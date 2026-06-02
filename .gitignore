@@ -12,7 +12,6 @@ dist/
 
 # macOS
 .DS_Store
-package-lock.json
 
 # Environment
 .env
@@ -25,3 +24,7 @@ package-lock.json
 # TypeScript
 *.tsbuildinfo
 .claude
+
+# Nix
+result
+.direnv
