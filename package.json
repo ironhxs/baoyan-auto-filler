@@ -12,6 +12,7 @@
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "compile": "tsc --noEmit --project .wxt/tsconfig.json",
+    "test:profile": "node scripts/test-profile-data.mjs",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {

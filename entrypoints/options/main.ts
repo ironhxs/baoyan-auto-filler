@@ -6,8 +6,14 @@ import {
   moveFileRecordsToCategory, getUncategorizedId, ensureCategoriesSeeded,
 } from '../../utils/db';
 import type { TextField, BlockCategory, BlockItem, Category, FileRecord } from '../../utils/db';
-import { PROVIDER_PRESETS, getProviderById, type ProviderPreset } from '../../utils/providers';
+import { PROVIDER_PRESETS, getProviderById } from '../../utils/providers';
 import { mergeFilesToPdf, type MergeFileItem } from '../../utils/pdf-merge';
+import {
+  mergeProfileFields,
+  parseProfileImport,
+  stringifyProfileExport,
+  type ProfileFieldData,
+} from '../../utils/profile-data';
 
 const navItems = document.querySelectorAll<HTMLElement>('.nav-item');
 const pageContent = document.getElementById('pageContent')!;
@@ -47,7 +53,7 @@ const PRESET_FIELDS: { key: string; label: string }[] = [
   { key: '预计能否获得推免资格', label: '预计能否获得推免资格' },
   { key: '学号', label: '学号' },
 ];
-const PRESET_FIELD_KEYS = new Set(PRESET_FIELDS.map((f) => f.key));
+const PROFILE_TEMPLATE_FIELDS = PRESET_FIELDS.map(({ key }) => ({ key, value: '' }));
 
 const PAGE_CONFIG: Record<string, { title: string; subtitle: string }> = {
   home: { title: '首页', subtitle: '概览与快捷入口' },
@@ -1327,9 +1333,18 @@ function renderSettingsPage() {
   pageContent.innerHTML = `
       <div class="settings-form">
         <div class="settings-section">
-          <h2>个人信息</h2>
-        <ul class="profile-field-list" id="fieldList">${fieldRows}</ul>
-        <button class="add-btn" id="addFieldBtn">+ 添加字段</button>
+          <div class="settings-section-header">
+            <h2>个人信息</h2>
+            <div class="profile-data-actions">
+              <button class="btn-secondary" id="exportProfileBtn">导出 JSON</button>
+              <button class="btn-secondary" id="importProfileBtn">导入 JSON</button>
+              <button class="btn-secondary" id="templateProfileBtn">下载模板</button>
+            </div>
+          </div>
+          <p class="settings-section-hint">仅导入导出个人信息字段，不包含 API Key 与材料文件。</p>
+          <ul class="profile-field-list" id="fieldList">${fieldRows}</ul>
+          <button class="add-btn" id="addFieldBtn">+ 添加字段</button>
+          <input type="file" id="profileImportInput" class="hidden" accept="application/json,.json" />
       </div>
 
       <div class="settings-section">
@@ -1376,6 +1391,12 @@ function renderSettingsPage() {
   document.getElementById('providerSelect')?.addEventListener('change', onProviderChange);
   document.getElementById('modelSelect')?.addEventListener('change', onModelSelectChange);
 
+  document.getElementById('exportProfileBtn')?.addEventListener('click', exportProfileData);
+  document.getElementById('importProfileBtn')?.addEventListener('click', () => {
+    document.getElementById('profileImportInput')?.click();
+  });
+  document.getElementById('templateProfileBtn')?.addEventListener('click', downloadProfileTemplate);
+  document.getElementById('profileImportInput')?.addEventListener('change', importProfileData);
   document.getElementById('saveBtn')?.addEventListener('click', saveSettings);
 }
 
@@ -1491,9 +1512,9 @@ function createFieldRowEl(key: string, value: string): HTMLLIElement {
   return row;
 }
 
-async function saveSettings() {
+function collectProfileFieldsFromForm(): ProfileFieldData[] {
   const rows = document.querySelectorAll<HTMLElement>('.field-row');
-  const fields: { key: string; value: string }[] = [];
+  const fields: ProfileFieldData[] = [];
   const seenKeys = new Set<string>();
 
   rows.forEach((row) => {
@@ -1503,6 +1524,66 @@ async function saveSettings() {
     fields.push({ key, value });
     seenKeys.add(key);
   });
+
+  return fields;
+}
+
+function downloadJson(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function exportProfileData() {
+  const fields = collectProfileFieldsFromForm();
+  const date = new Date();
+  const stamp = date.toISOString().slice(0, 10).replace(/-/g, '');
+  downloadJson(`auto-filler-profile-${stamp}.json`, stringifyProfileExport(fields, date));
+  showStatus(`已导出 ${fields.length} 个字段`);
+}
+
+function downloadProfileTemplate() {
+  downloadJson('auto-filler-profile-template.json', stringifyProfileExport(PROFILE_TEMPLATE_FIELDS));
+  showStatus('已下载模板');
+}
+
+async function importProfileData(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  try {
+    const importedFields = parseProfileImport(await file.text());
+    if (importedFields.length === 0) {
+      showStatus('未找到可导入字段');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `将导入 ${importedFields.length} 个字段：同名字段会覆盖，新字段会追加，现有其他字段会保留。是否继续？`,
+    );
+    if (!confirmed) return;
+
+    const mergedFields = mergeProfileFields(collectProfileFieldsFromForm(), importedFields);
+    await saveAllTextFields(mergedFields);
+    textFields = mergedFields;
+    renderSettingsPage();
+    showStatus(`已导入 ${importedFields.length} 个字段`);
+  } catch (err) {
+    showStatus(err instanceof Error ? err.message : '导入失败');
+  } finally {
+    input.value = '';
+  }
+}
+
+async function saveSettings() {
+  const fields = collectProfileFieldsFromForm();
 
   await saveAllTextFields(fields);
   textFields = fields;

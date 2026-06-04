@@ -498,6 +498,49 @@ body {
   border-bottom: 1px solid #F3F4F6;
 }
 
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid #F3F4F6;
+}
+
+.settings-section-header h2 {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-section-hint {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #667085;
+}
+
+.profile-data-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.profile-data-actions .btn-secondary {
+  margin-top: 0;
+  padding: 6px 10px;
+  border-color: #D6E4FF;
+  border-radius: 8px;
+  color: #257FFD;
+  white-space: nowrap;
+}
+
+.profile-data-actions .btn-secondary:hover {
+  background: #EAF2FF;
+}
+
 .form-group {
   margin-bottom: 14px;
 }
