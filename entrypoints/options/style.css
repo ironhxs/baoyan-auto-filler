@@ -1676,6 +1676,14 @@ body {
   object-fit: contain;
 }
 
+.cert-pdf-preview {
+  width: min(72vw, 960px);
+  height: 62vh;
+  border: 0;
+  border-radius: 8px;
+  background: #f3f6fb;
+}
+
 .cert-modal-nav {
   position: absolute;
   top: 50%;

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { getAiEligibleFields, matchFieldsLocally } from '../utils/local-matcher';
+import { getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '../utils/local-matcher';
 import { flattenProfileValues } from '../utils/profile-schema';
 import { isPageValueConsistent } from '../utils/value-compare';
+import { fieldFingerprint } from '../utils/field-fingerprint';
 import type { FormFieldInfo } from '../utils/matcher';
 import type { BlockCategory, TextField } from '../utils/db';
 
@@ -107,6 +108,11 @@ const fields = [
     context: '通讯地址 测试省测试市测试路1号',
   }),
   field(21, { label: '预计毕业年月', value: '202706' }),
+  field(22, {
+    label: '预计毕业年月',
+    value: '',
+    dateFormat: 'yyyyMM',
+  }),
 ];
 
 const matches = matchFieldsLocally(fields, textFields, blocks);
@@ -133,14 +139,24 @@ assert.equal(byIndex.get(19)?.value, '程序设计竞赛一等奖，省级，202
 assert.equal(/[|#]/.test(byIndex.get(19)?.value ?? ''), false);
 assert.equal(byIndex.has(20), false);
 assert.equal(byIndex.get(21)?.value, '202706');
+assert.equal(byIndex.get(22)?.value, '202706');
 assert.equal(isPageValueConsistent('138****0000', '13800000000'), true);
 assert.equal(isPageValueConsistent('2005-01-08', '20050108'), true);
 assert.equal(isPageValueConsistent('202706', '2027年6月'), true);
 assert.equal(isPageValueConsistent('156****5006', '15900005006'), false);
 assert.equal(isPageValueConsistent('370724 山东省测试县', '山东省测试县', true), true);
+assert.equal(
+  fieldFingerprint(field(30, { label: '手机号', value: '13800000000' })),
+  fieldFingerprint(field(8, { label: '手机号', value: '' })),
+);
+assert.notEqual(
+  fieldFingerprint(field(30, { label: '手机号' })),
+  fieldFingerprint(field(30, { label: '家庭住址' })),
+);
 
 const aiEligible = getAiEligibleFields(fields, matches);
 assert.deepEqual(aiEligible.map((candidate) => candidate.index), [9, 15, 20]);
+assert.equal(isMeaningfullyFilled(field(40, { value: '----请选择----', options: ['----请选择----', '汉族'] })), false);
 
 const flattened = flattenProfileValues(textFields, blocks);
 assert.equal(flattened.find((value) => value.key === '家庭成员[2].姓名')?.value, '测试母亲');

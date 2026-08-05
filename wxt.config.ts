@@ -19,12 +19,6 @@ export default defineConfig({
     name: '保填',
     permissions: ['storage', 'activeTab', 'scripting'],
     host_permissions: ['<all_urls>'],
-    commands: {
-      'stream-fill': {
-        suggested_key: { default: 'Alt+Shift+F' },
-        description: '流式自动填充当前页面表单',
-      },
-    },
   },
   hooks: {
     'build:manifestGenerated': (_wxt, manifest) => {

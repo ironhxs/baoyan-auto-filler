@@ -1,3 +1,5 @@
+import { fieldFingerprint } from '@/utils/field-fingerprint';
+
 interface FormField {
   kind: 'text' | 'file';
   tag: string;
@@ -9,10 +11,12 @@ interface FormField {
   placeholder: string;
   ariaLabel: string;
   title: string;
+  dateFormat?: string;
   value: string;
   options: string[];
   accept: string;
   multiple: boolean;
+  hasExistingFile: boolean;
   fillMode: 'short' | 'long';
   renderWidth: number;
   renderHeight: number;
@@ -67,10 +71,11 @@ interface PrepareRepeatRowsMessage { type: 'prepareRepeatRows'; targets: Array<{
 interface AdvanceToNextStepMessage { type: 'advanceToNextStep' }
 interface MarkPreviewMessage {
   type: 'markPreview';
-  items: Array<{ index: number; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
+  items: Array<{ index: number; fingerprint?: string; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
 }
 interface FocusFieldMessage { type: 'focusField'; index: number }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage;
+interface GetPageMetaMessage { type: 'getPageMeta' }
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | GetPageMetaMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -79,7 +84,8 @@ let lastFocusedElement: HTMLElement | null = null;
 function findLabel(el: HTMLElement): string {
   if (el.id) {
     const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-    if (label) return label.textContent?.trim() ?? '';
+    const text = label?.textContent?.trim() ?? '';
+    if (text) return text;
   }
 
   const parentLabel = el.closest('label');
@@ -87,7 +93,8 @@ function findLabel(el: HTMLElement): string {
     // Exclude the element's own text from the label
     const clone = parentLabel.cloneNode(true) as HTMLElement;
     clone.querySelectorAll('input, select, textarea').forEach((c) => c.remove());
-    return clone.textContent?.trim() ?? '';
+    const text = clone.textContent?.trim() ?? '';
+    if (text) return text;
   }
 
   // Use aria-labelledby
@@ -102,10 +109,13 @@ function findLabel(el: HTMLElement): string {
   if (row && valueCell) {
     const cells = Array.from(row.querySelectorAll<HTMLElement>('td, th'));
     const valueCellIndex = cells.indexOf(valueCell as HTMLElement);
-    const labelCell = cells
-      .slice(0, Math.max(valueCellIndex, 0))
-      .reverse()
-      .find((cell) => textWithoutControls(cell));
+    const precedingCells = cells.slice(0, Math.max(valueCellIndex, 0));
+    const labelCell = el instanceof HTMLInputElement && el.type === 'file'
+      ? precedingCells.find((cell) => {
+        const text = textWithoutControls(cell);
+        return text.length >= 2 && text.length <= 100 && !/^(pdf|jpe?g|png|是|否|必填|选填|required|optional|\d+)$/i.test(text);
+      })
+      : precedingCells.reverse().find((cell) => textWithoutControls(cell));
     if (labelCell) return textWithoutControls(labelCell);
   }
 
@@ -129,11 +139,28 @@ function normalizeText(text: string): string {
 }
 
 function isVisible(el: HTMLElement): boolean {
-  const style = window.getComputedStyle(el);
+  const style = (el.ownerDocument.defaultView ?? window).getComputedStyle(el);
   if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
     return false;
   }
   return el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0;
+}
+
+function hasVisibleFileTrigger(input: HTMLInputElement): boolean {
+  if (input.disabled) return false;
+  if (input.id) {
+    const label = document.querySelector<HTMLElement>(`label[for="${CSS.escape(input.id)}"]`);
+    if (label && isVisible(label)) return true;
+  }
+  let container: HTMLElement | null = input.parentElement;
+  for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
+    const trigger = Array.from(container.querySelectorAll<HTMLElement>(
+      'button,input[type="button"],a,[role="button"],label,.btn,[class*="upload"],[class*="select"]',
+    )).find((candidate) => candidate !== input && isVisible(candidate));
+    if (trigger) return true;
+    if (container.matches('tr,.form-group,.form-item,.form-row,.ant-form-item,.el-form-item')) break;
+  }
+  return false;
 }
 
 function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
@@ -155,8 +182,7 @@ function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
 
 function isSupportedDialogSelection(el: HTMLElement): boolean {
   if (!(el instanceof HTMLInputElement)) return false;
-  const text = joinUnique([findLabel(el), el.name, el.id, el.placeholder]);
-  return /学校|院校|专业/.test(text) && Boolean(findSelectionTrigger(el));
+  return Boolean(findSelectionTrigger(el));
 }
 
 function isSupportedDatePicker(el: HTMLElement): boolean {
@@ -168,6 +194,9 @@ function isSupportedDatePicker(el: HTMLElement): boolean {
 
 function isFillable(el: HTMLElement): boolean {
   if (!el.matches(SCANNABLE_SELECTOR)) return false;
+  if (el instanceof HTMLInputElement && el.type === 'file') {
+    return isVisible(el) || hasVisibleFileTrigger(el);
+  }
   return isVisible(el);
 }
 
@@ -482,6 +511,30 @@ function nextPageSignature(): string {
   return `${location.href}::${headings}::${controls}`;
 }
 
+function getPageMeta(): { label: string; url: string; signature: string } {
+  const activeNavigation = Array.from(document.querySelectorAll<HTMLElement>(
+    'nav .active,aside .active,[role="navigation"] .active,.sidebar .active,.side-menu .active,.menu .active,ul .active,ol .active',
+  ))
+    .filter(isVisible)
+    .map((element) => normalizeText(element.textContent ?? ''))
+    .find((text) => text.length >= 2 && text.length <= 24);
+  const preferred = Array.from(document.querySelectorAll<HTMLElement>(
+    '.page-title,.panel-title,.form-title,.section-title,.card-title,main h1,main h2,main h3,h1,h2,h3,legend',
+  ))
+    .filter(isVisible)
+    .map((element) => normalizeText(element.textContent ?? ''))
+    .filter((text) => (
+      text.length >= 2 &&
+      text.length <= 40 &&
+      !/研究生报考服务系统|接收推荐免试研究生报名|^首页$/.test(text)
+    ));
+  return {
+    label: activeNavigation ?? preferred.at(-1) ?? document.title ?? '当前页面',
+    url: location.href,
+    signature: nextPageSignature(),
+  };
+}
+
 function findSafeNextControl(): HTMLElement | null {
   const candidates = Array.from(document.querySelectorAll<HTMLElement>(
     'button,input[type="button"],input[type="submit"],a,[role="button"]',
@@ -556,6 +609,34 @@ function getSemanticContainer(el: HTMLElement): HTMLElement {
   return findNearestSingleFieldContainer(el, findContextRoot(el));
 }
 
+function findExistingFileEvidence(input: HTMLInputElement): string {
+  const selectedName = Array.from(input.files ?? []).map((file) => file.name).filter(Boolean).join(', ');
+  if (selectedName) return selectedName;
+
+  const container = getSemanticContainer(input);
+  const text = normalizeText(container.textContent ?? '');
+  const filename = text.match(/[^\\/\s<>:"|?*]+\.(?:pdf|docx?|jpe?g|png|gif|webp|zip|rar)\b/i)?.[0];
+  if (filename) return `已上传：${filename}`;
+
+  const existingAction = Array.from(container.querySelectorAll<HTMLElement>('a[href],button,[role="button"]'))
+    .find((candidate) => candidate !== input && isVisible(candidate) && /查看|下载|删除|替换|重新上传/.test(normalizeText(candidate.textContent ?? '')));
+  if (existingAction) return '已上传材料';
+
+  const explicitStatus = text.match(/(?:文件|材料|附件)?已上传|上传成功/);
+  if (explicitStatus) return explicitStatus[0];
+
+  const previewImage = Array.from(container.querySelectorAll<HTMLImageElement>('img[src]')).find((image) => {
+    if (!isVisible(image)) return false;
+    const descriptor = `${image.alt} ${image.className} ${image.src}`.toLowerCase();
+    if (/logo|icon|captcha|verify|qrcode|二维码|验证码/.test(descriptor)) return false;
+    const rect = image.getBoundingClientRect();
+    const width = image.naturalWidth || rect.width;
+    const height = image.naturalHeight || rect.height;
+    return width >= 60 && height >= 60;
+  });
+  return previewImage ? '已上传图片' : '';
+}
+
 function sanitizeHtml(el: HTMLElement): string {
   const clone = el.cloneNode(true) as HTMLElement;
   clone.querySelectorAll('script, style, svg, iframe, canvas').forEach((child) => child.remove());
@@ -599,6 +680,20 @@ function findHint(el: HTMLElement, label: string, context: string): string {
   return hint || context.replace(label, '').trim();
 }
 
+function isRequiredField(el: HTMLElement, fieldText: string): boolean {
+  if ((el as HTMLInputElement).required || el.getAttribute('aria-required') === 'true') return true;
+  const row = el.closest<HTMLTableRowElement>('tr');
+  const valueCell = el.closest<HTMLTableCellElement>('td,th');
+  if (row && valueCell) {
+    const preceding = Array.from(row.cells).slice(0, row.cells.length).filter((cell) => cell !== valueCell);
+    const explicit = preceding
+      .map((cell) => textWithoutControls(cell).toLowerCase())
+      .find((text) => /^(是|否|必填|选填|required|optional)$/.test(text));
+    if (explicit) return /^(是|必填|required)$/.test(explicit);
+  }
+  return /必填|不能为空|\*/.test(fieldText);
+}
+
 function extractField(el: HTMLElement): FormField {
   const tag = el.tagName.toLowerCase();
   const isFile = el instanceof HTMLInputElement && el.type === 'file';
@@ -609,11 +704,13 @@ function extractField(el: HTMLElement): FormField {
   const hint = findHint(el, label, context);
   const fieldText = joinUnique([repeatMeta.groupLabel, repeatMeta.columnLabel, label, hint, context]);
   const protection = getProtection(el, fieldText, isFile);
-  const required = Boolean(
-    (el as HTMLInputElement).required ||
-    el.getAttribute('aria-required') === 'true' ||
-    /必填|不能为空|\*/.test(fieldText)
-  );
+  const required = isRequiredField(el, fieldText);
+  const dateFormat = [
+    el.getAttribute('data-date-format'),
+    el.getAttribute('data-datefmt'),
+    el.getAttribute('onclick')?.match(/dateFmt\s*:\s*['"]([^'"]+)['"]/i)?.[1],
+  ].find(Boolean) ?? '';
+  const existingFile = isFile ? findExistingFileEvidence(el as HTMLInputElement) : '';
   return {
     kind: isFile ? 'file' : 'text',
     tag,
@@ -625,10 +722,12 @@ function extractField(el: HTMLElement): FormField {
     placeholder: el.getAttribute('placeholder') ?? '',
     ariaLabel: el.getAttribute('aria-label') ?? '',
     title: el.getAttribute('title') ?? '',
-    value: getCurrentValue(el),
+    dateFormat,
+    value: isFile ? (getCurrentValue(el) || existingFile) : getCurrentValue(el),
     options: getOptions(el),
     accept: isFile ? el.accept : '',
     multiple: isFile ? el.multiple : false,
+    hasExistingFile: Boolean(existingFile),
     fillMode: classifyFillMode(el, renderedSize.width, renderedSize.height),
     renderWidth: renderedSize.width,
     renderHeight: renderedSize.height,
@@ -733,12 +832,30 @@ function clearPreviewMarkers(): void {
 }
 
 function markPreviewFields(items: MarkPreviewMessage['items']): number {
+  const scanned = scanFields();
   clearPreviewMarkers();
+  const byFingerprint = new Map<string, HTMLElement[]>();
+  for (const result of scanned) {
+    const fingerprint = fieldFingerprint({ ...result.field, index: result.index });
+    const candidates = byFingerprint.get(fingerprint) ?? [];
+    const element = elementMap.get(result.index);
+    if (element) candidates.push(element);
+    byFingerprint.set(fingerprint, candidates);
+  }
+  const used = new Set<HTMLElement>();
   let marked = 0;
   for (const item of items) {
-    const el = elementMap.get(item.index);
+    const indexed = elementMap.get(item.index);
+    const indexedField = scanned.find((result) => result.index === item.index)?.field;
+    const indexStillMatches = indexed && (!item.fingerprint || (
+      indexedField && fieldFingerprint({ ...indexedField, index: item.index }) === item.fingerprint
+    ));
+    const el = indexStillMatches
+      ? indexed
+      : byFingerprint.get(item.fingerprint ?? '')?.find((candidate) => !used.has(candidate));
     if (!el) continue;
     markField(el, item.status, item.message);
+    used.add(el);
     marked++;
   }
   return marked;
@@ -776,6 +893,14 @@ function getVisibleDialogRoots(): HTMLElement[] {
   const roots = Array.from(document.querySelectorAll<HTMLElement>(
     '[role="dialog"],.modal,.dialog,.popup,.layui-layer,.ui-dialog,.el-dialog,.ant-modal,.window',
   )).filter(isVisible);
+  for (const frame of Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe')).filter(isVisible)) {
+    try {
+      const body = frame.contentDocument?.body;
+      if (body) roots.push(body);
+    } catch {
+      // Cross-origin dialog frames cannot be automated safely.
+    }
+  }
   return roots.length ? roots : [document.body];
 }
 
@@ -785,15 +910,73 @@ function normalizeSelectionText(text: string): string {
 
 async function waitForDialogChoice(value: string, timeoutMs = 2500): Promise<HTMLElement | null> {
   const deadline = Date.now() + timeoutMs;
+  const wanted = normalizeSelectionText(value);
+  const comparable = (text: string) => normalizeSelectionText(text).replace(/^\d{4,12}\s*/, '');
   while (Date.now() < deadline) {
     const candidates = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>(
       '[role="option"],li,td,a,button,.option,.item,.tree-node,.el-tree-node__label,.ant-select-item-option-content',
     ))).filter((candidate) => isVisible(candidate) && candidate.childElementCount <= 3);
-    const exact = candidates.find((candidate) => normalizeSelectionText(candidate.textContent ?? '') === normalizeSelectionText(value));
-    if (exact) return exact;
+    const exact = candidates
+      .filter((candidate) => {
+        const text = normalizeSelectionText(candidate.textContent ?? '');
+        return text === wanted || comparable(text) === comparable(wanted);
+      })
+      .sort((a, b) => normalizeSelectionText(a.textContent ?? '').length - normalizeSelectionText(b.textContent ?? '').length)[0];
+    if (exact) {
+      const clickableChild = Array.from(exact.querySelectorAll<HTMLElement>(
+        'a,button,[role="option"],[role="treeitem"],.option,.item,.tree-node,.el-tree-node__label,.ant-select-item-option-content',
+      )).find((candidate) => comparable(candidate.textContent ?? '') === comparable(wanted));
+      return clickableChild ?? exact;
+    }
     await new Promise((resolve) => setTimeout(resolve, 80));
   }
   return null;
+}
+
+function getTerminalSelectionTerm(value: string): string {
+  const normalized = normalizeSelectionText(value).replace(/^\d{4,12}/, '');
+  const delimited = normalized.split(/[|/>\\,，;；\s-]+/).filter(Boolean);
+  if (delimited.length > 1) return delimited.at(-1) ?? normalized;
+  const administrativeParts = normalized.match(/[^省市区县旗州盟]+?(?:特别行政区|自治区|自治州|地区|省|市|区|县|旗|盟)/g);
+  return administrativeParts?.at(-1) ?? normalized;
+}
+
+function setDialogSearchValue(input: HTMLInputElement, value: string): void {
+  const view = input.ownerDocument.defaultView;
+  const prototype = view?.HTMLInputElement?.prototype;
+  const setter = prototype && Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+  if (setter) setter.call(input, value); else input.value = value;
+  const EventConstructor = view?.Event ?? Event;
+  input.dispatchEvent(new EventConstructor('input', { bubbles: true }));
+  input.dispatchEvent(new EventConstructor('change', { bubbles: true }));
+}
+
+async function searchDialogChoice(value: string): Promise<HTMLElement | null> {
+  const term = getTerminalSelectionTerm(value);
+  if (!term) return null;
+  for (const root of getVisibleDialogRoots()) {
+    const input = Array.from(root.querySelectorAll<HTMLInputElement>(
+      'input[type="search"],input[type="text"],input:not([type])',
+    )).find((candidate) => isVisible(candidate) && !candidate.disabled && !candidate.readOnly);
+    if (!input) continue;
+    const button = Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]'))
+      .find((candidate) => isVisible(candidate) && /^(搜索|查询|查找)$/.test(normalizeText(
+        (candidate as HTMLInputElement).value || candidate.textContent || '',
+      )));
+    if (!button) continue;
+    setDialogSearchValue(input, term);
+    button.click();
+    const choice = await waitForDialogChoice(term, 1800);
+    if (choice) return choice;
+  }
+  return null;
+}
+
+function dialogValueMatches(el: HTMLElement, expected: string): boolean {
+  if (valueMatches(el, expected)) return true;
+  const actual = normalizeSelectionText(getCurrentValue(el)).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
+  const wanted = normalizeSelectionText(expected).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
+  return Boolean(actual && wanted && (actual.includes(wanted) || wanted.includes(actual)));
 }
 
 async function fillDialogSelection(
@@ -805,6 +988,10 @@ async function fillDialogSelection(
   if (!trigger) return false;
   trigger.click();
   let choice = await waitForDialogChoice(value, 1200);
+
+  if (!choice) {
+    choice = await searchDialogChoice(value);
+  }
 
   if (!choice) {
     const search = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLInputElement>(
@@ -826,14 +1013,17 @@ async function fillDialogSelection(
   choice.click();
   await new Promise((resolve) => setTimeout(resolve, 150));
 
-  if (!valueMatches(el, value)) {
-    const confirm = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>('button,a,[role="button"]')))
+  if (!dialogValueMatches(el, value)) {
+    const confirm = [
+      ...Array.from(document.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]')),
+      ...getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]'))),
+    ]
       .find((candidate) => isVisible(candidate) && /^(确定|确认|保存)$/.test(normalizeText(candidate.textContent ?? '')));
     confirm?.click();
     await new Promise((resolve) => setTimeout(resolve, 180));
   }
 
-  const verified = valueMatches(el, value);
+  const verified = dialogValueMatches(el, value);
   markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
   return verified;
 }
@@ -1036,6 +1226,8 @@ export default defineContentScript({
         if (message.type === 'scan') {
           const results = scanFields();
           sendResponse(results);
+        } else if (message.type === 'getPageMeta') {
+          sendResponse(getPageMeta());
         } else if (message.type === 'prepareRepeatRows') {
           prepareRepeatRows(message.targets)
             .then((added) => sendResponse({ ok: true, added }))

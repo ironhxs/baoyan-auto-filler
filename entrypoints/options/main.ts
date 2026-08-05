@@ -1255,6 +1255,10 @@ function showPreviewModal(file: FileRecord) {
   const sameCategoryFiles = fileRecords.filter(f => f.categoryId === file.categoryId && IMAGE_TYPES.has(f.fileType));
   const currentIdx = sameCategoryFiles.findIndex(f => f.id === file.id);
   const hasNav = isImage && sameCategoryFiles.length > 1;
+  const blobUrls = isImage
+    ? sameCategoryFiles.map(f => URL.createObjectURL(f.fileBody))
+    : [URL.createObjectURL(file.fileBody)];
+  const previewUrl = isImage ? blobUrls[Math.max(0, currentIdx)] : blobUrls[0];
 
   let navHtml = '';
   if (hasNav) {
@@ -1266,14 +1270,9 @@ function showPreviewModal(file: FileRecord) {
 
   let bodyHtml: string;
   if (isImage) {
-    const url = URL.createObjectURL(file.fileBody);
-    bodyHtml = `<img src="${url}" alt="${escapeAttr(file.filename)}" />`;
+    bodyHtml = `<img src="${previewUrl}" alt="${escapeAttr(file.filename)}" />`;
   } else if (isPdf) {
-    bodyHtml = `
-      <div style="text-align:center">
-        <div style="font-size:48px;margin-bottom:12px">📄</div>
-      </div>
-    `;
+    bodyHtml = `<iframe class="cert-pdf-preview" src="${previewUrl}#toolbar=1&navpanes=0" title="${escapeAttr(file.filename)}"></iframe>`;
   } else {
     const { icon } = getFileCategoryIcon(file.fileType);
     bodyHtml = `
@@ -1309,7 +1308,6 @@ function showPreviewModal(file: FileRecord) {
   `;
   document.body.appendChild(overlay);
 
-  let blobUrls: string[] = sameCategoryFiles.map(f => URL.createObjectURL(f.fileBody));
   let viewIdx = currentIdx;
   let imgEl = overlay.querySelector('.cert-modal-body img') as HTMLImageElement;
 
@@ -1899,7 +1897,16 @@ async function init() {
   categories = cats;
   fileRecords = files;
 
-  switchPage('profile');
+  const previewId = Number(new URLSearchParams(location.search).get('previewMaterial'));
+  const previewFile = Number.isInteger(previewId) && previewId > 0
+    ? fileRecords.find((file) => file.id === previewId)
+    : undefined;
+  if (previewFile) {
+    switchPage('certificates');
+    requestAnimationFrame(() => showPreviewModal(previewFile));
+  } else {
+    switchPage('profile');
+  }
 }
 
 init();

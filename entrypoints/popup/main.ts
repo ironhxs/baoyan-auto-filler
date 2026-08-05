@@ -1,11 +1,13 @@
 import './style.css';
 import { isApiConfigured } from '@/utils/storage';
 import { getAllBlockCategories, getAllFileRecords, getAllTextFields } from '@/utils/db';
+import type { FileRecord } from '@/utils/db';
 import type { MatchResult, FormFieldInfo } from '@/utils/matcher';
 import { flattenProfileValues, PROFILE_SECTIONS } from '@/utils/profile-schema';
 import type { ProfileSourceValue } from '@/utils/profile-schema';
 import { isMeaningfullyFilled } from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
+import { fieldFingerprint } from '@/utils/field-fingerprint';
 
 const app = document.getElementById('app')!;
 
@@ -55,9 +57,25 @@ interface AutoRunResponse {
   filledCount: number;
   message: string;
   updatedAt: number;
+  pauseReason?: 'materials' | 'required' | 'navigation' | 'error';
+  history: Array<{
+    page: number;
+    label: string;
+    recognized: number;
+    matched: number;
+    verified: number;
+    conflicts: number;
+    filled: number;
+    aiAttempted: boolean;
+    aiCached?: boolean;
+    aiReviewed: number;
+    status: 'checked' | 'paused' | 'complete' | 'error';
+    message: string;
+    updatedAt: number;
+  }>;
 }
 
-type ViewState = 'idle' | 'scanning' | 'result' | 'filling' | 'filled' | 'streaming';
+type ViewState = 'idle' | 'scanning' | 'result' | 'filling' | 'filled';
 type Confidence = MatchResult['confidence'];
 
 interface DisplayItem {
@@ -80,6 +98,9 @@ let profileValues: ProfileSourceValue[] = [];
 let pageStatus: InspectResponse | null = null;
 let apiAvailable = false;
 let autoRunStatus: AutoRunResponse | null = null;
+let materialFileRecords: FileRecord[] = [];
+const previewedMaterialByField = new Map<number, number>();
+let lastFillIncludedFiles = false;
 
 function sendRuntimeMessage<T>(message: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -99,6 +120,7 @@ async function init() {
   ]);
   profileValues = flattenProfileValues(textFields, blocks);
   apiAvailable = apiReady;
+  materialFileRecords = fileRecords;
 
   renderHeader();
 
@@ -120,7 +142,17 @@ async function init() {
     return;
   }
 
+  if (isMaterialReviewPause(autoRunStatus)) {
+    startScan();
+    return;
+  }
   renderIdle(apiReady);
+}
+
+function isMaterialReviewPause(status: AutoRunResponse | null): boolean {
+  return Boolean(status?.status === 'paused' && (
+    status.pauseReason === 'materials' || /上传|材料|附件/.test(status.message)
+  ));
 }
 
 function renderHeader() {
@@ -186,6 +218,26 @@ function bindModeTabs(): void {
   document.getElementById('manualModeTab')?.addEventListener('click', renderManualFill);
 }
 
+function renderAutoRunHistory(status: AutoRunResponse): string {
+  const history = status.history ?? [];
+  if (!history.length) return '';
+  const statusText = { checked: '已核对', paused: '已暂停', complete: '已完成', error: '异常' } as const;
+  const rows = history.map((entry) => `
+    <div class="auto-history-row ${entry.status}">
+      <span class="auto-history-dot"></span>
+      <div class="auto-history-main">
+        <div class="auto-history-label">
+          <strong>${escapeHtml(entry.label || `第 ${entry.page} 页`)}</strong>
+          <em>${statusText[entry.status]}</em>
+        </div>
+        <span>识别 ${entry.recognized} · 一致 ${entry.verified} · 冲突 ${entry.conflicts} · 填入 ${entry.filled}${entry.aiAttempted ? ` · AI ${entry.aiReviewed}${entry.aiCached ? '（缓存）' : ''}` : ''}</span>
+        <small>${escapeHtml(entry.message)}</small>
+      </div>
+    </div>
+  `).join('');
+  return `<details class="auto-history" open><summary class="auto-history-title">本次逐页记录（${history.length} 页）</summary><div class="auto-history-list">${rows}</div></details>`;
+}
+
 function renderIdle(apiReady = true) {
   viewState = 'idle';
   removeFooter();
@@ -208,10 +260,13 @@ function renderIdle(apiReady = true) {
         <span>${autoRunStatus.pageCount} 页 · ${autoRunStatus.filledCount} 项</span>
       </div>
       <p>${escapeHtml(autoRunStatus.message)}</p>
+      ${renderAutoRunHistory(autoRunStatus)}
       ${autoRunStatus.status === 'running'
         ? '<button id="stopAutoRunBtn" class="auto-run-link danger">停止</button>'
         : autoRunStatus.status === 'paused'
-          ? '<button id="resumeAutoRunBtn" class="auto-run-link">处理后继续</button>'
+          ? isMaterialReviewPause(autoRunStatus)
+            ? '<button id="reviewMaterialsBtn" class="auto-run-link">查看并确认材料</button>'
+            : '<button id="resumeAutoRunBtn" class="auto-run-link">处理后继续</button>'
           : ''}
     </div>
   ` : '';
@@ -225,16 +280,14 @@ function renderIdle(apiReady = true) {
       <div class="scan-desc">先预览匹配结果，再由你确认填入。${apiReady ? 'AI 可辅助处理低置信字段。' : '未配置 AI 时仍可使用本地明确匹配。'}</div>
       <button class="scan-btn" id="scanBtn">识别并预览</button>
       <button class="scan-btn auto-run-btn" id="autoRunBtn"${autoRunStatus?.status === 'running' ? ' disabled' : ''}>${autoRunStatus?.status === 'running' ? '正在后台连续填写' : '后台连续填写到最终审核'}</button>
-      <div class="auto-run-note">可关闭弹窗或切换页面；遇到无法处理的必填项会暂停，绝不点击最终提交。</div>
-      ${apiReady ? '<button class="scan-btn stream-btn" id="streamScanBtn">AI 流式快速填充</button>' : ''}
     </div>
   `;
   bindModeTabs();
   document.getElementById('scanBtn')!.addEventListener('click', startScan);
   document.getElementById('autoRunBtn')!.addEventListener('click', startAutoRun);
   document.getElementById('resumeAutoRunBtn')?.addEventListener('click', startAutoRun);
+  document.getElementById('reviewMaterialsBtn')?.addEventListener('click', startScan);
   document.getElementById('stopAutoRunBtn')?.addEventListener('click', stopAutoRun);
-  document.getElementById('streamScanBtn')?.addEventListener('click', startStreamScan);
 }
 
 async function startAutoRun() {
@@ -347,11 +400,13 @@ function buildDisplayItems(scanResp: ScanResponse): DisplayItem[] {
     const fillMode = m.fillMode ?? field?.fillMode;
     const isLong = fillMode === 'long';
     const isFile = m.kind === 'file';
-    const pageFilled = !isFile && isMeaningfullyFilled(field ?? ({} as FormFieldInfo));
+    const pageFilled = isMeaningfullyFilled(field ?? ({} as FormFieldInfo));
     const allowSystemPrefix = field?.selectionMode === 'dialog' || /出生地|籍贯|学校|院校|专业/.test(field?.label ?? '');
-    const verified = pageFilled && isPageValueConsistent(field?.value, m.value, allowSystemPrefix);
+    const verified = !isFile && pageFilled && isPageValueConsistent(field?.value, m.value, allowSystemPrefix);
     const auditValue = pageFilled
-      ? (verified
+      ? (isFile
+          ? String(field?.value ?? m.value)
+          : verified
           ? String(field?.value ?? '')
           : `页面：${String(field?.value ?? '')} / 资料：${m.value}`)
       : m.value;
@@ -361,7 +416,7 @@ function buildDisplayItems(scanResp: ScanResponse): DisplayItem[] {
       label: shortenLabel(m.shortLabel || m.fieldKey || `字段 #${m.index}`),
       value: auditValue,
       status: pageFilled
-        ? (verified ? 'verified' : 'conflict')
+        ? (isFile ? 'filled' : (verified ? 'verified' : 'conflict'))
         : (isFile ? 'pending' : (isLong ? 'matched' : (m.confidence === 'high' ? 'matched' : 'pending'))),
       confidence: isLong ? undefined : m.confidence,
       fillMode,
@@ -401,24 +456,26 @@ function getFieldLabel(field: FormFieldInfo | undefined, index: number): string 
   return shortenLabel(field.label || field.placeholder || field.ariaLabel || field.name || field.id || `字段 #${index}`);
 }
 
-function markerForItem(item: DisplayItem): { index: number; status: 'verified' | 'review' | 'mismatch'; message: string } | null {
+function markerForItem(item: DisplayItem): { index: number; fingerprint?: string; status: 'verified' | 'review' | 'mismatch'; message: string } | null {
+  const field = fields.find((candidate) => candidate.index === item.index);
+  const fingerprint = field ? fieldFingerprint(field) : undefined;
   if (item.status === 'conflict') {
-    return { index: item.index, status: 'mismatch', message: '保填：页面值与已保存资料不一致' };
+    return { index: item.index, fingerprint, status: 'mismatch', message: '保填：页面值与已保存资料不一致' };
   }
   if (item.status === 'verified') {
-    return { index: item.index, status: 'verified', message: '保填：页面值与已保存资料一致' };
+    return { index: item.index, fingerprint, status: 'verified', message: '保填：页面值与已保存资料一致' };
   }
   if (item.status === 'matched' && item.confidence === 'high') {
-    return { index: item.index, status: 'verified', message: '保填：高置信匹配，待确认填入' };
+    return { index: item.index, fingerprint, status: 'verified', message: '保填：高置信匹配，待确认填入' };
   }
   if (item.status === 'pending') {
-    return { index: item.index, status: 'review', message: '保填：匹配结果需要确认' };
+    return { index: item.index, fingerprint, status: 'review', message: '保填：匹配结果需要确认' };
   }
   if (item.status === 'filled') {
-    return { index: item.index, status: 'review', message: '保填：页面已有值，但资料中没有可核对项' };
+    return { index: item.index, fingerprint, status: 'review', message: '保填：页面已有值，但资料中没有可核对项' };
   }
   if (item.status === 'protected') {
-    return { index: item.index, status: 'review', message: '保填：该字段需本人处理' };
+    return { index: item.index, fingerprint, status: 'review', message: '保填：该字段需本人处理' };
   }
   return null;
 }
@@ -435,6 +492,83 @@ function locatePageField(index: number): void {
   void sendRuntimeMessage({ type: 'focusPageField', payload: { index } }).catch(() => undefined);
 }
 
+function refreshMaterialRow(index: number): void {
+  const item = displayItems.find((candidate) => candidate.index === index);
+  const fileRecordId = item?.match?.fileRecordId;
+  if (!item || fileRecordId == null) return;
+  const reviewed = previewedMaterialByField.get(index) === fileRecordId;
+  const row = document.querySelector<HTMLElement>(`.field-item[data-index="${index}"]`);
+  row?.classList.toggle('material-previewed', reviewed);
+  const checkbox = row?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  if (checkbox && (item.status === 'matched' || item.status === 'pending')) {
+    checkbox.disabled = !reviewed;
+    if (!reviewed) {
+      checkbox.checked = false;
+      item.checked = false;
+    }
+  }
+  const status = row?.querySelector<HTMLElement>('.field-status');
+  if (status && reviewed) status.innerHTML = '<span class="status-tag verified">已预览</span>';
+  updateFooterButton();
+}
+
+function previewMaterial(
+  fieldIndex: number,
+  fileRecordId: number,
+  queue: Array<{ index: number; fileRecordId: number }> = [{ index: fieldIndex, fileRecordId }],
+): void {
+  const record = materialFileRecords.find((file) => file.id === fileRecordId);
+  if (!record) {
+    showError('候选材料已不存在，请回到工作台重新添加');
+    return;
+  }
+
+  document.querySelector('.material-preview-overlay')?.remove();
+  const objectUrl = URL.createObjectURL(record.fileBody);
+  const fileType = (record.fileType || '').toLowerCase();
+  const isImage = fileType.startsWith('image/') || /\.(?:png|jpe?g|gif|webp)$/i.test(record.filename);
+  const isPdf = fileType === 'application/pdf' || /\.pdf$/i.test(record.filename);
+  const position = Math.max(0, queue.findIndex((item) => item.index === fieldIndex && item.fileRecordId === fileRecordId));
+  const overlay = document.createElement('div');
+  overlay.className = 'material-preview-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  const previewBody = isImage
+    ? `<img class="material-preview-image" src="${escapeAttr(objectUrl)}" alt="${escapeAttr(record.filename)}" />`
+    : isPdf
+      ? `<iframe class="material-preview-frame" src="${escapeAttr(objectUrl)}#toolbar=0" title="${escapeAttr(record.filename)}"></iframe>`
+      : `<div class="material-preview-unsupported"><strong>${escapeHtml(record.filename)}</strong><span>此格式无法在小窗内直接显示，请确认文件名和类型，或到材料库查看原文件。</span></div>`;
+  overlay.innerHTML = `
+    <div class="material-preview-dialog">
+      <div class="material-preview-head">
+        <div><strong>预览材料</strong><span>${queue.length > 1 ? `${position + 1} / ${queue.length}` : '上传前核对'}</span></div>
+        <button type="button" class="material-preview-close" aria-label="关闭预览">&times;</button>
+      </div>
+      <div class="material-preview-name" title="${escapeAttr(record.filename)}">${escapeHtml(record.filename)}</div>
+      <div class="material-preview-body">${previewBody}</div>
+      <div class="material-preview-actions">
+        <button type="button" class="secondary-btn material-preview-cancel">稍后检查</button>
+        <button type="button" class="fill-btn material-preview-confirm">${position < queue.length - 1 ? '已检查，下一份' : '已检查此材料'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    URL.revokeObjectURL(objectUrl);
+    overlay.remove();
+  };
+  overlay.querySelector('.material-preview-close')?.addEventListener('click', close);
+  overlay.querySelector('.material-preview-cancel')?.addEventListener('click', close);
+  overlay.querySelector('.material-preview-confirm')?.addEventListener('click', () => {
+    previewedMaterialByField.set(fieldIndex, fileRecordId);
+    refreshMaterialRow(fieldIndex);
+    close();
+    const next = queue[position + 1];
+    if (next) previewMaterial(next.index, next.fileRecordId, queue);
+  });
+}
+
 function renderResult(scanResp: ScanResponse) {
   viewState = 'result';
   fields = scanResp.fields;
@@ -444,6 +578,15 @@ function renderResult(scanResp: ScanResponse) {
   const reviewCount = displayItems.filter((i) => i.status === 'conflict' || i.status === 'filled' || i.status === 'protected').length;
   const matchedCount = displayItems.filter((i) => i.status === 'matched' || i.status === 'pending').length;
   const checkedCount = displayItems.filter((i) => i.checked && (i.status === 'matched' || i.status === 'pending')).length;
+  const materialItems = displayItems.filter((item) => item.kind === 'file');
+  const materialCandidates = materialItems.filter((item) => item.match?.fileRecordId != null);
+  const uploadedMaterialCount = materialItems.filter((item) => {
+    const field = scanResp.fields.find((candidate) => candidate.index === item.index);
+    return field ? isMeaningfullyFilled(field) : false;
+  }).length;
+  const requiredMaterialMissing = scanResp.fields.filter((field) => (
+    field.kind === 'file' && field.required && !isMeaningfullyFilled(field)
+  )).length;
 
   const main = getMainContainer(true);
 
@@ -460,6 +603,17 @@ function renderResult(scanResp: ScanResponse) {
   }
 
   main.innerHTML = `
+    ${materialItems.length > 0 ? `
+      <div class="material-review-card">
+        <div class="material-review-title"><strong>材料上传核对</strong><span>${uploadedMaterialCount}/${materialItems.length} 已写入</span></div>
+        <p>保填已按 AI 与本地语义选择候选并自动上传。请在进入下一步前检查实际文件；低置信候选不会自动上传。</p>
+        <div class="material-review-meta">
+          <span>${materialCandidates.length} 组候选</span>
+          <span>${requiredMaterialMissing > 0 ? `${requiredMaterialMissing} 个必填项待补齐` : '必填项已齐'}</span>
+        </div>
+        ${materialCandidates.length > 0 ? '<button type="button" class="material-review-all" id="previewAllMaterialsBtn">预览全部已选材料</button>' : ''}
+      </div>
+    ` : ''}
     <div class="ai-scan-status ${scanResp.ai.error ? 'error' : scanResp.ai.attempted ? 'success' : 'idle'}">
       ${scanResp.ai.error
         ? `AI 调用失败：${escapeHtml(scanResp.ai.error)}`
@@ -487,7 +641,7 @@ function renderResult(scanResp: ScanResponse) {
         <div class="stat-label">需检查</div>
       </div>
     </div>
-    <div class="fill-policy" role="group" aria-label="填充策略">
+    <div class="fill-policy" role="group" aria-label="填充策略"${materialItems.length === displayItems.length ? ' hidden' : ''}>
       <button data-policy="cautious">保守</button>
       <button data-policy="standard" class="active">标准</button>
       <button data-policy="aggressive">尽量填充</button>
@@ -509,16 +663,29 @@ function renderResult(scanResp: ScanResponse) {
     li.dataset.index = String(item.index);
     li.title = '点击定位网页字段';
 
+    const selectedFileId = item.match?.fileRecordId;
+    const materialPreviewed = item.kind !== 'file' || (selectedFileId != null && previewedMaterialByField.get(item.index) === selectedFileId);
     const checkboxHtml = item.status === 'matched' || item.status === 'pending'
-      ? `<input type="checkbox" data-idx="${item.index}" ${item.checked ? 'checked' : ''} />`
+      ? `<input type="checkbox" data-idx="${item.index}" ${item.checked ? 'checked' : ''} ${materialPreviewed ? '' : 'disabled'} />`
       : `<input type="checkbox" data-idx="${item.index}" disabled />`;
 
     const statusHtml = getStatusHtml(item);
+    const candidates = item.match?.fileCandidates ?? [];
+    const valueHtml = item.kind === 'file'
+      ? `<span class="field-value material-match-value">
+          ${candidates.length > 1
+            ? `<select class="material-candidate-select" data-idx="${item.index}" aria-label="选择候选材料">
+                ${candidates.map((candidate) => `<option value="${candidate.fileRecordId}"${candidate.fileRecordId === item.match?.fileRecordId ? ' selected' : ''}>${escapeHtml(candidate.fileName)}</option>`).join('')}
+              </select>`
+            : `<span title="${escapeAttr(item.value)}">${escapeHtml(item.value)}</span>`}
+          ${item.match?.fileRecordId != null ? `<button type="button" class="material-preview-btn" data-index="${item.index}" data-file-id="${item.match.fileRecordId}">预览材料</button>` : ''}
+        </span>`
+      : `<span class="field-value" title="${escapeAttr(item.value)}">${escapeHtml(item.value)}</span>`;
 
     li.innerHTML = `
       ${checkboxHtml}
       <span class="field-label" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</span>
-      <span class="field-value" title="${escapeHtml(item.value)}">${escapeHtml(item.value)}</span>
+      ${valueHtml}
       <span class="field-status">${statusHtml}</span>
     `;
     li.addEventListener('click', (event) => {
@@ -528,7 +695,7 @@ function renderResult(scanResp: ScanResponse) {
     list.appendChild(li);
   }
 
-  list.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:not([disabled])').forEach((cb) => {
+  list.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((cb) => {
     cb.addEventListener('change', () => {
       const idx = Number(cb.dataset.idx);
       const item = displayItems.find((i) => i.index === idx);
@@ -537,12 +704,49 @@ function renderResult(scanResp: ScanResponse) {
     });
   });
 
+  list.querySelectorAll<HTMLSelectElement>('.material-candidate-select').forEach((select) => {
+    select.addEventListener('click', (event) => event.stopPropagation());
+    select.addEventListener('change', () => {
+      const item = displayItems.find((candidate) => candidate.index === Number(select.dataset.idx));
+      const candidate = item?.match?.fileCandidates?.find((file) => file.fileRecordId === Number(select.value));
+      if (!item?.match || !candidate) return;
+      item.value = candidate.fileName;
+      item.match.value = candidate.fileName;
+      item.match.fileRecordId = candidate.fileRecordId;
+      item.match.fileName = candidate.fileName;
+      item.match.fileType = candidate.fileType;
+      previewedMaterialByField.delete(item.index);
+      item.checked = false;
+      const preview = select.closest('.material-match-value')?.querySelector<HTMLButtonElement>('.material-preview-btn');
+      if (preview) preview.dataset.fileId = String(candidate.fileRecordId);
+      refreshMaterialRow(item.index);
+    });
+  });
+
+  list.querySelectorAll<HTMLButtonElement>('.material-preview-btn').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      previewMaterial(Number(button.dataset.index), Number(button.dataset.fileId));
+    });
+  });
+
+  document.getElementById('previewAllMaterialsBtn')?.addEventListener('click', () => {
+    const queue = displayItems.flatMap((item) => (
+      item.kind === 'file' && item.match?.fileRecordId != null
+        ? [{ index: item.index, fileRecordId: item.match.fileRecordId }]
+        : []
+    ));
+    const first = queue[0];
+    if (first) previewMaterial(first.index, first.fileRecordId, queue);
+  });
+
   main.querySelectorAll<HTMLButtonElement>('.fill-policy button').forEach((button) => {
     button.addEventListener('click', () => applyFillPolicy(button.dataset.policy ?? 'standard'));
   });
 
   syncPageMarkers();
   renderFooter(checkedCount);
+  updateFooterButton();
 }
 
 function getStatusHtml(item: DisplayItem): string {
@@ -553,7 +757,9 @@ function getStatusHtml(item: DisplayItem): string {
     return '<span class="status-tag unmatched">未匹配</span>';
   }
   if (item.status === 'filled') {
-    return '<span class="status-tag filled">无法核对</span>';
+    return item.kind === 'file'
+      ? '<span class="status-tag filled">已上传</span>'
+      : '<span class="status-tag filled">无法核对</span>';
   }
   if (item.status === 'verified') {
     return `<span class="status-tag verified">${item.match?.source === 'ai_reviewed' || item.match?.source === 'ai' ? 'AI一致' : '一致'}</span>`;
@@ -628,17 +834,87 @@ function renderFooter(matchedCount: number) {
 
   const fillBtn = document.getElementById('fillBtn') as HTMLButtonElement;
   fillBtn.disabled = matchedCount === 0;
-  fillBtn.addEventListener('click', startFill);
+  fillBtn.addEventListener('click', handlePrimaryAction);
 
   document.getElementById('rescanBtn')!.addEventListener('click', startScan);
 }
 
+function getMaterialReviewState(): {
+  materialMode: boolean;
+  missingRequired: number;
+  unpreviewed: number;
+  canConfirm: boolean;
+} {
+  const materialItems = displayItems.filter((item) => item.kind === 'file');
+  const missingRequired = fields.filter((field) => (
+    field.kind === 'file' && field.required && !isMeaningfullyFilled(field)
+  )).length;
+  const reviewTargets = materialItems.filter((item) => {
+    if (item.match?.fileRecordId == null) return false;
+    const field = fields.find((candidate) => candidate.index === item.index);
+    return Boolean(field && isMeaningfullyFilled(field));
+  });
+  const unpreviewed = reviewTargets.filter((item) => (
+    previewedMaterialByField.get(item.index) !== item.match?.fileRecordId
+  )).length;
+  return {
+    materialMode: materialItems.length > 0,
+    missingRequired,
+    unpreviewed,
+    canConfirm: isMaterialReviewPause(autoRunStatus) && missingRequired === 0 && unpreviewed === 0,
+  };
+}
+
+async function confirmMaterialsAndResume(): Promise<void> {
+  try {
+    const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'confirmMaterialsAndResume' });
+    if (!response.ok) throw new Error(response.error);
+    autoRunStatus = response as AutoRunResponse;
+    renderIdle(apiAvailable);
+  } catch (error) {
+    showError(error instanceof Error ? error.message : '无法确认材料，请刷新页面后重试');
+  }
+}
+
+function handlePrimaryAction(): void {
+  const selected = displayItems.filter((item) => item.checked && (item.status === 'matched' || item.status === 'pending'));
+  if (selected.length > 0) {
+    startFill();
+    return;
+  }
+  if (getMaterialReviewState().canConfirm) void confirmMaterialsAndResume();
+}
+
 function updateFooterButton() {
-  const checkedCount = displayItems.filter((i) => i.checked && (i.status === 'matched' || i.status === 'pending')).length;
+  const selected = displayItems.filter((i) => i.checked && (i.status === 'matched' || i.status === 'pending'));
+  const checkedCount = selected.length;
+  const selectedFiles = selected.filter((item) => item.kind === 'file').length;
+  const materialReview = getMaterialReviewState();
   const fillBtn = document.getElementById('fillBtn') as HTMLButtonElement | null;
   if (fillBtn) {
-    fillBtn.textContent = `一键自动填充（${checkedCount} 项）`;
-    fillBtn.disabled = checkedCount === 0;
+    if (checkedCount > 0) {
+      fillBtn.textContent = selectedFiles > 0
+        ? `确认上传（${selectedFiles} 项）`
+        : `一键自动填充（${checkedCount} 项）`;
+      fillBtn.disabled = false;
+    } else if (materialReview.materialMode) {
+      if (materialReview.missingRequired > 0) {
+        fillBtn.textContent = `还有 ${materialReview.missingRequired} 个必填材料未上传`;
+        fillBtn.disabled = true;
+      } else if (materialReview.unpreviewed > 0) {
+        fillBtn.textContent = `还需预览 ${materialReview.unpreviewed} 项材料`;
+        fillBtn.disabled = true;
+      } else if (materialReview.canConfirm) {
+        fillBtn.textContent = '确认材料并继续下一步';
+        fillBtn.disabled = false;
+      } else {
+        fillBtn.textContent = '材料已核对';
+        fillBtn.disabled = true;
+      }
+    } else {
+      fillBtn.textContent = '一键自动填充（0 项）';
+      fillBtn.disabled = true;
+    }
   }
 }
 
@@ -687,6 +963,7 @@ function startFill() {
     .filter((match): match is MatchResult => Boolean(match));
 
   if (selected.length === 0) return;
+  lastFillIncludedFiles = selected.some((match) => match.kind === 'file');
 
   viewState = 'filling';
   removeFooter();
@@ -732,8 +1009,8 @@ function renderFillResult(success: boolean, successCount: number, failureCount: 
     main.innerHTML = `
       <div class="result-msg">
         <div class="icon success">✓</div>
-        <div class="text">填充完成</div>
-        <div class="sub">成功填充 ${successCount} 个字段</div>
+        <div class="text">${lastFillIncludedFiles ? '材料已写入页面' : '填充完成'}</div>
+        <div class="sub">${lastFillIncludedFiles ? `成功写入 ${successCount} 份材料，请核对网页上传结果` : `成功填充 ${successCount} 个字段`}</div>
       </div>
     `;
   } else {
@@ -750,122 +1027,8 @@ function renderFillResult(success: boolean, successCount: number, failureCount: 
   btn.className = 'scan-btn';
   btn.style.marginTop = '20px';
   btn.style.maxWidth = '200px';
-  btn.textContent = '关闭';
-  btn.addEventListener('click', () => window.close());
-  main.querySelector('.result-msg')!.appendChild(btn);
-}
-
-// ─── Streaming fill ─────────────────────────────────────────────────
-
-function startStreamScan() {
-  viewState = 'streaming';
-  renderStreamProgress();
-
-  const port = chrome.runtime.connect({ name: 'stream-fill' });
-
-  port.onMessage.addListener((msg) => {
-    if (msg.type === 'streamProgress') {
-      updateStreamProgress(msg.matched, msg.total, msg.latestLabel);
-    } else if (msg.type === 'streamComplete') {
-      renderStreamComplete(msg.matched, msg.errorCount);
-      port.disconnect();
-    } else if (msg.type === 'streamError') {
-      renderStreamError(msg.error);
-      port.disconnect();
-    }
-  });
-
-  port.onDisconnect.addListener(() => {
-    if (viewState === 'streaming') {
-      renderStreamError('连接已断开');
-    }
-  });
-
-  port.postMessage({ type: 'startStreamScan' });
-}
-
-function renderStreamProgress() {
-  removeFooter();
-  const main = getMainContainer(false);
-  main.innerHTML = `
-    <div class="stream-progress">
-      <div class="stream-header">
-        <div class="stream-spinner"></div>
-        <span class="stream-title">AI 正在识别并填充...</span>
-      </div>
-      <div class="stream-progress-bar-wrap">
-        <div class="stream-progress-bar">
-          <div class="stream-progress-fill" id="streamProgressFill" style="width:0%"></div>
-        </div>
-        <div class="stream-progress-text">
-          <span id="streamMatchedCount">0</span> / <span id="streamTotalCount">--</span>
-        </div>
-      </div>
-      <div class="stream-field-list" id="streamFieldList"></div>
-    </div>
-  `;
-}
-
-function updateStreamProgress(matched: number, total: number, latestLabel: string) {
-  const fill = document.getElementById('streamProgressFill');
-  const matchedEl = document.getElementById('streamMatchedCount');
-  const totalEl = document.getElementById('streamTotalCount');
-  const list = document.getElementById('streamFieldList');
-
-  if (fill) fill.style.width = `${total > 0 ? (matched / total) * 100 : 0}%`;
-  if (matchedEl) matchedEl.textContent = String(matched);
-  if (totalEl) totalEl.textContent = String(total);
-
-  if (list) {
-    const item = document.createElement('div');
-    item.className = 'stream-field-item done';
-    item.innerHTML = `
-      <span class="stream-dot filled"></span>
-      <span class="stream-field-label">${escapeHtml(latestLabel)}</span>
-      <span class="stream-field-status filled">已填充</span>
-    `;
-    list.appendChild(item);
-    list.scrollTop = list.scrollHeight;
-  }
-}
-
-function renderStreamComplete(matched: number, errorCount: number) {
-  viewState = 'filled';
-  removeFooter();
-  const main = getMainContainer(false);
-  main.innerHTML = `
-    <div class="result-msg">
-      <div class="icon success">✓</div>
-      <div class="text">流式填充完成</div>
-      <div class="sub">成功填充 ${matched} 个字段${errorCount > 0 ? `，${errorCount} 个失败` : ''}</div>
-    </div>
-  `;
-  const btn = document.createElement('button');
-  btn.className = 'scan-btn';
-  btn.style.marginTop = '20px';
-  btn.style.maxWidth = '200px';
-  btn.textContent = '关闭';
-  btn.addEventListener('click', () => window.close());
-  main.querySelector('.result-msg')!.appendChild(btn);
-}
-
-function renderStreamError(error: string) {
-  viewState = 'idle';
-  removeFooter();
-  const main = getMainContainer(false);
-  main.innerHTML = `
-    <div class="result-msg">
-      <div class="icon error">✕</div>
-      <div class="text">流式填充失败</div>
-      <div class="sub">${escapeHtml(error)}</div>
-    </div>
-  `;
-  const btn = document.createElement('button');
-  btn.className = 'scan-btn';
-  btn.style.marginTop = '20px';
-  btn.style.maxWidth = '200px';
-  btn.textContent = '重试';
-  btn.addEventListener('click', startStreamScan);
+  btn.textContent = lastFillIncludedFiles ? '核对上传结果' : '关闭';
+  btn.addEventListener('click', lastFillIncludedFiles ? startScan : () => window.close());
   main.querySelector('.result-msg')!.appendChild(btn);
 }
 

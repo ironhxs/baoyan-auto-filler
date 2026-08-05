@@ -9,6 +9,8 @@
     h2 { color: #257ffd; }
     .field { display: grid; grid-template-columns: 160px 1fr; align-items: center; gap: 16px; margin-top: 24px; }
     input { padding: 10px; border: 1px solid #d0d5dd; border-radius: 8px; }
+    .hidden-file { display: none; }
+    .file-button { display: inline-block; padding: 10px 16px; color: #fff; background: #257ffd; border-radius: 8px; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -17,6 +19,12 @@
     <div class="field">
       <label for="transcript">本科成绩单</label>
       <input id="transcript" type="file" accept="application/pdf,.pdf" required />
+    </div>
+    <div class="field">
+      <span>外语水平证明（PDF，不超过 2MB）</span>
+      <label class="file-button" for="languageProof">选择文件
+        <input class="hidden-file" id="languageProof" type="file" accept="application/pdf,.pdf" required />
+      </label>
     </div>
   </main>
 </body>

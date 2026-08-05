@@ -143,7 +143,11 @@ function chooseUnambiguousCandidate(candidates: ReturnType<typeof rankedCandidat
 export function isMeaningfullyFilled(field: FormFieldInfo): boolean {
   const value = (field.value ?? '').trim();
   if (!value) return false;
-  return !/^(请选择|请选择一项|请选|--|---|无|未选择)$/i.test(value);
+  const placeholder = value.replace(/[-—–_\s]/g, '');
+  if (/^(请选择|请选择一项|请选|无|未选择|select)$/i.test(placeholder)) return false;
+  const firstOption = field.options?.[0]?.trim();
+  if (firstOption === value && /请选择|请选|select|^-+$/i.test(firstOption)) return false;
+  return true;
 }
 
 function adaptValueToOptions(value: string, options: string[] | undefined): string {
@@ -155,16 +159,27 @@ function adaptValueToOptions(value: string, options: string[] | undefined): stri
   return close ?? value;
 }
 
-function adaptValueToField(value: string, field: FormFieldInfo): string {
+export function adaptValueToField(value: string, field: FormFieldInfo): string {
   const optionValue = adaptValueToOptions(value, field.options);
   const semantic = fieldSemanticText(field);
-  if (/年月|入学|毕业/.test(semantic) && /^\d{6}$/.test((field.value ?? '').trim())) {
-    const match = optionValue.match(/(20\d{2})\D{0,3}(\d{1,2})/);
-    if (match) return `${match[1]}${match[2].padStart(2, '0')}`;
+  const datePattern = field.dateFormat || field.html?.match(/dateFmt\s*:\s*['"]([^'"]+)['"]/i)?.[1];
+  const parts = optionValue.match(/((?:19|20)\d{2})\D{0,3}(\d{1,2})(?:\D{0,3}(\d{1,2}))?/);
+  if (datePattern && parts) {
+    const [, year, rawMonth, rawDay] = parts;
+    const month = rawMonth.padStart(2, '0');
+    const day = (rawDay ?? '1').padStart(2, '0');
+    return datePattern
+      .replace(/yyyy/g, year)
+      .replace(/MM/g, month)
+      .replace(/dd/g, day)
+      .replace(/M/g, String(Number(rawMonth)))
+      .replace(/d/g, String(Number(rawDay ?? '1')));
   }
-  if (/出生日期|年月日/.test(semantic) && /^\d{8}$/.test((field.value ?? '').trim())) {
-    const match = optionValue.match(/(20\d{2})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})/);
-    if (match) return `${match[1]}${match[2].padStart(2, '0')}${match[3].padStart(2, '0')}`;
+  if (/年月|入学|毕业/.test(semantic) && /^\d{6}$/.test((field.value ?? '').trim()) && parts) {
+    return `${parts[1]}${parts[2].padStart(2, '0')}`;
+  }
+  if (/出生日期|年月日/.test(semantic) && /^\d{8}$/.test((field.value ?? '').trim()) && parts?.[3]) {
+    return `${parts[1]}${parts[2].padStart(2, '0')}${parts[3].padStart(2, '0')}`;
   }
   return optionValue;
 }

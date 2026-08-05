@@ -6,11 +6,21 @@ import {
   getAllTextFields,
   saveAllTextFields,
 } from '@/utils/db';
-import { isSemanticallyCompatibleMatch, matchFields, matchFieldsStream } from '@/utils/matcher';
+import { matchFields, requestModelText } from '@/utils/matcher';
 import type { Category, FileRecord } from '@/utils/db';
 import type { MatchResult, FormFieldInfo, MaterialRole } from '@/utils/matcher';
 import { flattenProfileValues, getBlockSection, inferLanguageItems } from '@/utils/profile-schema';
-import { getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '@/utils/local-matcher';
+import { adaptValueToField, getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '@/utils/local-matcher';
+import { isPageValueConsistent } from '@/utils/value-compare';
+import { fieldFingerprint } from '@/utils/field-fingerprint';
+
+type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
+interface PageMarkerItem {
+  index: number;
+  fingerprint?: string;
+  status: PageMarkerStatus;
+  message?: string;
+}
 
 interface MessageMap {
   inspectPage: undefined;
@@ -18,12 +28,13 @@ interface MessageMap {
   startFill: { matches: MatchResult[] };
   manualFill: { value: string };
   markPageFields: {
-    items: Array<{ index: number; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
+    items: PageMarkerItem[];
   };
   focusPageField: { index: number };
   startAutoRun: undefined;
   getAutoRunStatus: undefined;
   stopAutoRun: undefined;
+  confirmMaterialsAndResume: undefined;
 }
 
 type MessageType = keyof MessageMap;
@@ -47,10 +58,14 @@ interface ScanSuccessResponse {
   matched: number;
   matches: MatchResult[];
   fields: FormFieldInfo[];
+  pageLabel: string;
+  pageUrl: string;
+  pageSignature: string;
   ai: {
     configured: boolean;
     mode: 'enhanced' | 'fallback';
     attempted: boolean;
+    cached: boolean;
     reviewed: number;
     error: string;
   };
@@ -79,6 +94,23 @@ interface PageActionSuccessResponse {
 
 type AutoRunStatus = 'running' | 'paused' | 'complete' | 'stopped';
 
+interface AutoRunHistoryEntry {
+  page: number;
+  pageKey: string;
+  label: string;
+  recognized: number;
+  matched: number;
+  verified: number;
+  conflicts: number;
+  filled: number;
+  aiAttempted: boolean;
+  aiCached: boolean;
+  aiReviewed: number;
+  status: 'checked' | 'paused' | 'complete' | 'error';
+  message: string;
+  updatedAt: number;
+}
+
 interface AutoRunState {
   tabId: number;
   status: AutoRunStatus;
@@ -86,6 +118,9 @@ interface AutoRunState {
   filledCount: number;
   message: string;
   updatedAt: number;
+  history: AutoRunHistoryEntry[];
+  pauseReason?: 'materials' | 'required' | 'navigation' | 'error';
+  confirmedMaterialPageKey?: string;
 }
 
 interface AutoRunSuccessResponse extends AutoRunState {
@@ -106,8 +141,48 @@ interface RoleScore {
 }
 
 const autoRunInFlight = new Set<number>();
+const AI_MATCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const AI_MATCH_CACHE_LIMIT = 40;
+const aiMatchCache = new Map<string, { expiresAt: number; matches: MatchResult[] }>();
+
+function shortStableHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index++) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function getCachedAiMatches(key: string): MatchResult[] | null {
+  const cached = aiMatchCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    aiMatchCache.delete(key);
+    return null;
+  }
+  return cached.matches.map((match) => ({ ...match }));
+}
+
+function cacheAiMatches(key: string, matches: MatchResult[]): void {
+  const now = Date.now();
+  for (const [cacheKey, cached] of aiMatchCache) {
+    if (cached.expiresAt <= now) aiMatchCache.delete(cacheKey);
+  }
+  while (aiMatchCache.size >= AI_MATCH_CACHE_LIMIT) {
+    const oldest = aiMatchCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    aiMatchCache.delete(oldest);
+  }
+  aiMatchCache.set(key, {
+    expiresAt: now + AI_MATCH_CACHE_TTL_MS,
+    matches: matches.map((match) => ({ ...match })),
+  });
+}
 
 const MATERIAL_LABELS: Record<MaterialRole, string> = {
+  application_form: '申请表',
+  id_card: '身份证件',
   id_photo: '证件照',
   id_card_front: '身份证正面',
   id_card_back: '身份证反面',
@@ -118,13 +193,23 @@ const MATERIAL_LABELS: Record<MaterialRole, string> = {
   language_certificate: '外语成绩证明',
   award_certificate: '获奖证明',
   academic_proof: '学术成果证明',
+  practice_proof: '实践经历证明',
   student_card: '学生证',
   recommendation_letter: '推荐信',
+  mentor_consent: '导师同意证明',
   enrollment_certificate: '在读证明',
   resume: '个人简历',
 };
 
 const ROLE_KEYWORDS: Record<MaterialRole, { exact: string[]; alias: string[] }> = {
+  application_form: {
+    exact: ['推免生申请表', '推荐免试研究生申请表', '报名申请表', '申请表'],
+    alias: ['申请材料表', '报名表'],
+  },
+  id_card: {
+    exact: ['身份证正反面', '身份证扫描件', '身份证件', '有效居民身份证'],
+    alias: ['身份证'],
+  },
   id_photo: {
     exact: ['证件照', '免冠照片', '免冠照', '个人照片', '报名照片'],
     alias: ['照片', '头像'],
@@ -165,6 +250,10 @@ const ROLE_KEYWORDS: Record<MaterialRole, { exact: string[]; alias: string[] }> 
     exact: ['学术成果证明', '科研成果证明', '论文证明', '专利证书'],
     alias: ['论文', '专利', '科研成果', '学术成果'],
   },
+  practice_proof: {
+    exact: ['实践经历证明', '实习证明', '科研训练证明', '社会工作证明'],
+    alias: ['实践经历', '实习实践', '科研训练', '社会工作'],
+  },
   student_card: {
     exact: ['学生证', '学生证件'],
     alias: ['学生身份'],
@@ -172,6 +261,10 @@ const ROLE_KEYWORDS: Record<MaterialRole, { exact: string[]; alias: string[] }> 
   recommendation_letter: {
     exact: ['专家推荐信', '专家推荐书', '推荐信'],
     alias: ['推荐材料', '推荐书'],
+  },
+  mentor_consent: {
+    exact: ['导师同意报名证明', '导师同意证明', '导师接收证明'],
+    alias: ['导师同意', '导师接收'],
   },
   enrollment_certificate: {
     exact: ['在读证明', '学籍证明', '在校证明'],
@@ -209,9 +302,24 @@ function autoRunKey(tabId: number): string {
   return `autoRun:${tabId}`;
 }
 
+function markerStoreKey(tabId: number): string {
+  return `autoRunMarkers:${tabId}`;
+}
+
+function pageKey(url: string | undefined): string {
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return url;
+  }
+}
+
 async function getAutoRunState(tabId: number): Promise<AutoRunState | null> {
   const result = await chrome.storage.session.get(autoRunKey(tabId));
-  return (result[autoRunKey(tabId)] as AutoRunState | undefined) ?? null;
+  const state = (result[autoRunKey(tabId)] as AutoRunState | undefined) ?? null;
+  return state ? { ...state, history: state.history ?? [] } : null;
 }
 
 async function saveAutoRunState(state: AutoRunState): Promise<void> {
@@ -225,6 +333,38 @@ async function saveAutoRunState(state: AutoRunState): Promise<void> {
 
 function autoRunResponse(state: AutoRunState): AutoRunSuccessResponse {
   return { ok: true, type: 'autoRun', ...state };
+}
+
+async function rememberPageMarkers(tabId: number, url: string | undefined, items: PageMarkerItem[]): Promise<void> {
+  const key = pageKey(url);
+  if (!key) return;
+  const storageKey = markerStoreKey(tabId);
+  const stored = await chrome.storage.session.get(storageKey);
+  const pages = (stored[storageKey] as Record<string, { items: PageMarkerItem[]; updatedAt: number }> | undefined) ?? {};
+  pages[key] = { items, updatedAt: Date.now() };
+  const trimmed = Object.fromEntries(
+    Object.entries(pages).sort((a, b) => b[1].updatedAt - a[1].updatedAt).slice(0, 30),
+  );
+  await chrome.storage.session.set({ [storageKey]: trimmed });
+}
+
+async function restorePageMarkers(tabId: number, url: string | undefined): Promise<void> {
+  const key = pageKey(url);
+  if (!key) return;
+  const storageKey = markerStoreKey(tabId);
+  const stored = await chrome.storage.session.get(storageKey);
+  const page = (stored[storageKey] as Record<string, { items: PageMarkerItem[] }> | undefined)?.[key];
+  if (!page) return;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
+    const current = await chrome.tabs.get(tabId).catch(() => undefined);
+    if (!current || pageKey(current.url) !== key) return;
+    const result = await sendToContentScript<{ marked?: number }>(
+      tabId,
+      { type: 'markPreview', items: page.items },
+    ).catch(() => undefined);
+    if ((result?.marked ?? 0) > 0 || page.items.length === 0) return;
+  }
 }
 
 async function sendToContentScript<T>(
@@ -250,6 +390,9 @@ function normalizeMaterialText(text: string): string {
 
 function scoreRole(text: string, role: MaterialRole): RoleScore {
   const normalized = normalizeMaterialText(text);
+  if (role === 'award_certificate' && /荣誉学院|荣誉班|强化班|拔尖班|强基班|培优班/.test(normalized)) {
+    return { role, score: 0, exact: false };
+  }
   const keywords = ROLE_KEYWORDS[role];
   let score = 0;
   let exact = false;
@@ -288,6 +431,16 @@ function detectBestRole(text: string): RoleScore | null {
   return scores[0];
 }
 
+function scoreCandidateForField(text: string, fieldRole: MaterialRole): RoleScore {
+  const compatibleRoles = fieldRole === 'language_certificate'
+    ? [fieldRole, 'cet4_certificate', 'cet6_certificate'] as MaterialRole[]
+    : [fieldRole];
+  const best = compatibleRoles
+    .map((role) => scoreRole(text, role))
+    .sort((a, b) => b.score - a.score)[0];
+  return { role: fieldRole, score: best?.score ?? 0, exact: best?.exact ?? false };
+}
+
 function acceptsFile(accept: string | undefined, filename: string, fileType: string): boolean {
   const rules = (accept ?? '')
     .split(',')
@@ -305,6 +458,34 @@ function acceptsFile(accept: string | undefined, filename: string, fileType: str
   });
 }
 
+function effectiveFileAccept(field: FormFieldInfo): string {
+  if (field.accept?.trim()) return field.accept;
+  const text = [field.label, field.hint, field.context, field.html].filter(Boolean).join(' ');
+  if (/(?:^|\s|[，,：:（(])pdf(?:$|\s|[，,。；;）)])/i.test(text)) return '.pdf,application/pdf';
+  if (/图片|照片|图像|jpe?g|png/i.test(text)) return 'image/*';
+  if (/word|docx?/i.test(text)) return '.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  return '';
+}
+
+function isCandidateSpecificEnough(text: string, role: MaterialRole): boolean {
+  const normalized = normalizeMaterialText(text);
+  if (role === 'id_card') {
+    const singleSide = /(正面|人像面|反面|国徽面)/.test(normalized) && !/正反面/.test(normalized);
+    return !singleSide;
+  }
+  return true;
+}
+
+function materialCandidatePriority(record: FileRecord, role: MaterialRole): number {
+  const stem = normalizeMaterialText(record.filename.replace(/\.[^.]+$/, ''));
+  if (role === 'id_card') {
+    if (stem === '身份证') return 30;
+    if (/身份证正反面/.test(stem)) return 25;
+    if (/身份证/.test(stem)) return 15;
+  }
+  return 0;
+}
+
 function inferFileType(filename: string, fileType: string): string {
   if (fileType) return fileType;
   if (/\.jpe?g$/i.test(filename)) return 'image/jpeg';
@@ -314,6 +495,28 @@ function inferFileType(filename: string, fileType: string): string {
   if (/\.doc$/i.test(filename)) return 'application/msword';
   if (/\.docx$/i.test(filename)) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   return '';
+}
+
+async function filterReadableFileRecords(records: FileRecord[]): Promise<FileRecord[]> {
+  const checks = await Promise.all(records.map(async (record) => {
+    try {
+      await record.fileBody.slice(0, 1).arrayBuffer();
+      return record;
+    } catch {
+      return null;
+    }
+  }));
+  return checks.filter((record): record is FileRecord => record != null);
+}
+
+function maxFileBytesFromField(field: FormFieldInfo): number | null {
+  const text = [field.label, field.hint, field.context, field.html].filter(Boolean).join(' ');
+  const match = text.match(/(?:不超过|不得超过|小于|最大|≤|<=)\s*(\d+(?:\.\d+)?)\s*(KB|MB|GB)/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  const unit = match[2].toUpperCase();
+  const multiplier = unit === 'GB' ? 1024 ** 3 : unit === 'MB' ? 1024 ** 2 : 1024;
+  return Number.isFinite(value) ? value * multiplier : null;
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -328,6 +531,17 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 
 function getCategoryName(record: FileRecord, categoryById: Map<number, Category>): string {
   return categoryById.get(record.categoryId)?.name ?? '';
+}
+
+function hasSpecificRecordOverlap(field: FormFieldInfo, record: FileRecord): boolean {
+  const fieldText = normalizeMaterialText(field.label || field.hint || '');
+  const candidates = [
+    record.filename.replace(/\.[^.]+$/, ''),
+    record.fileDescription,
+  ].map((text) => normalizeMaterialText(text)
+    .replace(/证明材料|证明|证书|扫描件|附件|文件|汇总|完整版/g, ''))
+    .filter((text) => text.length >= 3);
+  return candidates.some((text) => fieldText.includes(text) || text.includes(fieldText));
 }
 
 function detectFileFieldRole(field: FormFieldInfo): RoleScore | null {
@@ -362,31 +576,46 @@ function matchFileFields(
   return fileFields.flatMap((field) => {
     const fieldRole = detectFileFieldRole(field);
     if (!fieldRole) return [];
+    const maxFileBytes = maxFileBytesFromField(field);
 
     const candidates = availableRecords
       .map((record) => {
-        const text = [
+        const specificText = [
           record.filename,
           record.fileDescription,
-          getCategoryName(record, categoryById),
         ].filter(Boolean).join(' ');
-        const materialRole = scoreRole(text, fieldRole.role);
+        const categoryText = getCategoryName(record, categoryById);
+        let materialRole = scoreCandidateForField(specificText, fieldRole.role);
+        if (materialRole.score === 0 && categoryText) {
+          const categoryRole = scoreCandidateForField(categoryText, fieldRole.role);
+          materialRole = { ...categoryRole, score: Math.min(3, categoryRole.score), exact: false };
+        }
         return { record, materialRole };
       })
       .filter(({ record, materialRole }) => (
         materialRole.score > 0 &&
-        acceptsFile(field.accept, record.filename, inferFileType(record.filename, record.fileType))
+        isCandidateSpecificEnough([
+          record.filename,
+          record.fileDescription,
+          getCategoryName(record, categoryById),
+        ].filter(Boolean).join(' '), fieldRole.role) &&
+        acceptsFile(effectiveFileAccept(field), record.filename, inferFileType(record.filename, record.fileType)) &&
+        (maxFileBytes == null || record.fileSize <= maxFileBytes)
       ))
       .sort((a, b) => (
         b.materialRole.score - a.materialRole.score ||
+        materialCandidatePriority(b.record, fieldRole.role) - materialCandidatePriority(a.record, fieldRole.role) ||
         b.record.createdAt - a.record.createdAt
       ));
 
     const best = candidates[0];
     if (!best?.record.id) return [];
 
+    const isHighlySpecificField = normalizeMaterialText(field.label).length > 30;
     const confidence: MatchResult['confidence'] =
-      fieldRole.exact && best.materialRole.exact
+      isHighlySpecificField && !hasSpecificRecordOverlap(field, best.record)
+        ? 'low'
+        : fieldRole.exact && best.materialRole.exact
         ? 'high'
         : fieldRole.score >= 5 && best.materialRole.score >= 5
           ? 'medium'
@@ -403,9 +632,105 @@ function matchFileFields(
       fileName: best.record.filename,
       fileType: inferFileType(best.record.filename, best.record.fileType),
       materialRole: fieldRole.role,
+      fileCandidates: candidates.slice(0, 5).flatMap(({ record }) => (
+        record.id == null ? [] : [{
+          fileRecordId: record.id,
+          fileName: record.filename,
+          fileType: inferFileType(record.filename, record.fileType),
+        }]
+      )),
       source: 'material',
     }];
   });
+}
+
+async function reviewFileMatchesWithAi(
+  pageSignature: string,
+  fileFields: FormFieldInfo[],
+  localMatches: MatchResult[],
+  apiConfig: Awaited<ReturnType<typeof getApiConfig>>,
+): Promise<{ matches: MatchResult[]; attempted: boolean; cached: boolean; reviewed: number; error: string }> {
+  if (localMatches.length === 0) {
+    return { matches: localMatches, attempted: false, cached: false, reviewed: 0, error: '' };
+  }
+
+  const cacheKey = `materials:${shortStableHash(JSON.stringify({
+    pageSignature,
+    fields: fileFields.map((field) => fieldFingerprint(field)),
+    candidates: localMatches.map((match) => [match.index, match.fileCandidates]),
+    api: [apiConfig.baseUrl, apiConfig.model, apiConfig.providerId, apiConfig.apiMode, apiConfig.fastMode],
+  }))}`;
+  const cached = getCachedAiMatches(cacheKey);
+  if (cached) {
+    return {
+      matches: cached,
+      attempted: true,
+      cached: true,
+      reviewed: cached.filter((match) => match.source === 'ai_reviewed').length,
+      error: '',
+    };
+  }
+
+  const fieldByIndex = new Map(fileFields.map((field) => [field.index, field]));
+  const prompt = `你是推免报名材料匹配审核助手。请从每个上传字段给出的候选文件中选择语义最准确的一份。
+
+规则：
+- 只能选择该字段候选列表中真实存在的 fileRecordId，不能编造文件或编号。
+- 必须综合字段名称、说明、格式要求和文件名判断，不能仅凭“证明”“材料”等泛词匹配。
+- 身份证、成绩单、学籍证明、四六级成绩、申请表等材料不可互相替代。
+- 含义明确返回 high；基本明确但仍需用户重点预览返回 medium；无法可靠判断则不要返回该字段。
+- 只返回 JSON 数组，每项格式：{"index":数字,"fileRecordId":数字,"confidence":"high|medium"}。
+
+上传字段与候选：
+${localMatches.map((match) => {
+    const field = fieldByIndex.get(match.index);
+    const fieldText = [field?.label, field?.hint, field?.context, field?.accept]
+      .filter(Boolean)
+      .join(' | ')
+      .replace(/\s+/g, ' ')
+      .slice(0, 500);
+    const candidates = (match.fileCandidates ?? []).map((candidate) => (
+      `${candidate.fileRecordId}:${candidate.fileName}`
+    )).join('；');
+    return `[${match.index}] 字段=${fieldText}\n候选=${candidates}`;
+  }).join('\n')}`;
+
+  try {
+    const content = await requestModelText(apiConfig, prompt);
+    const json = content.match(/\[[\s\S]*\]/)?.[0];
+    if (!json) throw new Error('材料匹配响应不是有效 JSON 数组');
+    const choices = JSON.parse(json) as Array<{ index?: unknown; fileRecordId?: unknown; confidence?: unknown }>;
+    const choiceByIndex = new Map(choices.map((choice) => [Number(choice.index), choice]));
+    let reviewed = 0;
+    const matches: MatchResult[] = localMatches.map((match): MatchResult => {
+      const choice = choiceByIndex.get(match.index);
+      const candidate = match.fileCandidates?.find((item) => item.fileRecordId === Number(choice?.fileRecordId));
+      if (!candidate || (choice?.confidence !== 'high' && choice?.confidence !== 'medium')) {
+        return { ...match, confidence: 'low' as const };
+      }
+      reviewed++;
+      const confidence: MatchResult['confidence'] = choice.confidence;
+      return {
+        ...match,
+        value: candidate.fileName,
+        confidence,
+        fileRecordId: candidate.fileRecordId,
+        fileName: candidate.fileName,
+        fileType: candidate.fileType,
+        source: 'ai_reviewed' as const,
+      };
+    });
+    cacheAiMatches(cacheKey, matches);
+    return { matches, attempted: true, cached: false, reviewed, error: '' };
+  } catch (error) {
+    return {
+      matches: localMatches,
+      attempted: true,
+      cached: false,
+      reviewed: 0,
+      error: error instanceof Error ? error.message : 'AI 材料匹配失败',
+    };
+  }
 }
 
 export default defineBackground(() => {
@@ -421,17 +746,9 @@ export default defineBackground(() => {
     return true;
   });
 
-  chrome.runtime.onConnect.addListener((port) => {
-    if (port.name !== 'stream-fill') return;
-    port.onMessage.addListener(async (msg) => {
-      if (msg.type === 'startStreamScan') {
-        await handleStreamScan(port);
-      }
-    });
-  });
-
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo.status !== 'complete') return;
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.status !== 'complete' && !changeInfo.url) return;
+    setTimeout(() => { void restorePageMarkers(tabId, changeInfo.url ?? tab.url); }, 300);
     void getAutoRunState(tabId).then((state) => {
       if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);
     });
@@ -439,15 +756,9 @@ export default defineBackground(() => {
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     autoRunInFlight.delete(tabId);
-    void chrome.storage.session.remove(autoRunKey(tabId));
+    void chrome.storage.session.remove([autoRunKey(tabId), markerStoreKey(tabId)]);
   });
 
-  chrome.commands.onCommand.addListener(async (command) => {
-    if (command === 'stream-fill') {
-      console.log('%c⌨️ 快捷键触发流式填充', 'color:#6C5CE7;font-weight:bold');
-      await handleStreamScan();
-    }
-  });
 });
 
 async function seedDevData() {
@@ -505,6 +816,9 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'stopAutoRun') {
     return handleStopAutoRun();
   }
+  if (request.type === 'confirmMaterialsAndResume') {
+    return handleConfirmMaterialsAndResume();
+  }
   return errorResponse('Unknown message type');
 }
 
@@ -536,10 +850,11 @@ async function handleManualFill(value: string): Promise<Response> {
 }
 
 async function handleMarkPageFields(
-  items: Array<{ index: number; status: 'verified' | 'review' | 'mismatch'; message?: string }>,
+  items: PageMarkerItem[],
 ): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
+  await rememberPageMarkers(tab.id, tab.url, items);
   await sendToContentScript(tab.id, { type: 'markPreview', items });
   return { ok: true, type: 'pageAction' };
 }
@@ -562,6 +877,7 @@ async function handleGetAutoRunStatus(): Promise<Response> {
     filledCount: 0,
     message: '尚未开始连续填写',
     updatedAt: Date.now(),
+    history: [],
   });
 }
 
@@ -576,6 +892,8 @@ async function handleStartAutoRun(): Promise<Response> {
     filledCount: previous?.status === 'paused' ? previous.filledCount : 0,
     message: '后台正在填写当前页面',
     updatedAt: Date.now(),
+    history: previous?.status === 'paused' ? previous.history : [],
+    confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
   };
   await saveAutoRunState(state);
   void processAutoRun(tab.id);
@@ -593,9 +911,29 @@ async function handleStopAutoRun(): Promise<Response> {
     filledCount: previous?.filledCount ?? 0,
     message: '已停止连续填写',
     updatedAt: Date.now(),
+    history: previous?.history ?? [],
+    confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
   };
   await saveAutoRunState(state);
   return autoRunResponse(state);
+}
+
+async function handleConfirmMaterialsAndResume(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const previous = await getAutoRunState(tab.id);
+  if (!previous || previous.status !== 'paused' || previous.pauseReason !== 'materials') {
+    return errorResponse('当前页面没有等待确认的上传材料');
+  }
+  const meta = await sendToContentScript<{ url: string }>(tab.id, { type: 'getPageMeta' });
+  previous.status = 'running';
+  previous.pauseReason = undefined;
+  previous.confirmedMaterialPageKey = pageKey(meta.url);
+  previous.message = '材料已由本人确认，正在核对必填项并进入下一步';
+  previous.updatedAt = Date.now();
+  await saveAutoRunState(previous);
+  void processAutoRun(tab.id);
+  return autoRunResponse(previous);
 }
 
 async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSuccessResponse> {
@@ -607,15 +945,16 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     getAllFileRecords(),
     getAllCategories(),
   ]);
+  const readableFileRecords = await filterReadableFileRecords(fileRecords);
   await sendToContentScript(tabId, {
     type: 'prepareRepeatRows',
     targets: getRepeatRowTargets(blocks, textFields),
   });
 
-  const scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
-    tabId,
-    { type: 'scan' },
-  );
+  const [scanResults, pageMeta] = await Promise.all([
+    sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
+    sendToContentScript<{ label: string; url: string; signature: string }>(tabId, { type: 'getPageMeta' }),
+  ]);
   if (!scanResults?.length) {
     return {
       ok: true,
@@ -624,10 +963,14 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
       matched: 0,
       matches: [],
       fields: [],
+      pageLabel: pageMeta?.label || '当前页面',
+      pageUrl: pageMeta?.url || '',
+      pageSignature: pageMeta?.signature || pageMeta?.url || '',
       ai: {
         configured: textApiReady,
         mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
         attempted: false,
+        cached: false,
         reviewed: 0,
         error: '',
       },
@@ -641,24 +984,61 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     ? textFieldInfos.filter((field) => !field.protected || /只读|锁定/.test(field.protectionReason ?? ''))
     : getAiEligibleFields(textFieldInfos, localMatches);
   const profileValues = flattenProfileValues(textFields, blocks);
+  const fieldByIndex = new Map(textFieldInfos.map((field) => [field.index, field]));
   let aiMatches: MatchResult[] = [];
   let aiError = '';
   let aiAttempted = false;
+  let aiCached = false;
+  let materialAiReviewed = 0;
   if (allowAi && textApiReady && aiFields.length > 0 && profileValues.length > 0) {
     aiAttempted = true;
-    try {
-      aiMatches = await matchFields(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value })));
-    } catch (error) {
-      aiMatches = [];
-      aiError = (error instanceof Error ? error.message : 'API 调用失败').replace(/\s+/g, ' ').slice(0, 180);
+    const aiCacheKey = shortStableHash(JSON.stringify({
+      tabId,
+      page: pageMeta?.signature || pageMeta?.url || '',
+      fields: aiFields.map((field) => fieldFingerprint(field)),
+      profile: profileValues.map(({ key, value }) => [key, value]),
+      api: [apiConfig.baseUrl, apiConfig.model, apiConfig.providerId, apiConfig.apiMode, apiConfig.fastMode, apiConfig.aiEnhanced],
+    }));
+    const cached = getCachedAiMatches(aiCacheKey);
+    if (cached) {
+      aiMatches = cached;
+      aiCached = true;
+    } else {
+      try {
+        aiMatches = (await matchFields(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value }))))
+          .map((match) => {
+            const field = fieldByIndex.get(match.index);
+            return field ? { ...match, value: adaptValueToField(match.value, field) } : match;
+          });
+        cacheAiMatches(aiCacheKey, aiMatches);
+      } catch (error) {
+        aiMatches = [];
+        aiError = (error instanceof Error ? error.message : 'API 调用失败').replace(/\s+/g, ' ').slice(0, 180);
+      }
     }
   }
-  const fileMatches = matchFileFields(fieldInfos, fileRecords, categories);
+  let fileMatches = matchFileFields(fieldInfos, readableFileRecords, categories);
+  if (allowAi && textApiReady && fileMatches.length > 0) {
+    const materialReview = await reviewFileMatchesWithAi(
+      pageMeta?.signature || pageMeta?.url || '',
+      fieldInfos.filter((field) => field.kind === 'file'),
+      fileMatches,
+      apiConfig,
+    );
+    fileMatches = materialReview.matches;
+    aiAttempted = aiAttempted || materialReview.attempted;
+    aiCached = aiCached || materialReview.cached;
+    if (materialReview.error) aiError = [aiError, materialReview.error].filter(Boolean).join('；');
+    materialAiReviewed = materialReview.reviewed;
+  }
   const aiByIndex = new Map(aiMatches.map((match) => [match.index, match]));
   const localByIndex = new Map(localMatches.map((match) => [match.index, match]));
   const reviewedMatches = localMatches.map((localMatch) => {
     const aiMatch = aiByIndex.get(localMatch.index);
     if (!aiMatch) return localMatch;
+    if (apiConfig.aiEnhanced && aiMatch.confidence === 'high') {
+      return aiMatch;
+    }
     if (localMatch.confidence === 'medium' && aiMatch.confidence === 'high') return aiMatch;
     return { ...localMatch, source: 'ai_reviewed' as const };
   });
@@ -671,11 +1051,15 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     matched: matches.length,
     matches,
     fields: fieldInfos,
+    pageLabel: fieldInfos.find((field) => field.groupLabel)?.groupLabel || pageMeta?.label || fieldInfos[0]?.label || '当前页面',
+    pageUrl: pageMeta?.url || '',
+    pageSignature: pageMeta?.signature || pageMeta?.url || '',
     ai: {
       configured: textApiReady,
       mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
       attempted: aiAttempted,
-      reviewed: aiMatches.length,
+      cached: aiCached,
+      reviewed: aiMatches.length + materialAiReviewed,
       error: aiError,
     },
   };
@@ -687,12 +1071,7 @@ async function handleScan(): Promise<Response> {
   return collectTabScan(tab.id);
 }
 
-async function handleFill(
-  matches: MatchResult[],
-): Promise<Response> {
-  const tab = await getCurrentTab();
-  if (!tab?.id) return errorResponse('No active tab found');
-
+async function resolveContentFillItems(matches: MatchResult[]): Promise<ContentFillItem[]> {
   const fileMatches = matches.filter((match) => match.kind === 'file' && match.fileRecordId != null);
   const fileRecordById = new Map<number, FileRecord>();
   if (fileMatches.length > 0) {
@@ -708,17 +1087,31 @@ async function handleFill(
       if (match.fileRecordId == null) continue;
       const record = fileRecordById.get(match.fileRecordId);
       if (!record) continue;
-      items.push({
-        kind: 'file',
-        index: match.index,
-        fileName: record.filename,
-        fileType: inferFileType(record.filename, record.fileType),
-        fileBody: arrayBufferToBase64(await record.fileBody.arrayBuffer()),
-      });
+      try {
+        items.push({
+          kind: 'file',
+          index: match.index,
+          fileName: record.filename,
+          fileType: inferFileType(record.filename, record.fileType),
+          fileBody: arrayBufferToBase64(await record.fileBody.arrayBuffer()),
+        });
+      } catch {
+        // Stale IndexedDB blobs can outlive their browser backing file.
+      }
     } else {
       items.push({ kind: 'text', index: match.index, value: match.value, confidence: match.confidence });
     }
   }
+  return items;
+}
+
+async function handleFill(
+  matches: MatchResult[],
+): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+
+  const items = await resolveContentFillItems(matches);
 
   const result = await sendToContentScript<{ success: number; failure: number }>(
     tab.id,
@@ -726,6 +1119,86 @@ async function handleFill(
   );
 
   return { ok: true, type: 'fill', success: result.success, failure: result.failure };
+}
+
+function buildPageMarkers(scan: ScanSuccessResponse): PageMarkerItem[] {
+  const matchByIndex = new Map(scan.matches.map((match) => [match.index, match]));
+  return scan.fields.flatMap<PageMarkerItem>((field) => {
+    const match = matchByIndex.get(field.index);
+    const filled = isMeaningfullyFilled(field);
+    if (match?.kind === 'file') {
+      return [{
+        index: field.index,
+        fingerprint: fieldFingerprint(field),
+        status: 'review' as const,
+        message: filled
+          ? '保填：页面已有材料，请预览核对后确认'
+          : '保填：已生成候选材料，低置信项不会自动上传',
+      }];
+    }
+    if (match && filled) {
+      const allowSystemPrefix = field.selectionMode === 'dialog' || /出生地|籍贯|学校|院校|专业/.test(field.label ?? '');
+      const consistent = isPageValueConsistent(field.value, match.value, allowSystemPrefix);
+      return [{
+        index: field.index,
+        fingerprint: fieldFingerprint(field),
+        status: consistent ? 'verified' as const : 'mismatch' as const,
+        message: consistent ? '保填：页面值与已保存资料一致' : '保填：页面值与已保存资料不一致',
+      }];
+    }
+    if (match) {
+      return [{
+        index: field.index,
+        fingerprint: fieldFingerprint(field),
+        status: match.confidence === 'high' ? 'verified' as const : 'review' as const,
+        message: match.confidence === 'high' ? '保填：高置信匹配，待填入' : '保填：匹配结果需要确认',
+      }];
+    }
+    if (field.protected || filled) {
+      return [{
+        index: field.index,
+        fingerprint: fieldFingerprint(field),
+        status: 'review' as const,
+        message: field.protected ? `保填：${field.protectionReason || '需本人处理'}` : '保填：页面已有值，但资料中没有可核对项',
+      }];
+    }
+    return [];
+  });
+}
+
+function upsertAutoRunHistory(state: AutoRunState, entry: AutoRunHistoryEntry): AutoRunHistoryEntry {
+  const previous = state.history.at(-1);
+  if (previous?.pageKey === entry.pageKey) {
+    Object.assign(previous, entry);
+    return previous;
+  }
+  state.history.push(entry);
+  if (state.history.length > 20) state.history.splice(0, state.history.length - 20);
+  return entry;
+}
+
+function shouldAutoFillMatch(match: MatchResult, field: FormFieldInfo | undefined): boolean {
+  if (!field || match.kind === 'file' || match.confidence === 'low') return false;
+  return !isMeaningfullyFilled(field);
+}
+
+async function isSamePage(tabId: number, scan: ScanSuccessResponse): Promise<boolean> {
+  try {
+    const current = await sendToContentScript<{ url: string; signature: string }>(
+      tabId,
+      { type: 'getPageMeta' },
+      false,
+    );
+    return current.url === scan.pageUrl && current.signature === scan.pageSignature;
+  } catch {
+    return false;
+  }
+}
+
+async function retryAutoRunAfterPageChange(state: AutoRunState): Promise<void> {
+  state.message = '检测到页面已切换，已丢弃旧页结果并重新识别';
+  await saveAutoRunState(state);
+  setTimeout(() => { void processAutoRun(state.tabId); }, 500);
 }
 
 async function processAutoRun(tabId: number): Promise<void> {
@@ -753,11 +1226,64 @@ async function processAutoRun(tabId: number): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 600));
       scan = await collectTabScan(tabId);
     }
+    if (!(await isSamePage(tabId, scan))) {
+      await retryAutoRunAfterPageChange(state);
+      return;
+    }
+    const markers = buildPageMarkers(scan);
+    await Promise.all([
+      rememberPageMarkers(tabId, scan.pageUrl, markers),
+      sendToContentScript(tabId, { type: 'markPreview', items: markers }).catch(() => undefined),
+    ]);
+    const verifiedCount = markers.filter((marker) => marker.status === 'verified').length;
+    const conflictCount = markers.filter((marker) => marker.status === 'mismatch').length;
+    const historyEntry = upsertAutoRunHistory(state, {
+      page: state.pageCount + 1,
+      pageKey: pageKey(scan.pageUrl),
+      label: scan.pageLabel,
+      recognized: scan.total,
+      matched: scan.matched,
+      verified: verifiedCount,
+      conflicts: conflictCount,
+      filled: 0,
+      aiAttempted: scan.ai.attempted,
+      aiCached: scan.ai.cached,
+      aiReviewed: scan.ai.reviewed,
+      status: 'checked',
+      message: '页面已扫描并标色',
+      updatedAt: Date.now(),
+    });
+    await saveAutoRunState(state);
     const scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
+    const fileFields = scan.fields.filter((field) => field.kind === 'file');
+    const currentMaterialPageKey = pageKey(scan.pageUrl);
+    if (fileFields.length > 0 && state.confirmedMaterialPageKey !== currentMaterialPageKey) {
+      const safeFileMatches = scan.matches.filter((match) => {
+        const field = scannedFieldByIndex.get(match.index);
+        return match.kind === 'file' &&
+          match.fileRecordId != null &&
+          match.confidence !== 'low' &&
+          Boolean(field) &&
+          !isMeaningfullyFilled(field!);
+      });
+      const fileItems = await resolveContentFillItems(safeFileMatches);
+      const uploadResult = fileItems.length > 0
+        ? await sendToContentScript<{ success: number; failure: number }>(tabId, { type: 'fill', items: fileItems })
+        : { success: 0, failure: 0 };
+      state.filledCount += uploadResult.success;
+      state.status = 'paused';
+      state.pauseReason = 'materials';
+      const candidateCount = scan.matches.filter((match) => match.kind === 'file' && match.fileRecordId != null).length;
+      state.message = `发现 ${fileFields.length} 个上传项，已自动选择并写入 ${uploadResult.success} 项，生成 ${candidateCount} 组候选。请预览核对后确认进入下一步。`;
+      historyEntry.filled = uploadResult.success;
+      historyEntry.status = 'paused';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
+      await saveAutoRunState(state);
+      return;
+    }
     const selectedMatches = scan.matches.filter((match) => (
-      match.kind !== 'file' &&
-      match.confidence !== 'low' &&
-      !isMeaningfullyFilled(scannedFieldByIndex.get(match.index) ?? ({} as FormFieldInfo))
+      shouldAutoFillMatch(match, scannedFieldByIndex.get(match.index))
     ));
     const result = await sendToContentScript<{ success: number; failure: number }>(tabId, {
       type: 'fill',
@@ -768,24 +1294,53 @@ async function processAutoRun(tabId: number): Promise<void> {
         confidence: match.confidence,
       })),
     });
+    if (!(await isSamePage(tabId, scan))) {
+      if (state.history.at(-1) === historyEntry) state.history.pop();
+      await retryAutoRunAfterPageChange(state);
+      return;
+    }
     state.filledCount += result.success;
+    historyEntry.filled = result.success;
+    historyEntry.message = result.success > 0 ? `已填入 ${result.success} 项并回读` : '已有内容仅核对，未覆盖';
+    historyEntry.updatedAt = Date.now();
 
-    const afterResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
-      tabId,
-      { type: 'scan' },
-    );
+    const [afterResults, afterMeta] = await Promise.all([
+      sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
+      sendToContentScript<{ url: string; signature: string }>(tabId, { type: 'getPageMeta' }),
+    ]);
+    if (afterMeta.url !== scan.pageUrl || afterMeta.signature !== scan.pageSignature) {
+      state.filledCount -= result.success;
+      if (state.history.at(-1) === historyEntry) state.history.pop();
+      await retryAutoRunAfterPageChange(state);
+      return;
+    }
+    const afterFields = (afterResults ?? []).map((resultItem) => ({ ...resultItem.field, index: resultItem.index }));
+    const afterMarkers = buildPageMarkers({ ...scan, fields: afterFields });
+    await Promise.all([
+      rememberPageMarkers(tabId, scan.pageUrl, afterMarkers),
+      sendToContentScript(tabId, { type: 'markPreview', items: afterMarkers }).catch(() => undefined),
+    ]);
+    historyEntry.verified = afterMarkers.filter((marker) => marker.status === 'verified').length;
+    historyEntry.conflicts = afterMarkers.filter((marker) => marker.status === 'mismatch').length;
     const blockers = (afterResults ?? [])
       .map((resultItem) => ({ ...resultItem.field, index: resultItem.index }))
       .filter((field) => field.required && !isMeaningfullyFilled(field));
     if (blockers.length > 0) {
       const labels = blockers.slice(0, 3).map((field) => field.label || field.columnLabel || `字段${field.index + 1}`);
       state.status = 'paused';
+      state.pauseReason = 'required';
       state.message = `本页还有 ${blockers.length} 个必填项需处理：${labels.join('、')}`;
+      historyEntry.status = 'paused';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
       await saveAutoRunState(state);
       return;
     }
 
     state.message = '本页填写完成，正在安全进入下一步';
+    state.pauseReason = undefined;
+    historyEntry.message = state.message;
+    historyEntry.updatedAt = Date.now();
     await saveAutoRunState(state);
     let advance: { clicked: boolean; advanced: boolean; reason: string };
     try {
@@ -798,6 +1353,9 @@ async function processAutoRun(tabId: number): Promise<void> {
       // so tab.status alone is not a reliable navigation signal.
       state.pageCount++;
       state.message = '页面切换中，后台会在新页面稳定后继续填写';
+      historyEntry.status = 'checked';
+      historyEntry.message = '本页已核对，正在进入下一页';
+      historyEntry.updatedAt = Date.now();
       await saveAutoRunState(state);
       setTimeout(() => { void processAutoRun(tabId); }, 700);
       return;
@@ -807,154 +1365,45 @@ async function processAutoRun(tabId: number): Promise<void> {
       state.pageCount++;
       state.status = 'complete';
       state.message = '已到最终审核页，未执行提交，请逐项核对后本人决定';
+      historyEntry.status = 'complete';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
       await saveAutoRunState(state);
       return;
     }
     if (!advance.advanced) {
       state.status = 'paused';
+      state.pauseReason = 'navigation';
       state.message = advance.reason;
+      historyEntry.status = 'paused';
+      historyEntry.message = advance.reason;
+      historyEntry.updatedAt = Date.now();
       await saveAutoRunState(state);
       return;
     }
 
     state.pageCount++;
     state.message = '已进入下一页，后台继续填写';
+    historyEntry.status = 'checked';
+    historyEntry.message = '本页已核对并进入下一页';
+    historyEntry.updatedAt = Date.now();
     await saveAutoRunState(state);
     setTimeout(() => { void processAutoRun(tabId); }, 250);
   } catch (error) {
     const state = await getAutoRunState(tabId);
     if (state?.status === 'running') {
       state.status = 'paused';
+      state.pauseReason = 'error';
       state.message = error instanceof Error ? error.message : '连续填写遇到错误，已暂停';
+      const historyEntry = state.history.at(-1);
+      if (historyEntry) {
+        historyEntry.status = 'error';
+        historyEntry.message = state.message;
+        historyEntry.updatedAt = Date.now();
+      }
       await saveAutoRunState(state);
     }
   } finally {
     autoRunInFlight.delete(tabId);
-  }
-}
-
-async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
-  const tab = await getCurrentTab();
-  if (!tab?.id) {
-    port?.postMessage({ type: 'streamError', error: 'No active tab found' });
-    port?.disconnect();
-    return;
-  }
-
-  const sendProgress = (matched: number, total: number, latestLabel: string) => {
-    port?.postMessage({ type: 'streamProgress', matched, total, latestLabel });
-  };
-
-  try {
-    // 1. Load data and safely add missing visible rows in recognized repeat tables
-    const [textFields, blocks, apiConfig, textApiReady] = await Promise.all([
-      getAllTextFields(),
-      getAllBlockCategories(),
-      getApiConfig(),
-      isApiConfigured(),
-    ]);
-    await sendToContentScript(tab.id, {
-      type: 'prepareRepeatRows',
-      targets: getRepeatRowTargets(blocks, textFields),
-    });
-
-    // 2. Scan fields
-    const scanResults = await sendToContentScript<
-      Array<{ index: number; field: FormFieldInfo }>
-    >(tab.id, { type: 'scan' });
-
-    if (!scanResults || scanResults.length === 0) {
-      port?.postMessage({ type: 'streamComplete', matched: 0, errorCount: 0 });
-      port?.disconnect();
-      return;
-    }
-
-    const fieldInfos = scanResults.map((r) => ({ ...r.field, index: r.index }));
-    const textFieldInfos = fieldInfos.filter((f) => f.kind !== 'file');
-    const totalFields = fieldInfos.length;
-
-    let matched = 0;
-    let errorCount = 0;
-
-    // 3. Init content script for streaming
-    await sendToContentScript(tab.id, {
-      type: 'fillStreamInit',
-      items: fieldInfos.map((f) => ({ index: f.index, fillMode: f.fillMode ?? 'short' })),
-    });
-
-    // 4. Local deterministic matches (AI is optional)
-    const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
-    for (const match of localMatches) {
-      const field = textFieldInfos.find((candidate) => candidate.index === match.index);
-      if (field && isMeaningfullyFilled(field)) continue;
-      try {
-        await sendToContentScript(tab.id, {
-          type: 'fillField',
-          index: match.index,
-          value: match.value,
-          confidence: match.confidence,
-        });
-        matched++;
-        sendProgress(matched, totalFields, match.shortLabel);
-      } catch { errorCount++; }
-    }
-
-    // 5. Stream text matches
-    const aiFields = getAiEligibleFields(textFieldInfos, localMatches);
-    const profileValues = flattenProfileValues(textFields, blocks);
-    const profileValueByKey = new Map(profileValues.map((value) => [value.key, value.value]));
-    const fieldByIndex = new Map(textFieldInfos.map((field) => [field.index, field]));
-    if (textApiReady && aiFields.length > 0 && profileValues.length > 0) {
-      for await (const event of matchFieldsStream(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value })))) {
-        if (event.type === 'value_chunk') {
-          try {
-            await sendToContentScript(tab.id, {
-              type: 'fillTypeChunk',
-              index: event.index,
-              chunk: event.chunk,
-            });
-          } catch { /* tab may have closed */ }
-        } else if (event.type === 'match_complete') {
-          const match = event.match;
-          const field = fieldByIndex.get(match.index);
-          if (!isSemanticallyCompatibleMatch(field, match.fieldKey)) continue;
-          if (field?.rowIndex != null && field.groupLabel) {
-            const structuredPrefix = `${field.groupLabel}[${field.rowIndex + 1}].`;
-            const groundedValue = match.fieldKey.startsWith(structuredPrefix)
-              ? profileValueByKey.get(match.fieldKey)
-              : undefined;
-            if (groundedValue == null) continue;
-            match.value = groundedValue;
-          }
-          try {
-            if (match.fillMode === 'long') {
-              await sendToContentScript(tab.id, {
-                type: 'fillTypeCommit',
-                index: match.index,
-              });
-            } else {
-              await sendToContentScript(tab.id, {
-                type: 'fillField',
-                index: match.index,
-                value: match.value,
-                confidence: match.confidence,
-              });
-            }
-            matched++;
-            sendProgress(matched, totalFields, match.shortLabel);
-          } catch { errorCount++; }
-        }
-      }
-    }
-
-    // 6. Complete
-    try {
-      await sendToContentScript(tab.id, { type: 'fillStreamComplete' });
-    } catch { /* ignore */ }
-    port?.postMessage({ type: 'streamComplete', matched, errorCount });
-  } catch (err) {
-    port?.postMessage({ type: 'streamError', error: (err as Error).message });
-  } finally {
-    port?.disconnect();
   }
 }

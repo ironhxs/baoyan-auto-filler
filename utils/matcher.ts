@@ -12,10 +12,12 @@ export interface FormFieldInfo {
   placeholder: string;
   ariaLabel: string;
   title?: string;
+  dateFormat?: string;
   value?: string;
   options?: string[];
   accept?: string;
   multiple?: boolean;
+  hasExistingFile?: boolean;
   fillMode?: 'short' | 'long';
   renderWidth?: number;
   renderHeight?: number;
@@ -32,6 +34,8 @@ export interface FormFieldInfo {
 }
 
 export type MaterialRole =
+  | 'application_form'
+  | 'id_card'
   | 'id_photo'
   | 'id_card_front'
   | 'id_card_back'
@@ -42,8 +46,10 @@ export type MaterialRole =
   | 'language_certificate'
   | 'award_certificate'
   | 'academic_proof'
+  | 'practice_proof'
   | 'student_card'
   | 'recommendation_letter'
+  | 'mentor_consent'
   | 'enrollment_certificate'
   | 'resume';
 
@@ -59,6 +65,11 @@ export interface MatchResult {
   fileName?: string;
   fileType?: string;
   materialRole?: MaterialRole;
+  fileCandidates?: Array<{
+    fileRecordId: number;
+    fileName: string;
+    fileType: string;
+  }>;
   source?: 'local' | 'ai' | 'ai_reviewed' | 'material';
 }
 
@@ -104,13 +115,14 @@ function buildPrompt(fields: FormFieldInfo[], textFields: { key: string; value: 
       const html = truncateText(f.html || '', 500);
       const technical = [f.name && `name=${f.name}`, f.id && `id=${f.id}`].filter(Boolean).join(', ');
       const options = f.options?.length ? `, options="${f.options.join(' / ')}"` : '';
+      const dateFormat = f.dateFormat ? `, dateFormat="${f.dateFormat}"` : '';
       const currentValue = f.value ? `, currentValue="${f.value}"` : '';
       const fillMode = f.fillMode ?? 'short';
       const size = f.renderWidth && f.renderHeight ? `, renderedSize=${f.renderWidth}x${f.renderHeight}` : '';
       const repeat = f.groupLabel || f.columnLabel || f.rowIndex != null
         ? `, group="${f.groupLabel ?? ''}", row=${f.rowIndex != null ? f.rowIndex + 1 : ''}, column="${f.columnLabel ?? ''}"`
         : '';
-      return `  [${f.index}] tag=${f.tag}, type=${f.type}, fillMode=${fillMode}${size}, label="${label}", hint="${hint}", context="${context}", html="${html}"${repeat}${options}${currentValue}${technical ? `, ${technical}` : ''}`;
+      return `  [${f.index}] tag=${f.tag}, type=${f.type}, fillMode=${fillMode}${size}, label="${label}", hint="${hint}", context="${context}", html="${html}"${repeat}${options}${dateFormat}${currentValue}${technical ? `, ${technical}` : ''}`;
     })
     .join('\n');
 
