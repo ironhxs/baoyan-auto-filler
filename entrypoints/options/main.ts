@@ -1,5 +1,6 @@
 import { getApiConfig, setApiConfig } from '../../utils/storage';
 import type { ApiConfig, ApiMode } from '../../utils/storage';
+import { matchFields } from '../../utils/matcher';
 import {
   getAllTextFields, saveAllTextFields, getAllBlockCategories, saveBlockCategory, deleteBlockCategory,
   ensureProfileBlocksSeeded,
@@ -1378,10 +1379,30 @@ function renderSettingsPage() {
     providerId: '',
     apiMode: 'chat_completions' as ApiMode,
     fastMode: false,
+    aiEnhanced: true,
   };
 
   nextFieldId = 0;
   const fieldRows = textFields.map((f) => createFieldRowHtml(f.key, f.value)).join('');
+  const repeatSummaryHtml = DEFAULT_REPEAT_SECTIONS.map((section) => {
+    const block = blockCategories.find((candidate) => candidate.sectionId === section.id || candidate.title === section.title);
+    const items = block?.items ?? [];
+    const preview = items.slice(0, 2).map((item, index) => {
+      const values = item.fields
+        .filter((field) => field.value.trim())
+        .slice(0, 3)
+        .map((field) => `${escapeHtml(field.key)}：${escapeHtml(field.value)}`)
+        .join(' · ');
+      return `<div class="repeat-summary-row"><span>${index + 1}</span><p>${values || '空白条目'}</p></div>`;
+    }).join('');
+    return `
+      <article class="repeat-summary-card${items.length ? '' : ' empty'}">
+        <div class="repeat-summary-title"><span>${section.icon} ${section.title}</span><b>${items.length} 条</b></div>
+        ${preview || '<div class="repeat-summary-empty">暂无条目</div>'}
+        ${items.length > 2 ? `<div class="repeat-summary-more">另有 ${items.length - 2} 条</div>` : ''}
+      </article>
+    `;
+  }).join('');
 
   pageContent.innerHTML = `
       <div class="settings-form">
@@ -1399,6 +1420,16 @@ function renderSettingsPage() {
           <ul class="profile-field-list" id="fieldList">${fieldRows}</ul>
           <button class="add-btn" id="addFieldBtn">+ 添加字段</button>
           <input type="file" id="profileImportInput" class="hidden" accept="application/json,.json" />
+          <div class="repeat-settings-panel">
+            <div class="repeat-settings-head">
+              <div>
+                <h3>多行资料</h3>
+                <p>家庭成员、外语、经历、成果和奖励按“条目 + 子字段”保存，不会拆散成上面的普通字段。</p>
+              </div>
+              <button class="btn-secondary" id="editRepeatDataBtn">到首页编辑</button>
+            </div>
+            <div class="repeat-summary-grid">${repeatSummaryHtml}</div>
+          </div>
       </div>
 
       <div class="settings-section">
@@ -1442,6 +1473,18 @@ function renderSettingsPage() {
           </label>
           <span class="api-key-hint">请求会携带 <code>service_tier: fast</code>。仅在模型和中转支持时开启，可能产生更高费用。</span>
         </div>
+        <div class="form-group">
+          <label>AI 参与方式</label>
+          <label class="fast-mode-option" for="aiEnhanced">
+            <input type="checkbox" id="aiEnhanced"${api.aiEnhanced ? ' checked' : ''} />
+            <span>开启 AI 增强复核（推荐）</span>
+          </label>
+          <span class="api-key-hint">开启后，手动扫描会像 1.0 版一样把当前安全字段交给 API 复核，并由本地资料约束结果；关闭后 API 只处理本地规则无法匹配的空字段。</span>
+        </div>
+        <div class="settings-inline-actions">
+          <button class="btn-secondary" id="testApiBtn" type="button">测试 API 连接</button>
+          <span class="status-msg" id="apiTestStatus"></span>
+        </div>
       </div>
 
       <div class="settings-section">
@@ -1466,6 +1509,7 @@ function renderSettingsPage() {
 
   document.getElementById('providerSelect')?.addEventListener('change', onProviderChange);
   document.getElementById('modelSelect')?.addEventListener('change', onModelSelectChange);
+  document.getElementById('testApiBtn')?.addEventListener('click', testApiConnection);
 
   document.getElementById('exportProfileBtn')?.addEventListener('click', exportProfileData);
   document.getElementById('importProfileBtn')?.addEventListener('click', () => {
@@ -1478,6 +1522,7 @@ function renderSettingsPage() {
   });
   document.getElementById('templateProfileBtn')?.addEventListener('click', downloadProfileTemplate);
   document.getElementById('profileImportInput')?.addEventListener('change', importProfileData);
+  document.getElementById('editRepeatDataBtn')?.addEventListener('click', () => switchPage('profile'));
   document.getElementById('saveBtn')?.addEventListener('click', saveSettings);
   document.getElementById('reloadExtensionBtn')?.addEventListener('click', () => {
     showStatus('正在重新加载扩展，资料不会被清空');
@@ -1698,6 +1743,7 @@ async function saveSettings() {
   const providerId = (document.getElementById('providerSelect') as HTMLSelectElement).value;
   const apiMode = (document.getElementById('apiMode') as HTMLSelectElement).value as ApiMode;
   const fastMode = (document.getElementById('fastMode') as HTMLInputElement).checked;
+  const aiEnhanced = (document.getElementById('aiEnhanced') as HTMLInputElement).checked;
 
   if (apiKey && (!baseUrl || !model)) {
     showStatus('请完整填写 Base URL 和模型名称');
@@ -1714,6 +1760,7 @@ async function saveSettings() {
     providerId,
     apiMode,
     fastMode,
+    aiEnhanced,
   });
 
   apiConfigData = {
@@ -1723,9 +1770,58 @@ async function saveSettings() {
     providerId,
     apiMode,
     fastMode,
+    aiEnhanced,
   };
 
   showStatus('已保存');
+}
+
+async function testApiConnection() {
+  const status = document.getElementById('apiTestStatus');
+  const button = document.getElementById('testApiBtn') as HTMLButtonElement | null;
+  const config: ApiConfig = {
+    baseUrl: (document.getElementById('baseUrl') as HTMLInputElement).value.trim(),
+    apiKey: (document.getElementById('apiKey') as HTMLInputElement).value.trim(),
+    model: getModelValue(),
+    providerId: (document.getElementById('providerSelect') as HTMLSelectElement).value,
+    apiMode: (document.getElementById('apiMode') as HTMLSelectElement).value as ApiMode,
+    fastMode: (document.getElementById('fastMode') as HTMLInputElement).checked,
+    aiEnhanced: (document.getElementById('aiEnhanced') as HTMLInputElement).checked,
+  };
+  if (!config.baseUrl || !config.apiKey || !config.model) {
+    if (status) {
+      status.textContent = '请先完整填写 Base URL、API Key 和模型';
+      status.classList.add('show');
+    }
+    return;
+  }
+
+  if (button) button.disabled = true;
+  if (status) {
+    status.textContent = '正在真实调用 API…';
+    status.classList.add('show');
+  }
+  try {
+    const result = await matchFields([{
+      index: 0,
+      kind: 'text',
+      tag: 'input',
+      type: 'text',
+      name: 'connection_test',
+      id: 'connection_test',
+      label: '连接测试',
+      placeholder: '',
+      ariaLabel: '',
+      context: '仅用于验证 API 协议、模型和线路是否可用',
+      fillMode: 'short',
+    }], config, [{ key: '连接测试', value: '连接成功' }]);
+    if (!result.length) throw new Error('API 已响应，但没有返回有效匹配结果');
+    if (status) status.textContent = `连接成功：${config.model} · ${config.apiMode === 'responses' ? 'Responses' : 'Chat Completions'}${config.fastMode ? ' · Fast' : ''}`;
+  } catch (error) {
+    if (status) status.textContent = (error instanceof Error ? error.message : 'API 测试失败').replace(/\s+/g, ' ').slice(0, 180);
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 function getModelValue(): string {

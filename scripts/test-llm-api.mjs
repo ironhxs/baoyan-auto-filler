@@ -5,6 +5,8 @@ import {
   extractStreamText,
   getRequestBody,
   getRequestUrl,
+  isSemanticallyCompatibleMatch,
+  matchFields,
 } from '../utils/matcher.ts';
 
 const baseConfig = {
@@ -73,5 +75,71 @@ assert.equal(extractStreamError({
   type: 'response.failed',
   response: { error: { message: 'upstream failed' } },
 }), 'upstream failed');
+
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async () => new Response(JSON.stringify({
+  choices: [{ message: { content: JSON.stringify([
+    {
+      index: 20,
+      fieldKey: '奖励情况[1].奖励名称',
+      value: '模型擅自改写的名称',
+      shortLabel: '获奖名称',
+      confidence: 'high',
+    },
+    {
+      index: 21,
+      fieldKey: '家庭成员[1].姓名',
+      value: '错误跨组值',
+      shortLabel: '获奖级别',
+      confidence: 'high',
+    },
+  ]) } }],
+}), { status: 200, headers: { 'content-type': 'application/json' } });
+
+const grounded = await matchFields([
+  {
+    index: 20,
+    kind: 'text',
+    tag: 'input',
+    type: 'text',
+    name: '',
+    id: '',
+    label: '获奖名称',
+    placeholder: '',
+    ariaLabel: '',
+    context: '',
+    groupLabel: '奖励情况',
+    columnLabel: '获奖名称',
+    rowIndex: 0,
+  },
+  {
+    index: 21,
+    kind: 'text',
+    tag: 'input',
+    type: 'text',
+    name: '',
+    id: '',
+    label: '获奖级别',
+    placeholder: '',
+    ariaLabel: '',
+    context: '',
+    groupLabel: '奖励情况',
+    columnLabel: '获奖级别',
+    rowIndex: 0,
+  },
+], chatConfig, [
+  { key: '奖励情况[1].奖励名称', value: '程序设计竞赛一等奖' },
+  { key: '家庭成员[1].姓名', value: '测试家长' },
+]);
+assert.deepEqual(grounded.map(({ index, fieldKey, value }) => ({ index, fieldKey, value })), [{
+  index: 20,
+  fieldKey: '奖励情况[1].奖励名称',
+  value: '程序设计竞赛一等奖',
+}]);
+assert.equal(isSemanticallyCompatibleMatch({ label: '固定电话', fillMode: 'short' }, '通讯地址'), false);
+assert.equal(isSemanticallyCompatibleMatch({ label: '固定电话', fillMode: 'short' }, '手机号'), false);
+assert.equal(isSemanticallyCompatibleMatch({ label: '通讯地址', fillMode: 'short' }, '手机号'), false);
+assert.equal(isSemanticallyCompatibleMatch({ label: '考生电子邮箱', fillMode: 'short' }, '邮箱'), true);
+globalThis.fetch = originalFetch;
 
 console.log('LLM API protocol tests passed');

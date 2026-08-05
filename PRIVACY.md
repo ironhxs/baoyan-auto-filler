@@ -1,6 +1,6 @@
 # Privacy Policy for 保填
 
-**Last updated:** June 2, 2026
+**Last updated:** August 5, 2026
 
 ## Overview
 
@@ -22,12 +22,16 @@ The extension stores the following data **locally on your device only**:
 
 This data is never transmitted to any server except as described in the next section.
 
+When a page contains a clearly labeled file upload field, the extension may compare that field's local page text with local document filenames, descriptions, and categories. This comparison happens entirely in the browser. A suggested file is attached only after the user explicitly selects it in the preview; background multi-step filling never uploads documents.
+
 ## External API Usage
 
 When you use the form filling feature, the extension sends the following data to **the LLM API endpoint you configure yourself**:
 
 - Form field metadata (label, placeholder, name, id) extracted from the current page
 - Your stored personal information (key-value pairs)
+
+When **AI Enhanced Review** is enabled, a manual page scan sends all safely scanned form fields to the configured API for semantic matching. This can include a field's visible current value so the extension can compare already-filled content with the user's saved profile. If AI Enhanced Review is disabled, only unresolved safe fields are sent. CAPTCHA, payment, agreement, final-submission, preference, and advisor-selection controls are excluded from AI matching.
 
 This data is sent solely to the API endpoint and API key that **you provide**. We have no access to, visibility into, or control over your API communications. We do not operate any intermediary servers.
 

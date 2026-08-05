@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>推免材料上传测试页</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; background: #f4f7fb; }
+    main { width: 720px; margin: 48px auto; padding: 32px; background: #fff; border-radius: 12px; }
+    h2 { color: #257ffd; }
+    .field { display: grid; grid-template-columns: 160px 1fr; align-items: center; gap: 16px; margin-top: 24px; }
+    input { padding: 10px; border: 1px solid #d0d5dd; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h2>证明材料</h2>
+    <div class="field">
+      <label for="transcript">本科成绩单</label>
+      <input id="transcript" type="file" accept="application/pdf,.pdf" required />
+    </div>
+  </main>
+</body>
+</html>

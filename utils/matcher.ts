@@ -31,7 +31,21 @@ export interface FormFieldInfo {
   protectionReason?: string;
 }
 
-export type MaterialRole = 'id_photo' | 'id_card_front' | 'id_card_back';
+export type MaterialRole =
+  | 'id_photo'
+  | 'id_card_front'
+  | 'id_card_back'
+  | 'transcript'
+  | 'ranking_proof'
+  | 'cet4_certificate'
+  | 'cet6_certificate'
+  | 'language_certificate'
+  | 'award_certificate'
+  | 'academic_proof'
+  | 'student_card'
+  | 'recommendation_letter'
+  | 'enrollment_certificate'
+  | 'resume';
 
 export interface MatchResult {
   kind?: 'text' | 'file';
@@ -45,6 +59,33 @@ export interface MatchResult {
   fileName?: string;
   fileType?: string;
   materialRole?: MaterialRole;
+  source?: 'local' | 'ai' | 'ai_reviewed' | 'material';
+}
+
+function sourceLeafKey(fieldKey: string): string {
+  return fieldKey.split('.').at(-1) ?? fieldKey;
+}
+
+export function isSemanticallyCompatibleMatch(field: FormFieldInfo | undefined, fieldKey: string): boolean {
+  if (!field || !fieldKey) return false;
+  if (field.fillMode === 'long' && fieldKey === 'generated_long_text') return true;
+  const target = [field.columnLabel, field.label, field.placeholder, field.ariaLabel, field.title]
+    .filter(Boolean)
+    .join(' ');
+  const source = sourceLeafKey(fieldKey);
+
+  if (/固定电话|座机|住宅电话|办公电话/.test(target)) {
+    return /固定电话|座机|住宅电话|办公电话/.test(source);
+  }
+  if (/电话|手机|联系方式/.test(target) && /地址|住址|籍贯|出生地|户口|邮编|邮政编码/.test(source)) {
+    return false;
+  }
+  if (/地址|住址|籍贯|出生地|户口/.test(target) && /电话|手机|联系方式/.test(source)) {
+    return false;
+  }
+  if (/邮编|邮政编码/.test(target) && !/邮编|邮政编码/.test(source)) return false;
+  if (/电子邮箱|邮箱|e-?mail/i.test(target) && !/电子邮箱|邮箱|e-?mail/i.test(source)) return false;
+  return true;
 }
 
 function truncateText(text: string, maxLength: number): string {
@@ -96,7 +137,10 @@ ${fieldList}
 - 通讯地址、通信地址可优先匹配"地址"；户口所在地详细地址、户籍地址可优先匹配"户籍地址"。
 - 民族、性别、婚否、政治面貌等下拉项应根据 options 中最接近的选项文本匹配，value 返回网页可接受的选项文本。
 - 优先依据 label、hint、html 中的当前字段行/局部容器理解字段含义；context 只是辅助信息；name/id 只是技术标识，含义不清时不要强行匹配
+- 字段带有 currentValue 时仍要返回根据“用户个人信息”推导出的正确期望值，用于核对页面现值；不要为了迎合页面而直接照抄 currentValue。
 - 每个表单字段最多匹配一个用户字段。无法推理出合理值时不要返回该字段。
+- 对 group、row、column 描述的多行资料，必须按“分组 + 行号 + 子字段语义”匹配：网页列顺序可以与资料顺序不同，但第 N 行只能取用户资料中同一分组第 N 条的数据。
+- 多行资料的 fieldKey 必须原样返回用户个人信息中提供的完整 key，例如“奖励情况[2].奖励名称”；不得把第 1 条和第 2 条资料交叉，也不得只因为网页列顺序变化就改变条目顺序。
 - **特别重要：fillMode=long 的长文本字段必须返回匹配项，绝对不可跳过。** 即使页面上下文不明确，也要综合用户全部信息生成一段通顺稳妥的自我介绍/个人陈述文本。
 - 为每个返回项生成一个简短字段名 shortLabel，2 到 8 个中文字符或简短英文，不要直接复制很长的上下文。
 - confidence 只能是 high、medium、low：
@@ -284,17 +328,27 @@ export async function matchFields(
 
   const rawResults = JSON.parse(jsonMatch[0]) as Array<Partial<MatchResult>>;
   const fieldByIndex = new Map(textLikeFields.map((f) => [f.index, f]));
+  const sourceValueByKey = new Map(textFields.map((field) => [field.key, field.value]));
   const results: MatchResult[] = rawResults.map((r) => {
     const field = fieldByIndex.get(Number(r.index));
     const isLong = field?.fillMode === 'long';
+    const fieldKey = String(r.fieldKey ?? '');
+    const isStructured = field?.rowIndex != null && Boolean(field.groupLabel);
+    const structuredPrefix = field?.rowIndex != null && field.groupLabel
+      ? `${field.groupLabel}[${field.rowIndex + 1}].`
+      : '';
+    const groundedStructuredValue = isStructured && fieldKey.startsWith(structuredPrefix)
+      ? sourceValueByKey.get(fieldKey)
+      : undefined;
     return {
       kind: 'text',
       index: Number(r.index),
-      fieldKey: String(r.fieldKey ?? ''),
-      value: String(r.value ?? ''),
-      shortLabel: String(r.shortLabel || fallbackShortLabel(field, String(r.fieldKey ?? ''), Number(r.index))),
+      fieldKey: isStructured && groundedStructuredValue == null ? '' : fieldKey,
+      value: isStructured ? String(groundedStructuredValue ?? '') : String(r.value ?? ''),
+      shortLabel: String(r.shortLabel || fallbackShortLabel(field, fieldKey, Number(r.index))),
       confidence: isLong ? 'high' : normalizeConfidence(r.confidence),
       fillMode: field?.fillMode,
+      source: 'ai',
     };
   });
 
@@ -303,7 +357,12 @@ export async function matchFields(
   console.groupEnd();
 
   const validIndices = new Set(textLikeFields.map((f) => f.index));
-  return results.filter((r) => validIndices.has(r.index) && r.fieldKey && r.value);
+  return results.filter((r) => (
+    validIndices.has(r.index) &&
+    r.fieldKey &&
+    r.value &&
+    isSemanticallyCompatibleMatch(fieldByIndex.get(r.index), r.fieldKey)
+  ));
 }
 
 // ─── Streaming parser ───────────────────────────────────────────────
@@ -559,6 +618,7 @@ class IncrementalJsonParser {
           shortLabel: String(raw.shortLabel || fallbackShortLabel(field, String(raw.fieldKey ?? ''), index)),
           confidence: isLongField ? 'high' : normalizeConfidence(raw.confidence),
           fillMode: field?.fillMode,
+          source: 'ai',
         },
       });
     } catch {

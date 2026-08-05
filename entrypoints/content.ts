@@ -65,7 +65,12 @@ interface FillStreamCompleteMessage { type: 'fillStreamComplete' }
 interface ManualFillMessage { type: 'manualFill'; value: string }
 interface PrepareRepeatRowsMessage { type: 'prepareRepeatRows'; targets: Array<{ groupLabel: string; count: number }> }
 interface AdvanceToNextStepMessage { type: 'advanceToNextStep' }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage;
+interface MarkPreviewMessage {
+  type: 'markPreview';
+  items: Array<{ index: number; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
+}
+interface FocusFieldMessage { type: 'focusField'; index: number }
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -135,7 +140,7 @@ function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
   let container: HTMLElement | null = el.parentElement;
   for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
     const controls = Array.from(container.querySelectorAll<HTMLElement>(
-      'button,input[type="button"],a,[role="button"]',
+      'button,input[type="button"],a,[role="button"],span,.add-on',
     ));
     const trigger = controls.find((candidate) => {
       if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
@@ -154,14 +159,15 @@ function isSupportedDialogSelection(el: HTMLElement): boolean {
   return /学校|院校|专业/.test(text) && Boolean(findSelectionTrigger(el));
 }
 
+function isSupportedDatePicker(el: HTMLElement): boolean {
+  if (!(el instanceof HTMLInputElement) || !el.readOnly) return false;
+  const trigger = el.getAttribute('onclick') ?? '';
+  const text = joinUnique([findLabel(el), el.name, el.id, el.placeholder]);
+  return /WdatePicker|datePicker|datepicker/i.test(trigger) && /日期|年月|时间|入学|毕业/.test(text);
+}
+
 function isFillable(el: HTMLElement): boolean {
   if (!el.matches(SCANNABLE_SELECTOR)) return false;
-  if ((el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled) return false;
-  if (
-    !(el instanceof HTMLInputElement && el.type === 'file') &&
-    (el as HTMLInputElement | HTMLTextAreaElement).readOnly &&
-    !isSupportedDialogSelection(el)
-  ) return false;
   return isVisible(el);
 }
 
@@ -298,7 +304,7 @@ function detectProfileGroup(text: string): string {
     ['家庭成员', /家庭|社会关系|父亲|母亲|家长/],
     ['学习和工作经历', /学习.{0,3}工作经历|教育经历|工作经历|学习经历/],
     ['学术成果', /学术成果|科研成果|论文|专利|著作|竞赛成果/],
-    ['奖励情况', /奖励|获奖|荣誉|奖惩/],
+    ['奖励情况', /奖励|获奖|荣誉|奖惩|学科竞赛|专业竞赛|竞赛经历|比赛经历/],
     ['外语水平', /外语|英语|四六级|雅思|托福/],
     ['学习信息', /学习信息|学籍|教育信息|本科信息|成绩信息/],
     ['基本信息', /基本信息|个人信息/],
@@ -315,8 +321,8 @@ function findGroupText(el: HTMLElement, table: HTMLTableElement | null): string 
   }
 
   let node: HTMLElement | null = table ?? el;
-  for (let depth = 0; node && node !== document.body && depth < 5; depth++, node = node.parentElement) {
-    const heading = node.querySelector<HTMLElement>('h1,h2,h3,h4,legend,.title,.form-title,.panel-title');
+  for (let depth = 0; node && node !== document.body && depth < 8; depth++, node = node.parentElement) {
+    const heading = node.querySelector<HTMLElement>('h1,h2,h3,h4,legend,.title,.form-title,.panel-title,.info-group');
     if (heading) parts.push(normalizeText(heading.textContent ?? ''));
     let previous = node.previousElementSibling as HTMLElement | null;
     for (let i = 0; previous && i < 2; i++, previous = previous.previousElementSibling as HTMLElement | null) {
@@ -327,9 +333,30 @@ function findGroupText(el: HTMLElement, table: HTMLTableElement | null): string 
   return joinUnique(parts);
 }
 
+function inferProfileGroupFromTable(table: HTMLTableElement): string {
+  const headerText = Array.from(table.querySelectorAll<HTMLElement>('th,thead td'))
+    .map((cell) => textWithoutControls(cell))
+    .filter(Boolean)
+    .join('|');
+  if (/姓名/.test(headerText) && /关系/.test(headerText) && /(联系电话|工作单位|职务)/.test(headerText)) {
+    return '家庭成员';
+  }
+  if (/(外语|考试|等级)/.test(headerText) && /成绩/.test(headerText)) return '外语水平';
+  if (/(获奖|奖励|奖项|竞赛)/.test(headerText) && /(名称|等级|级别|时间|日期)/.test(headerText)) {
+    return '奖励情况';
+  }
+  if (/(论文|专利|成果|项目)/.test(headerText) && /(名称|类型|时间|排序)/.test(headerText)) {
+    return '学术成果';
+  }
+  if (/(开始|起始)/.test(headerText) && /(结束|终止)/.test(headerText) && /(学校|单位|职务|专业)/.test(headerText)) {
+    return '学习和工作经历';
+  }
+  return '';
+}
+
 function findNearestHeadingText(el: HTMLElement): string {
   const headings = Array.from(document.querySelectorAll<HTMLElement>(
-    'h1,h2,h3,h4,legend,.title,.form-title,.panel-title',
+    'h1,h2,h3,h4,legend,.title,.form-title,.panel-title,.info-group',
   ));
   const preceding = headings.filter((heading) => (
     heading === el || Boolean(heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)
@@ -365,8 +392,11 @@ function getTableColumnLabel(el: HTMLElement, table: HTMLTableElement, row: HTML
 function getRepeatFieldMeta(el: HTMLElement): RepeatFieldMeta {
   const row = el.closest<HTMLTableRowElement>('tr');
   const table = el.closest<HTMLTableElement>('table');
-  const groupText = table ? findGroupText(el, table) : findNearestHeadingText(el);
-  const groupLabel = detectProfileGroup(groupText);
+  const groupText = findGroupText(el, table);
+  const nearestHeading = findNearestHeadingText(el);
+  const groupLabel = table
+    ? inferProfileGroupFromTable(table) || detectProfileGroup(nearestHeading)
+    : detectProfileGroup(nearestHeading || groupText);
   const repeatProfileGroups = new Set(['家庭成员', '外语水平', '学习和工作经历', '学术成果', '奖励情况']);
 
   if (!row || !table || !repeatProfileGroups.has(groupLabel)) {
@@ -482,6 +512,16 @@ async function advanceToNextStep(): Promise<{ clicked: boolean; advanced: boolea
 
 function getProtection(el: HTMLElement, fieldText: string, isFile: boolean): { protected: boolean; reason: string } {
   if (isFile) return { protected: true, reason: '文件上传需本人确认' };
+  if ((el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled && !isSupportedDialogSelection(el)) {
+    return { protected: true, reason: '页面已锁定该字段' };
+  }
+  if (
+    (el as HTMLInputElement | HTMLTextAreaElement).readOnly &&
+    !isSupportedDialogSelection(el) &&
+    !isSupportedDatePicker(el)
+  ) {
+    return { protected: true, reason: '页面只读字段' };
+  }
   if (/验证码|短信码|图形码|动态码/.test(fieldText)) return { protected: true, reason: '验证码不自动填写' };
   if (/承诺书|诚信承诺|同意条款|本人承诺/.test(fieldText)) return { protected: true, reason: '承诺与协议需本人操作' };
   if (/支付|缴费|付款/.test(fieldText)) return { protected: true, reason: '支付操作不自动处理' };
@@ -657,18 +697,62 @@ function ensureMarkerStyles(): void {
     [data-auto-filler-status="verified"] { outline: 2px solid #22c55e !important; outline-offset: 2px !important; }
     [data-auto-filler-status="review"] { outline: 2px solid #f59e0b !important; outline-offset: 2px !important; }
     [data-auto-filler-status="mismatch"] { outline: 2px solid #ef4444 !important; outline-offset: 2px !important; }
+    [data-auto-filler-located="true"] { animation: auto-filler-locate 900ms ease-out 1 !important; }
+    @keyframes auto-filler-locate {
+      0%, 100% { box-shadow: none; }
+      35% { box-shadow: 0 0 0 7px rgba(37, 127, 253, .28); }
+    }
   `;
   document.documentElement.appendChild(style);
 }
 
-function markField(el: HTMLElement, status: 'verified' | 'review' | 'mismatch'): void {
+function markField(el: HTMLElement, status: 'verified' | 'review' | 'mismatch', message?: string): void {
   ensureMarkerStyles();
+  if (el.dataset.autoFillerOriginalTitle == null) {
+    el.dataset.autoFillerOriginalTitle = el.getAttribute('title') ?? '';
+  }
   el.dataset.autoFillerStatus = status;
-  el.title = [el.title, status === 'verified'
+  const markerTitle = message ?? (status === 'verified'
     ? '保填：已填写并回读一致'
     : status === 'review'
       ? '保填：已填写，建议确认'
-      : '保填：页面回读不一致，请手动检查'].filter(Boolean).join(' | ');
+      : '保填：页面回读不一致，请手动检查');
+  el.title = [el.dataset.autoFillerOriginalTitle, markerTitle].filter(Boolean).join(' | ');
+}
+
+function clearPreviewMarkers(): void {
+  document.querySelectorAll<HTMLElement>('[data-auto-filler-status]').forEach((el) => {
+    delete el.dataset.autoFillerStatus;
+    const originalTitle = el.dataset.autoFillerOriginalTitle;
+    if (originalTitle != null) {
+      if (originalTitle) el.setAttribute('title', originalTitle);
+      else el.removeAttribute('title');
+      delete el.dataset.autoFillerOriginalTitle;
+    }
+  });
+}
+
+function markPreviewFields(items: MarkPreviewMessage['items']): number {
+  clearPreviewMarkers();
+  let marked = 0;
+  for (const item of items) {
+    const el = elementMap.get(item.index);
+    if (!el) continue;
+    markField(el, item.status, item.message);
+    marked++;
+  }
+  return marked;
+}
+
+function focusField(index: number): boolean {
+  const el = elementMap.get(index);
+  if (!el) return false;
+  ensureMarkerStyles();
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+  el.dataset.autoFillerLocated = 'true';
+  window.setTimeout(() => { delete el.dataset.autoFillerLocated; }, 950);
+  return true;
 }
 
 function valueMatches(el: HTMLElement, expected: string): boolean {
@@ -960,6 +1044,10 @@ export default defineContentScript({
           advanceToNextStep()
             .then(sendResponse)
             .catch(() => sendResponse({ clicked: false, advanced: false, reason: '无法安全进入下一页' }));
+        } else if (message.type === 'markPreview') {
+          sendResponse({ ok: true, marked: markPreviewFields(message.items) });
+        } else if (message.type === 'focusField') {
+          sendResponse({ ok: focusField(message.index) });
         } else if (message.type === 'fill') {
           fillFields(message.items).then(sendResponse).catch(() => sendResponse({ success: 0, failure: message.items.length }));
         } else if (message.type === 'fillStreamInit') {

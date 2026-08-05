@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" href="data:," />
+  <title>奖励汇总字段测试页</title>
+  <style>
+    body { font: 14px/1.5 Arial, sans-serif; padding: 30px; color: #222; }
+    h2 { color: #567ac8; border-bottom: 1px solid #ddd; padding-bottom: 8px; }
+    .row { display: grid; grid-template-columns: 200px 1fr; gap: 14px; align-items: start; }
+    label { font-weight: 700; padding-top: 20px; }
+    textarea { width: 780px; height: 110px; padding: 8px; }
+    .error { color: #f33; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h2>奖励情况</h2>
+  <div class="row">
+    <label for="awardSummary">本科期间校级以上（含）荣誉奖励（获奖名称、获奖等级、获奖时间）</label>
+    <div>
+      <textarea id="awardSummary" name="awardSummary"></textarea>
+      <div class="error">内容中不得含有 | #</div>
+    </div>
+  </div>
+</body>
+</html>

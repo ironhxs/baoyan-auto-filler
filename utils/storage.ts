@@ -7,6 +7,7 @@ export interface ApiConfig {
   providerId: string;
   apiMode: ApiMode;
   fastMode: boolean;
+  aiEnhanced: boolean;
 }
 
 const DEFAULT_API_CONFIG: ApiConfig = {
@@ -16,6 +17,7 @@ const DEFAULT_API_CONFIG: ApiConfig = {
   providerId: '',
   apiMode: 'chat_completions',
   fastMode: false,
+  aiEnhanced: true,
 };
 
 export function getApiConfig(): Promise<ApiConfig> {

@@ -4,6 +4,8 @@ import { getAllBlockCategories, getAllFileRecords, getAllTextFields } from '@/ut
 import type { MatchResult, FormFieldInfo } from '@/utils/matcher';
 import { flattenProfileValues, PROFILE_SECTIONS } from '@/utils/profile-schema';
 import type { ProfileSourceValue } from '@/utils/profile-schema';
+import { isMeaningfullyFilled } from '@/utils/local-matcher';
+import { isPageValueConsistent } from '@/utils/value-compare';
 
 const app = document.getElementById('app')!;
 
@@ -14,6 +16,13 @@ interface ScanResponse {
   matched: number;
   matches: MatchResult[];
   fields: FormFieldInfo[];
+  ai: {
+    configured: boolean;
+    mode: 'enhanced' | 'fallback';
+    attempted: boolean;
+    reviewed: number;
+    error: string;
+  };
 }
 
 interface ErrorResponse {
@@ -56,7 +65,7 @@ interface DisplayItem {
   index: number;
   label: string;
   value: string;
-  status: 'matched' | 'pending' | 'unmatched' | 'protected';
+  status: 'matched' | 'pending' | 'verified' | 'conflict' | 'filled' | 'unmatched' | 'protected';
   confidence?: Confidence;
   fillMode?: 'short' | 'long';
   checked: boolean;
@@ -119,7 +128,7 @@ function renderHeader() {
   header.className = 'header';
   header.innerHTML = `
     <div class="header-left">
-      <img class="logo-icon" src="/logo.png" alt="保填" />
+      <img class="logo-icon" src="/icon/32.png" alt="保填" />
       <span class="logo-text">保填</span>
     </div>
     <div class="header-right">
@@ -337,27 +346,39 @@ function buildDisplayItems(scanResp: ScanResponse): DisplayItem[] {
     const field = fieldByIndex.get(m.index);
     const fillMode = m.fillMode ?? field?.fillMode;
     const isLong = fillMode === 'long';
+    const isFile = m.kind === 'file';
+    const pageFilled = !isFile && isMeaningfullyFilled(field ?? ({} as FormFieldInfo));
+    const allowSystemPrefix = field?.selectionMode === 'dialog' || /出生地|籍贯|学校|院校|专业/.test(field?.label ?? '');
+    const verified = pageFilled && isPageValueConsistent(field?.value, m.value, allowSystemPrefix);
+    const auditValue = pageFilled
+      ? (verified
+          ? String(field?.value ?? '')
+          : `页面：${String(field?.value ?? '')} / 资料：${m.value}`)
+      : m.value;
     items.push({
       kind: m.kind ?? 'text',
       index: m.index,
       label: shortenLabel(m.shortLabel || m.fieldKey || `字段 #${m.index}`),
-      value: m.value,
-      status: isLong ? 'matched' : (m.confidence === 'high' ? 'matched' : 'pending'),
+      value: auditValue,
+      status: pageFilled
+        ? (verified ? 'verified' : 'conflict')
+        : (isFile ? 'pending' : (isLong ? 'matched' : (m.confidence === 'high' ? 'matched' : 'pending'))),
       confidence: isLong ? undefined : m.confidence,
       fillMode,
-      checked: isLong ? true : (m.confidence !== 'low'),
+      checked: pageFilled ? false : (isFile ? false : (isLong ? true : (m.confidence !== 'low'))),
       match: m,
     });
   }
 
   for (const f of scanResp.fields) {
     if (!matchedSet.has(f.index)) {
+      const filled = !f.protected && isMeaningfullyFilled(f);
       items.push({
         kind: f.kind ?? 'text',
         index: f.index,
         label: getFieldLabel(f, f.index),
-        value: f.protected ? (f.protectionReason || '需本人处理') : '-',
-        status: f.protected ? 'protected' : 'unmatched',
+        value: f.protected ? (f.protectionReason || '需本人处理') : (filled ? String(f.value ?? '') : '-'),
+        status: f.protected ? 'protected' : (filled ? 'filled' : 'unmatched'),
         checked: false,
       });
     }
@@ -380,13 +401,47 @@ function getFieldLabel(field: FormFieldInfo | undefined, index: number): string 
   return shortenLabel(field.label || field.placeholder || field.ariaLabel || field.name || field.id || `字段 #${index}`);
 }
 
+function markerForItem(item: DisplayItem): { index: number; status: 'verified' | 'review' | 'mismatch'; message: string } | null {
+  if (item.status === 'conflict') {
+    return { index: item.index, status: 'mismatch', message: '保填：页面值与已保存资料不一致' };
+  }
+  if (item.status === 'verified') {
+    return { index: item.index, status: 'verified', message: '保填：页面值与已保存资料一致' };
+  }
+  if (item.status === 'matched' && item.confidence === 'high') {
+    return { index: item.index, status: 'verified', message: '保填：高置信匹配，待确认填入' };
+  }
+  if (item.status === 'pending') {
+    return { index: item.index, status: 'review', message: '保填：匹配结果需要确认' };
+  }
+  if (item.status === 'filled') {
+    return { index: item.index, status: 'review', message: '保填：页面已有值，但资料中没有可核对项' };
+  }
+  if (item.status === 'protected') {
+    return { index: item.index, status: 'review', message: '保填：该字段需本人处理' };
+  }
+  return null;
+}
+
+function syncPageMarkers(): void {
+  const items = displayItems.flatMap((item) => {
+    const marker = markerForItem(item);
+    return marker ? [marker] : [];
+  });
+  void sendRuntimeMessage({ type: 'markPageFields', payload: { items } }).catch(() => undefined);
+}
+
+function locatePageField(index: number): void {
+  void sendRuntimeMessage({ type: 'focusPageField', payload: { index } }).catch(() => undefined);
+}
+
 function renderResult(scanResp: ScanResponse) {
   viewState = 'result';
   fields = scanResp.fields;
   displayItems = buildDisplayItems(scanResp);
 
-  const pendingCount = displayItems.filter((i) => i.status === 'pending').length;
-  const protectedCount = displayItems.filter((i) => i.status === 'protected').length;
+  const verifiedCount = displayItems.filter((i) => i.status === 'verified').length;
+  const reviewCount = displayItems.filter((i) => i.status === 'conflict' || i.status === 'filled' || i.status === 'protected').length;
   const matchedCount = displayItems.filter((i) => i.status === 'matched' || i.status === 'pending').length;
   const checkedCount = displayItems.filter((i) => i.checked && (i.status === 'matched' || i.status === 'pending')).length;
 
@@ -405,6 +460,15 @@ function renderResult(scanResp: ScanResponse) {
   }
 
   main.innerHTML = `
+    <div class="ai-scan-status ${scanResp.ai.error ? 'error' : scanResp.ai.attempted ? 'success' : 'idle'}">
+      ${scanResp.ai.error
+        ? `AI 调用失败：${escapeHtml(scanResp.ai.error)}`
+        : scanResp.ai.attempted
+          ? `AI 已真实调用 · ${scanResp.ai.mode === 'enhanced' ? '增强复核' : '补漏'} · 返回 ${scanResp.ai.reviewed} 项`
+          : scanResp.ai.configured
+            ? 'AI 已配置，本页没有需要发送的安全字段'
+            : 'AI 未配置，本次仅使用本地规则'}
+    </div>
     <div class="stats-bar">
       <div class="stat-item">
         <div class="stat-value">${scanResp.total}</div>
@@ -412,15 +476,15 @@ function renderResult(scanResp: ScanResponse) {
       </div>
       <div class="stat-item">
         <div class="stat-value matched">${matchedCount}</div>
-        <div class="stat-label">匹配成功</div>
+        <div class="stat-label">待填匹配</div>
       </div>
       <div class="stat-item">
-        <div class="stat-value pending">${pendingCount}</div>
-        <div class="stat-label">待确认</div>
+        <div class="stat-value filled">${verifiedCount}</div>
+        <div class="stat-label">核对一致</div>
       </div>
       <div class="stat-item">
-        <div class="stat-value protected">${protectedCount}</div>
-        <div class="stat-label">人工处理</div>
+        <div class="stat-value protected">${reviewCount}</div>
+        <div class="stat-label">需检查</div>
       </div>
     </div>
     <div class="fill-policy" role="group" aria-label="填充策略">
@@ -432,7 +496,7 @@ function renderResult(scanResp: ScanResponse) {
       <div class="field-list-header">
         <span class="col-label">字段</span>
         <span class="col-value">匹配内容</span>
-        <span class="col-status">置信度</span>
+        <span class="col-status">状态</span>
       </div>
       <ul class="field-list" id="fieldList"></ul>
     </div>
@@ -442,8 +506,10 @@ function renderResult(scanResp: ScanResponse) {
   for (const item of displayItems) {
     const li = document.createElement('li');
     li.className = `field-item ${item.kind === 'file' ? 'file-item' : ''} ${item.fillMode === 'long' ? 'long-text-item' : ''} ${item.confidence ? `confidence-${item.confidence}` : ''}`.trim();
+    li.dataset.index = String(item.index);
+    li.title = '点击定位网页字段';
 
-    const checkboxHtml = item.status !== 'unmatched' && item.status !== 'protected'
+    const checkboxHtml = item.status === 'matched' || item.status === 'pending'
       ? `<input type="checkbox" data-idx="${item.index}" ${item.checked ? 'checked' : ''} />`
       : `<input type="checkbox" data-idx="${item.index}" disabled />`;
 
@@ -455,6 +521,10 @@ function renderResult(scanResp: ScanResponse) {
       <span class="field-value" title="${escapeHtml(item.value)}">${escapeHtml(item.value)}</span>
       <span class="field-status">${statusHtml}</span>
     `;
+    li.addEventListener('click', (event) => {
+      if ((event.target as HTMLElement).closest('input[type="checkbox"]')) return;
+      locatePageField(item.index);
+    });
     list.appendChild(li);
   }
 
@@ -471,6 +541,7 @@ function renderResult(scanResp: ScanResponse) {
     button.addEventListener('click', () => applyFillPolicy(button.dataset.policy ?? 'standard'));
   });
 
+  syncPageMarkers();
   renderFooter(checkedCount);
 }
 
@@ -480,6 +551,19 @@ function getStatusHtml(item: DisplayItem): string {
   }
   if (item.status === 'unmatched') {
     return '<span class="status-tag unmatched">未匹配</span>';
+  }
+  if (item.status === 'filled') {
+    return '<span class="status-tag filled">无法核对</span>';
+  }
+  if (item.status === 'verified') {
+    return `<span class="status-tag verified">${item.match?.source === 'ai_reviewed' || item.match?.source === 'ai' ? 'AI一致' : '一致'}</span>`;
+  }
+  if (item.status === 'conflict') {
+    return `<span class="status-tag conflict">${item.match?.source === 'ai_reviewed' || item.match?.source === 'ai' ? 'AI不一致' : '不一致'}</span>`;
+  }
+
+  if (item.kind === 'file') {
+    return '<span class="status-tag pending">确认文件</span>';
   }
 
   if (item.fillMode === 'long') {
@@ -492,7 +576,8 @@ function getStatusHtml(item: DisplayItem): string {
     medium: '中',
     low: '低',
   };
-  return `<span class="status-tag ${confidence}">${labelMap[confidence]}</span>`;
+  const sourceLabel = item.match?.source === 'ai' ? 'AI' : item.match?.source === 'ai_reviewed' ? 'AI复核' : '本地';
+  return `<span class="status-tag ${confidence}">${sourceLabel}${labelMap[confidence]}</span>`;
 }
 
 function applyFillPolicy(policy: string): void {
@@ -500,7 +585,11 @@ function applyFillPolicy(policy: string): void {
     button.classList.toggle('active', (button as HTMLElement).dataset.policy === policy);
   });
   displayItems.forEach((item) => {
-    if (item.status === 'unmatched' || item.status === 'protected') return;
+    if (item.status !== 'matched' && item.status !== 'pending') return;
+    if (item.kind === 'file') {
+      item.checked = false;
+      return;
+    }
     item.checked = policy === 'aggressive'
       ? true
       : policy === 'cautious'

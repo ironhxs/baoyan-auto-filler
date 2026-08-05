@@ -13,7 +13,7 @@ const ALIAS_GROUPS: string[][] = [
   ['政治面貌'],
   ['婚否', '婚姻状况'],
   ['住址', '家庭住址', '现住址', '居住地址'],
-  ['通讯地址', '通信地址', '联系地址', '邮寄地址'],
+  ['通讯地址', '通迅地址', '通信地址', '联系地址', '邮寄地址'],
   ['通信地址邮政编码', '通讯地址邮政编码', '邮政编码', '邮编'],
   ['出生地'],
   ['籍贯地', '籍贯'],
@@ -22,6 +22,7 @@ const ALIAS_GROUPS: string[][] = [
   ['档案所在单位地址', '档案单位地址'],
   ['档案所在单位邮政编码', '档案单位邮编'],
   ['紧急电话', '紧急联系电话'],
+  ['固定电话', '座机', '住宅电话', '办公电话'],
   ['关系', '与本人关系', '称谓', '家庭关系'],
   ['工作单位及职务', '在何单位工作任何职务', '工作单位和职务', '单位及职务', '工作单位职务'],
   ['学校', '就读学校', '本科院校', '毕业院校'],
@@ -56,9 +57,9 @@ const ALIAS_GROUPS: string[][] = [
   ['发表或完成时间', '发表时间', '完成时间'],
   ['本人排序', '作者排名', '署名顺序'],
   ['成果说明', '成果简介'],
-  ['奖励名称', '奖项名称', '荣誉名称'],
-  ['奖励级别', '获奖级别', '奖项级别'],
-  ['获奖时间', '奖励时间'],
+  ['奖励名称', '获奖名称', '奖项名称', '竞赛名称', '比赛名称', '荣誉名称'],
+  ['奖励级别', '获奖级别', '获奖等级', '奖项级别', '奖项等级', '竞赛级别'],
+  ['获奖时间', '奖励时间', '获奖日期', '奖励日期'],
   ['本人排名', '获奖排名'],
   ['颁发单位', '授予单位'],
 ];
@@ -68,7 +69,9 @@ function normalize(text: string): string {
     .toLowerCase()
     .replace(/cet[-\s]?4/g, '英语四级')
     .replace(/cet[-\s]?6/g, '英语六级')
-    .replace(/请(输入|填写|选择)|您的|本人|主要|详细|信息|情况/g, '')
+    .replace(/获奖|奖项|竞赛|比赛|荣誉/g, '奖励')
+    .replace(/等级/g, '级别')
+    .replace(/请(输入|填写|选择)|您的|主要|详细|信息|情况/g, '')
     .replace(/[\s　：:，,。；;（）()【】\[\]\/|｜_*#]/g, '');
 }
 
@@ -122,7 +125,7 @@ function primaryFieldSemanticText(field: FormFieldInfo): string {
 
 function rankedCandidates(semanticText: string, textFields: TextField[]) {
   return textFields
-    .filter((source) => source.value.trim())
+    .filter((source) => source.value.trim() && !/^(字段值|待填写|请填写|未填写)$/i.test(source.value.trim()))
     .map((source) => ({ source, score: scoreKey(semanticText, source.key) }))
     .filter(({ score }) => score >= 76)
     .sort((a, b) => b.score - a.score);
@@ -152,6 +155,20 @@ function adaptValueToOptions(value: string, options: string[] | undefined): stri
   return close ?? value;
 }
 
+function adaptValueToField(value: string, field: FormFieldInfo): string {
+  const optionValue = adaptValueToOptions(value, field.options);
+  const semantic = fieldSemanticText(field);
+  if (/年月|入学|毕业/.test(semantic) && /^\d{6}$/.test((field.value ?? '').trim())) {
+    const match = optionValue.match(/(20\d{2})\D{0,3}(\d{1,2})/);
+    if (match) return `${match[1]}${match[2].padStart(2, '0')}`;
+  }
+  if (/出生日期|年月日/.test(semantic) && /^\d{8}$/.test((field.value ?? '').trim())) {
+    const match = optionValue.match(/(20\d{2})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})/);
+    if (match) return `${match[1]}${match[2].padStart(2, '0')}${match[3].padStart(2, '0')}`;
+  }
+  return optionValue;
+}
+
 function makeMatch(
   field: FormFieldInfo,
   sourceKey: string,
@@ -165,10 +182,11 @@ function makeMatch(
     kind: 'text',
     index: field.index,
     fieldKey: sourceKey,
-    value: adaptValueToOptions(value, field.options),
+    value: adaptValueToField(value, field),
     shortLabel: label || sourceFieldKey,
     confidence: score >= 88 ? 'high' : 'medium',
     fillMode: field.fillMode,
+    source: 'local',
   };
 }
 
@@ -204,12 +222,95 @@ function findStructuredMatch(
   );
 }
 
+function findBlockForGroup(field: FormFieldInfo, blocks: BlockCategory[]): BlockCategory | undefined {
+  if (!field.groupLabel) return undefined;
+  return blocks.find((candidate) => {
+    const section = getBlockSection(candidate);
+    return section?.title === field.groupLabel || normalize(candidate.title) === normalize(field.groupLabel ?? '');
+  });
+}
+
+function aggregateKeyOrder(field: FormFieldInfo, block: BlockCategory): string[] {
+  const storedKeys = [
+    ...(block.templateFields ?? []),
+    ...block.items.flatMap((item) => item.fields.map((source) => source.key)),
+  ].filter((key, index, all) => key.trim() && all.findIndex((other) => normalize(other) === normalize(key)) === index);
+  const semanticText = normalize(fieldSemanticText(field));
+  const positions = storedKeys.map((key, fallbackIndex) => {
+    const variants = [key, ...aliasesFor(key)]
+      .map(normalize)
+      .filter(Boolean);
+    const position = variants.reduce((best, variant) => {
+      const found = semanticText.indexOf(variant);
+      return found >= 0 && (best < 0 || found < best) ? found : best;
+    }, -1);
+    return { key, position, fallbackIndex };
+  });
+  const explicitlyRequested = positions.filter(({ position }) => position >= 0);
+  if (explicitlyRequested.length >= 2) {
+    return explicitlyRequested.sort((a, b) => a.position - b.position).map(({ key }) => key);
+  }
+  return positions.sort((a, b) => a.fallbackIndex - b.fallbackIndex).map(({ key }) => key);
+}
+
+function cleanAggregateValue(value: string): string {
+  return value
+    .replace(/[|｜#]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findAggregateBlockMatch(
+  field: FormFieldInfo,
+  blocks: BlockCategory[],
+): MatchResult | undefined {
+  if (field.rowIndex != null || !field.groupLabel) return undefined;
+  const block = findBlockForGroup(field, blocks);
+  if (!block?.items.length) return undefined;
+
+  const order = aggregateKeyOrder(field, block);
+  const semanticText = fieldSemanticText(field);
+  const mentionedKeyCount = order.filter((key) => aliasesFor(key).some((alias) => (
+    normalize(semanticText).includes(normalize(alias))
+  ))).length;
+  if (field.fillMode !== 'long' && mentionedKeyCount < 2) return undefined;
+
+  const entries = block.items.flatMap((item) => {
+    const values = order.flatMap((key) => {
+      const candidates = item.fields
+        .map((source) => ({ source, score: scoreKey(key, source.key) }))
+        .sort((a, b) => b.score - a.score);
+      const value = cleanAggregateValue(candidates[0]?.source.value ?? '');
+      return value ? [value] : [];
+    });
+    return values.length ? [values.join('，')] : [];
+  });
+  if (!entries.length) return undefined;
+
+  return {
+    kind: 'text',
+    index: field.index,
+    fieldKey: `${block.title}.汇总`,
+    value: entries.join('；'),
+    shortLabel: `${block.title}汇总`,
+    confidence: field.fillMode === 'long' ? 'high' : 'medium',
+    fillMode: field.fillMode,
+    source: 'local',
+  };
+}
+
 function findFlatMatch(field: FormFieldInfo, textFields: TextField[]): MatchResult | undefined {
   if (field.rowIndex != null && field.groupLabel) return undefined;
   const primaryText = primaryFieldSemanticText(field);
   const primaryCandidates = rankedCandidates(primaryText, textFields);
-  const best = chooseUnambiguousCandidate(primaryCandidates)
-    ?? chooseUnambiguousCandidate(rankedCandidates(fieldSemanticText(field), textFields));
+  const primary = chooseUnambiguousCandidate(primaryCandidates);
+  const normalizedPrimary = normalize(primaryText);
+  const primaryIsMeaningful = Boolean(normalizedPrimary) && !/^(字段|字段值|input|text|value|field\d*)$/i.test(normalizedPrimary);
+  const best = primary ?? (
+    primaryIsMeaningful
+      ? undefined
+      : chooseUnambiguousCandidate(rankedCandidates(fieldSemanticText(field), textFields))
+  );
   if (!best) return undefined;
   return makeMatch(field, best.source.key, best.source.key, best.source.value, best.score);
 }
@@ -220,9 +321,12 @@ export function matchFieldsLocally(
   blocks: BlockCategory[],
 ): MatchResult[] {
   return fields.flatMap((field) => {
-    if (field.kind === 'file' || field.protected || isMeaningfullyFilled(field)) return [];
+    const isReadOnlyAudit = isMeaningfullyFilled(field) && /只读|锁定/.test(field.protectionReason ?? '');
+    if (field.kind === 'file' || (field.protected && !isReadOnlyAudit)) return [];
     const structured = findStructuredMatch(field, blocks, textFields);
     if (structured) return [structured];
+    const aggregate = findAggregateBlockMatch(field, blocks);
+    if (aggregate) return [aggregate];
     const flat = findFlatMatch(field, textFields);
     return flat ? [flat] : [];
   });
@@ -234,7 +338,6 @@ export function getAiEligibleFields(fields: FormFieldInfo[], localMatches: Match
     field.kind !== 'file' &&
     !field.protected &&
     !isMeaningfullyFilled(field) &&
-    !locallyMatched.has(field.index) &&
-    !(field.rowIndex != null && field.groupLabel)
+    !locallyMatched.has(field.index)
   ));
 }

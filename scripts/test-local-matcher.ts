@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { getAiEligibleFields, matchFieldsLocally } from '../utils/local-matcher';
 import { flattenProfileValues } from '../utils/profile-schema';
+import { isPageValueConsistent } from '../utils/value-compare';
 import type { FormFieldInfo } from '../utils/matcher';
 import type { BlockCategory, TextField } from '../utils/db';
 
@@ -35,6 +36,8 @@ const textFields: TextField[] = [
   { key: '英语六级成绩', value: '489' },
   { key: '成绩排名', value: '10' },
   { key: '排名基数', value: '151' },
+  { key: '通讯地址', value: '测试省测试市测试路1号' },
+  { key: '预计毕业年月', value: '2027年6月' },
 ];
 const blocks: BlockCategory[] = [{
   title: '家庭成员',
@@ -54,6 +57,18 @@ const blocks: BlockCategory[] = [{
       { key: '联系电话', value: '13900000002' },
     ] },
   ],
+}, {
+  title: '奖励情况',
+  sectionId: 'awards',
+  items: [{ fields: [
+    { key: '获奖时间', value: '2025-06' },
+    { key: '奖励名称', value: '程序设计竞赛一等奖' },
+    { key: '奖励级别', value: '省级' },
+  ] }, { fields: [
+    { key: '奖励名称', value: '数学建模#二等奖' },
+    { key: '奖励级别', value: '校级' },
+    { key: '获奖时间', value: '2024-12' },
+  ] }],
 }];
 
 const fields = [
@@ -76,6 +91,22 @@ const fields = [
     hint: '上一项：成绩排名；当前项为必填字段',
   }),
   field(15, { groupLabel: '外语水平', rowIndex: 0, columnLabel: '取得成绩时间（日期格式：2019-11）' }),
+  field(16, { groupLabel: '奖励情况', rowIndex: 0, columnLabel: '获奖等级' }),
+  field(17, { groupLabel: '奖励情况', rowIndex: 0, columnLabel: '获奖名称' }),
+  field(18, { groupLabel: '奖励情况', rowIndex: 0, columnLabel: '获奖日期' }),
+  field(19, {
+    tag: 'textarea',
+    fillMode: 'long',
+    groupLabel: '奖励情况',
+    label: '本科期间校级以上荣誉奖励（获奖名称、获奖等级、获奖时间）',
+    hint: '内容中不得含有 | #',
+  }),
+  field(20, {
+    label: '固定电话',
+    hint: '上一项为通讯地址',
+    context: '通讯地址 测试省测试市测试路1号',
+  }),
+  field(21, { label: '预计毕业年月', value: '202706' }),
 ];
 
 const matches = matchFieldsLocally(fields, textFields, blocks);
@@ -88,16 +119,28 @@ assert.equal(byIndex.get(4)?.value, '13900000001');
 assert.equal(byIndex.get(5)?.value, '测试母亲');
 assert.equal(byIndex.get(6)?.value, '13900000002');
 assert.equal(byIndex.has(7), false);
-assert.equal(byIndex.has(8), false);
+assert.equal(byIndex.get(8)?.value, '13800000000');
 assert.equal(byIndex.get(10)?.value, 'CET-4');
 assert.equal(byIndex.get(11)?.value, '536');
 assert.equal(byIndex.get(12)?.value, 'CET-6');
 assert.equal(byIndex.get(13)?.value, '489');
 assert.equal(byIndex.get(14)?.value, '151');
 assert.equal(byIndex.has(15), false);
+assert.equal(byIndex.get(16)?.value, '省级');
+assert.equal(byIndex.get(17)?.value, '程序设计竞赛一等奖');
+assert.equal(byIndex.get(18)?.value, '2025-06');
+assert.equal(byIndex.get(19)?.value, '程序设计竞赛一等奖，省级，2025-06；数学建模二等奖，校级，2024-12');
+assert.equal(/[|#]/.test(byIndex.get(19)?.value ?? ''), false);
+assert.equal(byIndex.has(20), false);
+assert.equal(byIndex.get(21)?.value, '202706');
+assert.equal(isPageValueConsistent('138****0000', '13800000000'), true);
+assert.equal(isPageValueConsistent('2005-01-08', '20050108'), true);
+assert.equal(isPageValueConsistent('202706', '2027年6月'), true);
+assert.equal(isPageValueConsistent('156****5006', '15900005006'), false);
+assert.equal(isPageValueConsistent('370724 山东省测试县', '山东省测试县', true), true);
 
 const aiEligible = getAiEligibleFields(fields, matches);
-assert.deepEqual(aiEligible.map((candidate) => candidate.index), [9]);
+assert.deepEqual(aiEligible.map((candidate) => candidate.index), [9, 15, 20]);
 
 const flattened = flattenProfileValues(textFields, blocks);
 assert.equal(flattened.find((value) => value.key === '家庭成员[2].姓名')?.value, '测试母亲');

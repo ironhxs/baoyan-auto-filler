@@ -2,7 +2,7 @@
 
 English | [中文](README.md)
 
-A Chrome / Edge form-filling assistant for graduate recommendation applications. Common fields are matched locally, with AI as an optional fallback. It supports multi-step background filling, repeatable tables, manual quick fill, and PDF document synthesis. Profile data stays in the browser; no account is required.
+A Chrome / Edge form-filling assistant for graduate recommendation applications. It preserves the 1.0 full-page AI semantic-matching flow and adds deterministic value safeguards, filled-value auditing, multi-step background filling, repeatable tables, manual quick fill, and PDF document synthesis. Profile data stays in the browser; no account is required.
 
 <div align="center">
   <a href="../../releases/latest"><b>⬇️ Download & Install</b></a>
@@ -18,11 +18,15 @@ A Chrome / Edge form-filling assistant for graduate recommendation applications.
 
 ### Smart Form Filling
 - Manages seven profile groups: basic info, family, education, languages, experience, academic work, and awards
-- Matches common fields locally first; optional AI is used only for remaining eligible fields
+- AI Enhanced Review (enabled by default) sends all safe fields on the current page to the configured API, as version 1.0 did, while deterministic stored values prevent factual rewrites
+- AI Enhanced Review can be disabled to use the API only for fields that local rules cannot match
 - Adds and fills repeatable rows for family members, language scores, experience, academic work, and awards
+- Matches repeatable rows by group, row number, and subfield semantics, so different web-column ordering does not change the saved item mapping; optional AI fallback is grounded to the same stored row
+- Aggregates repeatable data into a single textarea when required, following the subfield order stated by the page and removing forbidden `|` / `#` characters
 - Supports exact-match school and major selection dialogs
 - Works with React and other framework pages (uses native setters to trigger updates)
 - Uses green, orange, and red readback states to show verified, review-needed, and mismatched values
+- Draws the same green / orange / red state on page controls after preview; clicking a sidebar result locates and focuses the corresponding field
 - Includes manual quick fill for complex controls not covered automatically
 
 ### Background Multi-step Filling
@@ -39,6 +43,7 @@ A Chrome / Edge form-filling assistant for graduate recommendation applications.
 - Upload images (JPG/PNG/WebP) and PDF files
 - Organize documents by category (ID, education, certificates, photos, etc.)
 - Preview, rename, move between categories, and delete
+- Recommends locally stored files for clearly identified upload fields using page context plus filenames, descriptions, and categories; document matches are unchecked until the user explicitly confirms them in preview
 
 ### PDF Synthesis
 - Select images and PDFs from your documents, drag to reorder, then merge into one PDF
@@ -51,6 +56,7 @@ A Chrome / Edge form-filling assistant for graduate recommendation applications.
 - Supports both OpenAI-compatible Chat Completions (`/chat/completions`) and Responses (`/responses`)
 - Connects to hosted providers, aggregators, third-party gateways, and local model servers
 - Includes provider presets and supports custom Base URLs and model names
+- Supports Fast mode (`service_tier: fast`), a privacy-safe API connection test, and an explicit per-scan indicator showing whether the API was actually called
 - Optional Fast mode adds `service_tier: "fast"`; it is disabled by default
 
 ## Installation

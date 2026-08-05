@@ -6,7 +6,7 @@ import {
   getAllTextFields,
   saveAllTextFields,
 } from '@/utils/db';
-import { matchFields, matchFieldsStream } from '@/utils/matcher';
+import { isSemanticallyCompatibleMatch, matchFields, matchFieldsStream } from '@/utils/matcher';
 import type { Category, FileRecord } from '@/utils/db';
 import type { MatchResult, FormFieldInfo, MaterialRole } from '@/utils/matcher';
 import { flattenProfileValues, getBlockSection, inferLanguageItems } from '@/utils/profile-schema';
@@ -17,6 +17,10 @@ interface MessageMap {
   startScan: undefined;
   startFill: { matches: MatchResult[] };
   manualFill: { value: string };
+  markPageFields: {
+    items: Array<{ index: number; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
+  };
+  focusPageField: { index: number };
   startAutoRun: undefined;
   getAutoRunStatus: undefined;
   stopAutoRun: undefined;
@@ -43,6 +47,13 @@ interface ScanSuccessResponse {
   matched: number;
   matches: MatchResult[];
   fields: FormFieldInfo[];
+  ai: {
+    configured: boolean;
+    mode: 'enhanced' | 'fallback';
+    attempted: boolean;
+    reviewed: number;
+    error: string;
+  };
 }
 
 interface FillSuccessResponse {
@@ -61,6 +72,11 @@ interface InspectSuccessResponse {
   protected: number;
 }
 
+interface PageActionSuccessResponse {
+  ok: true;
+  type: 'pageAction';
+}
+
 type AutoRunStatus = 'running' | 'paused' | 'complete' | 'stopped';
 
 interface AutoRunState {
@@ -77,7 +93,7 @@ interface AutoRunSuccessResponse extends AutoRunState {
   type: 'autoRun';
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | AutoRunSuccessResponse | ErrorResponse;
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
   | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
@@ -89,13 +105,23 @@ interface RoleScore {
   exact: boolean;
 }
 
-const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
 const autoRunInFlight = new Set<number>();
 
 const MATERIAL_LABELS: Record<MaterialRole, string> = {
   id_photo: '证件照',
   id_card_front: '身份证正面',
   id_card_back: '身份证反面',
+  transcript: '成绩单',
+  ranking_proof: '排名证明',
+  cet4_certificate: '四级成绩证明',
+  cet6_certificate: '六级成绩证明',
+  language_certificate: '外语成绩证明',
+  award_certificate: '获奖证明',
+  academic_proof: '学术成果证明',
+  student_card: '学生证',
+  recommendation_letter: '推荐信',
+  enrollment_certificate: '在读证明',
+  resume: '个人简历',
 };
 
 const ROLE_KEYWORDS: Record<MaterialRole, { exact: string[]; alias: string[] }> = {
@@ -110,6 +136,50 @@ const ROLE_KEYWORDS: Record<MaterialRole, { exact: string[]; alias: string[] }> 
   id_card_back: {
     exact: ['身份证反面', '身份证国徽面'],
     alias: ['国徽面', '反面'],
+  },
+  transcript: {
+    exact: ['本科成绩单', '成绩单', '学业成绩单'],
+    alias: ['成绩证明', '学业成绩'],
+  },
+  ranking_proof: {
+    exact: ['专业排名证明', '成绩排名证明', '排名证明'],
+    alias: ['排名', '专业名次', '年级名次'],
+  },
+  cet4_certificate: {
+    exact: ['英语四级成绩单', '四级成绩单', '英语四级证书', 'CET-4成绩单', 'CET4成绩单'],
+    alias: ['英语四级', 'CET-4', 'CET4', '四级'],
+  },
+  cet6_certificate: {
+    exact: ['英语六级成绩单', '六级成绩单', '英语六级证书', 'CET-6成绩单', 'CET6成绩单'],
+    alias: ['英语六级', 'CET-6', 'CET6', '六级'],
+  },
+  language_certificate: {
+    exact: ['外语成绩证明', '外语水平证明', '英语成绩证明', '雅思成绩单', '托福成绩单'],
+    alias: ['外语', '英语成绩', '雅思', '托福'],
+  },
+  award_certificate: {
+    exact: ['获奖证书', '奖励证明', '荣誉证书', '竞赛证书'],
+    alias: ['获奖', '奖励', '荣誉', '竞赛'],
+  },
+  academic_proof: {
+    exact: ['学术成果证明', '科研成果证明', '论文证明', '专利证书'],
+    alias: ['论文', '专利', '科研成果', '学术成果'],
+  },
+  student_card: {
+    exact: ['学生证', '学生证件'],
+    alias: ['学生身份'],
+  },
+  recommendation_letter: {
+    exact: ['专家推荐信', '专家推荐书', '推荐信'],
+    alias: ['推荐材料', '推荐书'],
+  },
+  enrollment_certificate: {
+    exact: ['在读证明', '学籍证明', '在校证明'],
+    alias: ['在读', '学籍', '在校'],
+  },
+  resume: {
+    exact: ['个人简历', '申请简历'],
+    alias: ['简历', 'CV'],
   },
 };
 
@@ -235,11 +305,14 @@ function acceptsFile(accept: string | undefined, filename: string, fileType: str
   });
 }
 
-function inferImageType(filename: string, fileType: string): string {
+function inferFileType(filename: string, fileType: string): string {
   if (fileType) return fileType;
   if (/\.jpe?g$/i.test(filename)) return 'image/jpeg';
   if (/\.png$/i.test(filename)) return 'image/png';
   if (/\.webp$/i.test(filename)) return 'image/webp';
+  if (/\.pdf$/i.test(filename)) return 'application/pdf';
+  if (/\.doc$/i.test(filename)) return 'application/msword';
+  if (/\.docx$/i.test(filename)) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   return '';
 }
 
@@ -251,12 +324,6 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
-}
-
-function isSupportedImage(record: FileRecord): boolean {
-  const fileType = inferImageType(record.filename, record.fileType).toLowerCase();
-  if (SUPPORTED_IMAGE_TYPES.has(fileType)) return true;
-  return /\.(jpe?g|png|webp)$/i.test(record.filename);
 }
 
 function getCategoryName(record: FileRecord, categoryById: Map<number, Category>): string {
@@ -290,13 +357,13 @@ function matchFileFields(
     category.id == null ? [] : [[category.id, category] as const]
   )));
   const fileFields = fields.filter((field) => field.kind === 'file');
-  const imageRecords = fileRecords.filter((record) => record.id != null && isSupportedImage(record));
+  const availableRecords = fileRecords.filter((record) => record.id != null && record.fileBody.size > 0);
 
   return fileFields.flatMap((field) => {
     const fieldRole = detectFileFieldRole(field);
     if (!fieldRole) return [];
 
-    const candidates = imageRecords
+    const candidates = availableRecords
       .map((record) => {
         const text = [
           record.filename,
@@ -308,7 +375,7 @@ function matchFileFields(
       })
       .filter(({ record, materialRole }) => (
         materialRole.score > 0 &&
-        acceptsFile(field.accept, record.filename, inferImageType(record.filename, record.fileType))
+        acceptsFile(field.accept, record.filename, inferFileType(record.filename, record.fileType))
       ))
       .sort((a, b) => (
         b.materialRole.score - a.materialRole.score ||
@@ -334,8 +401,9 @@ function matchFileFields(
       confidence,
       fileRecordId: best.record.id,
       fileName: best.record.filename,
-      fileType: inferImageType(best.record.filename, best.record.fileType),
+      fileType: inferFileType(best.record.filename, best.record.fileType),
       materialRole: fieldRole.role,
+      source: 'material',
     }];
   });
 }
@@ -422,6 +490,12 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'manualFill') {
     return handleManualFill(request.payload!.value);
   }
+  if (request.type === 'markPageFields') {
+    return handleMarkPageFields(request.payload!.items);
+  }
+  if (request.type === 'focusPageField') {
+    return handleFocusPageField(request.payload!.index);
+  }
   if (request.type === 'startAutoRun') {
     return handleStartAutoRun();
   }
@@ -459,6 +533,22 @@ async function handleManualFill(value: string): Promise<Response> {
   return result.ok
     ? { ok: true, type: 'fill', success: 1, failure: 0 }
     : { ok: true, type: 'fill', success: 0, failure: 1 };
+}
+
+async function handleMarkPageFields(
+  items: Array<{ index: number; status: 'verified' | 'review' | 'mismatch'; message?: string }>,
+): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  await sendToContentScript(tab.id, { type: 'markPreview', items });
+  return { ok: true, type: 'pageAction' };
+}
+
+async function handleFocusPageField(index: number): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  await sendToContentScript(tab.id, { type: 'focusField', index });
+  return { ok: true, type: 'pageAction' };
 }
 
 async function handleGetAutoRunStatus(): Promise<Response> {
@@ -509,11 +599,13 @@ async function handleStopAutoRun(): Promise<Response> {
 }
 
 async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSuccessResponse> {
-  const [textFields, blocks, apiConfig, textApiReady] = await Promise.all([
+  const [textFields, blocks, apiConfig, textApiReady, fileRecords, categories] = await Promise.all([
     getAllTextFields(),
     getAllBlockCategories(),
     getApiConfig(),
     isApiConfigured(),
+    getAllFileRecords(),
+    getAllCategories(),
   ]);
   await sendToContentScript(tabId, {
     type: 'prepareRepeatRows',
@@ -525,23 +617,53 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     { type: 'scan' },
   );
   if (!scanResults?.length) {
-    return { ok: true, type: 'scan', total: 0, matched: 0, matches: [], fields: [] };
+    return {
+      ok: true,
+      type: 'scan',
+      total: 0,
+      matched: 0,
+      matches: [],
+      fields: [],
+      ai: {
+        configured: textApiReady,
+        mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
+        attempted: false,
+        reviewed: 0,
+        error: '',
+      },
+    };
   }
 
   const fieldInfos = scanResults.map((result) => ({ ...result.field, index: result.index }));
   const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
   const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
-  const aiFields = getAiEligibleFields(textFieldInfos, localMatches);
+  const aiFields = apiConfig.aiEnhanced
+    ? textFieldInfos.filter((field) => !field.protected || /只读|锁定/.test(field.protectionReason ?? ''))
+    : getAiEligibleFields(textFieldInfos, localMatches);
   const profileValues = flattenProfileValues(textFields, blocks);
   let aiMatches: MatchResult[] = [];
+  let aiError = '';
+  let aiAttempted = false;
   if (allowAi && textApiReady && aiFields.length > 0 && profileValues.length > 0) {
+    aiAttempted = true;
     try {
       aiMatches = await matchFields(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value })));
-    } catch {
+    } catch (error) {
       aiMatches = [];
+      aiError = (error instanceof Error ? error.message : 'API 调用失败').replace(/\s+/g, ' ').slice(0, 180);
     }
   }
-  const matches = [...localMatches, ...aiMatches];
+  const fileMatches = matchFileFields(fieldInfos, fileRecords, categories);
+  const aiByIndex = new Map(aiMatches.map((match) => [match.index, match]));
+  const localByIndex = new Map(localMatches.map((match) => [match.index, match]));
+  const reviewedMatches = localMatches.map((localMatch) => {
+    const aiMatch = aiByIndex.get(localMatch.index);
+    if (!aiMatch) return localMatch;
+    if (localMatch.confidence === 'medium' && aiMatch.confidence === 'high') return aiMatch;
+    return { ...localMatch, source: 'ai_reviewed' as const };
+  });
+  const aiOnlyMatches = aiMatches.filter((match) => !localByIndex.has(match.index));
+  const matches = [...reviewedMatches, ...aiOnlyMatches, ...fileMatches];
   return {
     ok: true,
     type: 'scan',
@@ -549,6 +671,13 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     matched: matches.length,
     matches,
     fields: fieldInfos,
+    ai: {
+      configured: textApiReady,
+      mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
+      attempted: aiAttempted,
+      reviewed: aiMatches.length,
+      error: aiError,
+    },
   };
 }
 
@@ -583,7 +712,7 @@ async function handleFill(
         kind: 'file',
         index: match.index,
         fileName: record.filename,
-        fileType: inferImageType(record.filename, record.fileType),
+        fileType: inferFileType(record.filename, record.fileType),
         fileBody: arrayBufferToBase64(await record.fileBody.arrayBuffer()),
       });
     } else {
@@ -624,7 +753,12 @@ async function processAutoRun(tabId: number): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 600));
       scan = await collectTabScan(tabId);
     }
-    const selectedMatches = scan.matches.filter((match) => match.confidence !== 'low');
+    const scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
+    const selectedMatches = scan.matches.filter((match) => (
+      match.kind !== 'file' &&
+      match.confidence !== 'low' &&
+      !isMeaningfullyFilled(scannedFieldByIndex.get(match.index) ?? ({} as FormFieldInfo))
+    ));
     const result = await sendToContentScript<{ success: number; failure: number }>(tabId, {
       type: 'fill',
       items: selectedMatches.map((match) => ({
@@ -751,6 +885,8 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
     // 4. Local deterministic matches (AI is optional)
     const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
     for (const match of localMatches) {
+      const field = textFieldInfos.find((candidate) => candidate.index === match.index);
+      if (field && isMeaningfullyFilled(field)) continue;
       try {
         await sendToContentScript(tab.id, {
           type: 'fillField',
@@ -766,6 +902,8 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
     // 5. Stream text matches
     const aiFields = getAiEligibleFields(textFieldInfos, localMatches);
     const profileValues = flattenProfileValues(textFields, blocks);
+    const profileValueByKey = new Map(profileValues.map((value) => [value.key, value.value]));
+    const fieldByIndex = new Map(textFieldInfos.map((field) => [field.index, field]));
     if (textApiReady && aiFields.length > 0 && profileValues.length > 0) {
       for await (const event of matchFieldsStream(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value })))) {
         if (event.type === 'value_chunk') {
@@ -778,6 +916,16 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
           } catch { /* tab may have closed */ }
         } else if (event.type === 'match_complete') {
           const match = event.match;
+          const field = fieldByIndex.get(match.index);
+          if (!isSemanticallyCompatibleMatch(field, match.fieldKey)) continue;
+          if (field?.rowIndex != null && field.groupLabel) {
+            const structuredPrefix = `${field.groupLabel}[${field.rowIndex + 1}].`;
+            const groundedValue = match.fieldKey.startsWith(structuredPrefix)
+              ? profileValueByKey.get(match.fieldKey)
+              : undefined;
+            if (groundedValue == null) continue;
+            match.value = groundedValue;
+          }
           try {
             if (match.fillMode === 'long') {
               await sendToContentScript(tab.id, {
