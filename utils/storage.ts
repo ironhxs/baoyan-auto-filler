@@ -1,8 +1,12 @@
+export type ApiMode = 'chat_completions' | 'responses';
+
 export interface ApiConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
   providerId: string;
+  apiMode: ApiMode;
+  fastMode: boolean;
 }
 
 const DEFAULT_API_CONFIG: ApiConfig = {
@@ -10,6 +14,8 @@ const DEFAULT_API_CONFIG: ApiConfig = {
   apiKey: '',
   model: '',
   providerId: '',
+  apiMode: 'chat_completions',
+  fastMode: false,
 };
 
 export function getApiConfig(): Promise<ApiConfig> {
@@ -26,5 +32,9 @@ export function setApiConfig(config: Partial<ApiConfig>): Promise<void> {
 }
 
 export function isApiConfigured(): Promise<boolean> {
-  return getApiConfig().then((cfg) => cfg.apiKey.length > 0);
+  return getApiConfig().then((cfg) => (
+    cfg.baseUrl.trim().length > 0 &&
+    cfg.apiKey.trim().length > 0 &&
+    cfg.model.trim().length > 0
+  ));
 }

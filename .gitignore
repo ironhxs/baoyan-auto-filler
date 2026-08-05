@@ -9,6 +9,7 @@ dist/
 
 # Chrome profile (persistent dev data)
 .chrome-profile/
+.playwright-cli/
 
 # macOS
 .DS_Store

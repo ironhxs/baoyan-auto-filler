@@ -15,7 +15,9 @@
 interface ApiConfig {
   baseUrl: string;   // 默认 "https://api.openai.com/v1"
   apiKey: string;
-  model: string;     // 默认 "gpt-4o-mini"
+  model: string;     // 必填，不设置默认模型
+  apiMode: 'chat_completions' | 'responses';
+  fastMode: boolean; // 默认 false
 }
 ```
 

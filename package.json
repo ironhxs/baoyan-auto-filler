@@ -1,7 +1,7 @@
 {
-  "name": "auto-filler",
-  "description": "秒填鸭",
-  "version": "1.0.0",
+  "name": "baotian",
+  "description": "保填",
+  "version": "1.2.1",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -12,13 +12,16 @@
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "compile": "tsc --noEmit --project .wxt/tsconfig.json",
+    "test:llm-api": "node scripts/test-llm-api.mjs",
     "test:profile": "node scripts/test-profile-data.mjs",
+    "test:local-matcher": "tsx scripts/test-local-matcher.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.42",
     "marked": "^18.0.4",
     "puppeteer": "^25.0.4",
+    "tsx": "^4.23.7",
     "typescript": "^5.9.3",
     "wxt": "^0.20.26"
   },

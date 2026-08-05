@@ -1,7 +1,9 @@
 import './style.css';
 import { isApiConfigured } from '@/utils/storage';
-import { getAllFileRecords, hasTextFields } from '@/utils/db';
+import { getAllBlockCategories, getAllFileRecords, getAllTextFields } from '@/utils/db';
 import type { MatchResult, FormFieldInfo } from '@/utils/matcher';
+import { flattenProfileValues, PROFILE_SECTIONS } from '@/utils/profile-schema';
+import type { ProfileSourceValue } from '@/utils/profile-schema';
 
 const app = document.getElementById('app')!;
 
@@ -26,6 +28,26 @@ interface FillResponse {
   failure: number;
 }
 
+interface InspectResponse {
+  ok: true;
+  type: 'inspect';
+  total: number;
+  required: number;
+  unfilled: number;
+  protected: number;
+}
+
+interface AutoRunResponse {
+  ok: true;
+  type: 'autoRun';
+  tabId: number;
+  status: 'running' | 'paused' | 'complete' | 'stopped';
+  pageCount: number;
+  filledCount: number;
+  message: string;
+  updatedAt: number;
+}
+
 type ViewState = 'idle' | 'scanning' | 'result' | 'filling' | 'filled' | 'streaming';
 type Confidence = MatchResult['confidence'];
 
@@ -34,7 +56,7 @@ interface DisplayItem {
   index: number;
   label: string;
   value: string;
-  status: 'matched' | 'pending' | 'unmatched';
+  status: 'matched' | 'pending' | 'unmatched' | 'protected';
   confidence?: Confidence;
   fillMode?: 'short' | 'long';
   checked: boolean;
@@ -45,27 +67,51 @@ interface DisplayItem {
 let viewState: ViewState = 'idle';
 let displayItems: DisplayItem[] = [];
 let fields: FormFieldInfo[] = [];
+let profileValues: ProfileSourceValue[] = [];
+let pageStatus: InspectResponse | null = null;
+let apiAvailable = false;
+let autoRunStatus: AutoRunResponse | null = null;
+
+function sendRuntimeMessage<T>(message: unknown): Promise<T> {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, (response: T) => {
+      if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+      else resolve(response);
+    });
+  });
+}
 
 async function init() {
-  const [hasFields, apiReady, fileRecords] = await Promise.all([
-    hasTextFields(),
+  const [textFields, blocks, apiReady, fileRecords] = await Promise.all([
+    getAllTextFields(),
+    getAllBlockCategories(),
     isApiConfigured(),
     getAllFileRecords(),
   ]);
+  profileValues = flattenProfileValues(textFields, blocks);
+  apiAvailable = apiReady;
 
   renderHeader();
 
-  const hasMaterials = fileRecords.length > 0;
-  if (!hasFields && !hasMaterials) {
-    renderNotConfigured(!hasFields);
-    return;
+  try {
+    const [inspected, autoStatus] = await Promise.all([
+      sendRuntimeMessage<InspectResponse | ErrorResponse>({ type: 'inspectPage' }),
+      sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'getAutoRunStatus' }),
+    ]);
+    pageStatus = inspected.ok ? inspected as InspectResponse : null;
+    autoRunStatus = autoStatus.ok ? autoStatus as AutoRunResponse : null;
+  } catch {
+    pageStatus = null;
+    autoRunStatus = null;
   }
-  if (!apiReady && !hasMaterials) {
-    renderNotConfigured(false);
+
+  const hasMaterials = fileRecords.length > 0;
+  if (profileValues.length === 0 && !hasMaterials) {
+    renderNotConfigured(true);
     return;
   }
 
-  renderIdle();
+  renderIdle(apiReady);
 }
 
 function renderHeader() {
@@ -73,8 +119,8 @@ function renderHeader() {
   header.className = 'header';
   header.innerHTML = `
     <div class="header-left">
-      <img class="logo-icon" src="/logo.png" alt="秒填鸭" />
-      <span class="logo-text">秒填鸭</span>
+      <img class="logo-icon" src="/logo.png" alt="保填" />
+      <span class="logo-text">保填</span>
     </div>
     <div class="header-right">
       <button class="avatar-btn" id="avatarBtn" title="工作台">用</button>
@@ -117,21 +163,153 @@ function renderNotConfigured(needProfile: boolean) {
   });
 }
 
-function renderIdle() {
+function renderModeTabs(active: 'smart' | 'manual'): string {
+  return `
+    <div class="mode-tabs">
+      <button class="mode-tab${active === 'smart' ? ' active' : ''}" id="smartModeTab">智能填充</button>
+      <button class="mode-tab${active === 'manual' ? ' active' : ''}" id="manualModeTab">手动速填</button>
+    </div>
+  `;
+}
+
+function bindModeTabs(): void {
+  document.getElementById('smartModeTab')?.addEventListener('click', () => renderIdle(apiAvailable));
+  document.getElementById('manualModeTab')?.addEventListener('click', renderManualFill);
+}
+
+function renderIdle(apiReady = true) {
   viewState = 'idle';
   removeFooter();
   const main = getMainContainer(false);
+  const statusHtml = pageStatus ? `
+    <div class="site-status-card">
+      <div class="site-status-title"><span class="status-live-dot"></span>当前页面已识别</div>
+      <div class="site-status-grid">
+        <span><b>${pageStatus.total}</b> 可填字段</span>
+        <span><b>${pageStatus.required}</b> 必填字段</span>
+        <span><b>${pageStatus.unfilled}</b> 尚未填写</span>
+        <span><b>${pageStatus.protected}</b> 人工处理</span>
+      </div>
+    </div>
+  ` : '<div class="site-status-card unavailable">当前页面暂时无法识别，请刷新页面后重试。</div>';
+  const autoHtml = autoRunStatus && autoRunStatus.status !== 'stopped' ? `
+    <div class="auto-run-card ${autoRunStatus.status}">
+      <div class="auto-run-head">
+        <strong>${autoRunStatus.status === 'running' ? '后台连续填写中' : autoRunStatus.status === 'paused' ? '连续填写已暂停' : '已到最终审核页'}</strong>
+        <span>${autoRunStatus.pageCount} 页 · ${autoRunStatus.filledCount} 项</span>
+      </div>
+      <p>${escapeHtml(autoRunStatus.message)}</p>
+      ${autoRunStatus.status === 'running'
+        ? '<button id="stopAutoRunBtn" class="auto-run-link danger">停止</button>'
+        : autoRunStatus.status === 'paused'
+          ? '<button id="resumeAutoRunBtn" class="auto-run-link">处理后继续</button>'
+          : ''}
+    </div>
+  ` : '';
   main.innerHTML = `
+    ${renderModeTabs('smart')}
+    ${statusHtml}
+    ${autoHtml}
     <div class="scan-card">
-      <div class="scan-icon-wrap">🔍</div>
-      <div class="scan-title">扫描当前页面</div>
-      <div class="scan-desc">自动识别表单字段并匹配您的个人信息</div>
-      <button class="scan-btn" id="scanBtn">开始扫描</button>
-      <button class="scan-btn stream-btn" id="streamScanBtn">流式自动填充</button>
+      <div class="scan-icon-wrap">⚡</div>
+      <div class="scan-title">快速填充当前页面</div>
+      <div class="scan-desc">先预览匹配结果，再由你确认填入。${apiReady ? 'AI 可辅助处理低置信字段。' : '未配置 AI 时仍可使用本地明确匹配。'}</div>
+      <button class="scan-btn" id="scanBtn">识别并预览</button>
+      <button class="scan-btn auto-run-btn" id="autoRunBtn"${autoRunStatus?.status === 'running' ? ' disabled' : ''}>${autoRunStatus?.status === 'running' ? '正在后台连续填写' : '后台连续填写到最终审核'}</button>
+      <div class="auto-run-note">可关闭弹窗或切换页面；遇到无法处理的必填项会暂停，绝不点击最终提交。</div>
+      ${apiReady ? '<button class="scan-btn stream-btn" id="streamScanBtn">AI 流式快速填充</button>' : ''}
     </div>
   `;
+  bindModeTabs();
   document.getElementById('scanBtn')!.addEventListener('click', startScan);
-  document.getElementById('streamScanBtn')!.addEventListener('click', startStreamScan);
+  document.getElementById('autoRunBtn')!.addEventListener('click', startAutoRun);
+  document.getElementById('resumeAutoRunBtn')?.addEventListener('click', startAutoRun);
+  document.getElementById('stopAutoRunBtn')?.addEventListener('click', stopAutoRun);
+  document.getElementById('streamScanBtn')?.addEventListener('click', startStreamScan);
+}
+
+async function startAutoRun() {
+  try {
+    const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'startAutoRun' });
+    if (!response.ok) throw new Error(response.error);
+    autoRunStatus = response as AutoRunResponse;
+    renderIdle(apiAvailable);
+  } catch {
+    showError('无法启动后台连续填写，请刷新页面后重试');
+  }
+}
+
+async function stopAutoRun() {
+  try {
+    const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'stopAutoRun' });
+    if (response.ok) autoRunStatus = response as AutoRunResponse;
+    renderIdle(apiAvailable);
+  } catch {
+    showError('无法停止连续填写，请刷新页面后重试');
+  }
+}
+
+function renderManualFill() {
+  viewState = 'idle';
+  removeFooter();
+  const main = getMainContainer(false);
+  const sectionsHtml = PROFILE_SECTIONS.map((section, index) => {
+    const values = profileValues.filter((value) => value.sectionId === section.id);
+    if (values.length === 0) return '';
+    return `
+      <details class="manual-section" ${index < 2 ? 'open' : ''}>
+        <summary><span>${section.icon} ${section.title}</span><b>${values.length}</b></summary>
+        <div class="manual-value-list">
+          ${values.map((value) => `
+            <button class="manual-value-btn" data-value="${escapeAttr(value.value)}">
+              <span>${escapeHtml(value.key)}</span>
+              <strong>${escapeHtml(value.value)}</strong>
+            </button>
+          `).join('')}
+        </div>
+      </details>
+    `;
+  }).join('');
+
+  const customValues = profileValues.filter((value) => value.sectionId === 'custom');
+  main.innerHTML = `
+    ${renderModeTabs('manual')}
+    <div class="manual-hint">先在报名网页中点击一个输入框，再点下方资料即可写入；验证码、文件、志愿和导师字段会被拦截。</div>
+    <div id="manualStatus" class="manual-status"></div>
+    <div class="manual-sections">
+      ${sectionsHtml}
+      ${customValues.length ? `
+        <details class="manual-section">
+          <summary><span>🗂 其他资料</span><b>${customValues.length}</b></summary>
+          <div class="manual-value-list">
+            ${customValues.map((value) => `<button class="manual-value-btn" data-value="${escapeAttr(value.value)}"><span>${escapeHtml(value.key)}</span><strong>${escapeHtml(value.value)}</strong></button>`).join('')}
+          </div>
+        </details>
+      ` : ''}
+    </div>
+  `;
+  bindModeTabs();
+  main.querySelectorAll<HTMLButtonElement>('.manual-value-btn').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const status = document.getElementById('manualStatus');
+      try {
+        const response = await sendRuntimeMessage<FillResponse | ErrorResponse>({
+          type: 'manualFill',
+          payload: { value: button.dataset.value ?? '' },
+        });
+        const success = response.ok && response.type === 'fill' && response.success === 1;
+        if (status) {
+          status.textContent = success ? '已写入当前输入框，可继续选择下一项。' : '未找到可填写的输入框，或该字段需要本人处理。';
+          status.className = `manual-status show ${success ? 'success' : 'error'}`;
+        }
+      } catch {
+        if (status) {
+          status.textContent = '无法连接当前页面，请刷新后重试。';
+          status.className = 'manual-status show error';
+        }
+      }
+    });
+  });
 }
 
 function renderScanning() {
@@ -178,8 +356,8 @@ function buildDisplayItems(scanResp: ScanResponse): DisplayItem[] {
         kind: f.kind ?? 'text',
         index: f.index,
         label: getFieldLabel(f, f.index),
-        value: '-',
-        status: 'unmatched',
+        value: f.protected ? (f.protectionReason || '需本人处理') : '-',
+        status: f.protected ? 'protected' : 'unmatched',
         checked: false,
       });
     }
@@ -208,8 +386,9 @@ function renderResult(scanResp: ScanResponse) {
   displayItems = buildDisplayItems(scanResp);
 
   const pendingCount = displayItems.filter((i) => i.status === 'pending').length;
-  const matchedCount = displayItems.filter((i) => i.status !== 'unmatched').length;
-  const checkedCount = displayItems.filter((i) => i.checked && i.status !== 'unmatched').length;
+  const protectedCount = displayItems.filter((i) => i.status === 'protected').length;
+  const matchedCount = displayItems.filter((i) => i.status === 'matched' || i.status === 'pending').length;
+  const checkedCount = displayItems.filter((i) => i.checked && (i.status === 'matched' || i.status === 'pending')).length;
 
   const main = getMainContainer(true);
 
@@ -239,6 +418,15 @@ function renderResult(scanResp: ScanResponse) {
         <div class="stat-value pending">${pendingCount}</div>
         <div class="stat-label">待确认</div>
       </div>
+      <div class="stat-item">
+        <div class="stat-value protected">${protectedCount}</div>
+        <div class="stat-label">人工处理</div>
+      </div>
+    </div>
+    <div class="fill-policy" role="group" aria-label="填充策略">
+      <button data-policy="cautious">保守</button>
+      <button data-policy="standard" class="active">标准</button>
+      <button data-policy="aggressive">尽量填充</button>
     </div>
     <div class="field-list-card">
       <div class="field-list-header">
@@ -255,7 +443,7 @@ function renderResult(scanResp: ScanResponse) {
     const li = document.createElement('li');
     li.className = `field-item ${item.kind === 'file' ? 'file-item' : ''} ${item.fillMode === 'long' ? 'long-text-item' : ''} ${item.confidence ? `confidence-${item.confidence}` : ''}`.trim();
 
-    const checkboxHtml = item.status !== 'unmatched'
+    const checkboxHtml = item.status !== 'unmatched' && item.status !== 'protected'
       ? `<input type="checkbox" data-idx="${item.index}" ${item.checked ? 'checked' : ''} />`
       : `<input type="checkbox" data-idx="${item.index}" disabled />`;
 
@@ -279,10 +467,17 @@ function renderResult(scanResp: ScanResponse) {
     });
   });
 
+  main.querySelectorAll<HTMLButtonElement>('.fill-policy button').forEach((button) => {
+    button.addEventListener('click', () => applyFillPolicy(button.dataset.policy ?? 'standard'));
+  });
+
   renderFooter(checkedCount);
 }
 
 function getStatusHtml(item: DisplayItem): string {
+  if (item.status === 'protected') {
+    return '<span class="status-tag protected">人工</span>';
+  }
   if (item.status === 'unmatched') {
     return '<span class="status-tag unmatched">未匹配</span>';
   }
@@ -300,10 +495,31 @@ function getStatusHtml(item: DisplayItem): string {
   return `<span class="status-tag ${confidence}">${labelMap[confidence]}</span>`;
 }
 
+function applyFillPolicy(policy: string): void {
+  document.querySelectorAll('.fill-policy button').forEach((button) => {
+    button.classList.toggle('active', (button as HTMLElement).dataset.policy === policy);
+  });
+  displayItems.forEach((item) => {
+    if (item.status === 'unmatched' || item.status === 'protected') return;
+    item.checked = policy === 'aggressive'
+      ? true
+      : policy === 'cautious'
+        ? item.confidence === 'high' || item.fillMode === 'long'
+        : item.confidence !== 'low' || item.fillMode === 'long';
+    const checkbox = document.querySelector<HTMLInputElement>(`input[type="checkbox"][data-idx="${item.index}"]`);
+    if (checkbox) checkbox.checked = item.checked;
+  });
+  updateFooterButton();
+}
+
 function escapeHtml(text: string): string {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+
+function escapeAttr(text: string): string {
+  return escapeHtml(text).replace(/"/g, '&quot;');
 }
 
 function removeFooter() {
@@ -329,7 +545,7 @@ function renderFooter(matchedCount: number) {
 }
 
 function updateFooterButton() {
-  const checkedCount = displayItems.filter((i) => i.checked && i.status !== 'unmatched').length;
+  const checkedCount = displayItems.filter((i) => i.checked && (i.status === 'matched' || i.status === 'pending')).length;
   const fillBtn = document.getElementById('fillBtn') as HTMLButtonElement | null;
   if (fillBtn) {
     fillBtn.textContent = `一键自动填充（${checkedCount} 项）`;

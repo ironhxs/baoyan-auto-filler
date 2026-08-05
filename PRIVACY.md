@@ -1,10 +1,10 @@
-# Privacy Policy for 秒填鸭 (Auto Filler)
+# Privacy Policy for 保填
 
 **Last updated:** June 2, 2026
 
 ## Overview
 
-秒填鸭 (Auto Filler) is a browser extension that helps users fill web forms using LLM-powered semantic matching. We respect your privacy and are committed to protecting your personal data.
+保填 is a browser extension that helps users fill web forms using local matching and optional LLM-powered semantic matching. We respect your privacy and are committed to protecting your personal data.
 
 ## Data Collection
 

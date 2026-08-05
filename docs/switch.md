@@ -2,7 +2,7 @@
 
 > 数据来源：[cc-switch](https://github.com/farion1231/cc-switch) `src/config/hermesProviderPresets.ts`
 >
-> 以下均为 **OpenAI 兼容** 端点（`/v1/chat/completions`），可直接填入 秒填鸭 使用。
+> 以下均为 **OpenAI 兼容** 端点（`/v1/chat/completions`），可直接填入保填使用。
 
 ## 国内厂商
 

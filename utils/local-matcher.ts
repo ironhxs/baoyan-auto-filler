@@ -1,0 +1,240 @@
+import type { BlockCategory, TextField } from './db';
+import type { FormFieldInfo, MatchResult } from './matcher';
+import { getBlockSection, inferLanguageItems } from './profile-schema';
+
+const ALIAS_GROUPS: string[][] = [
+  ['姓名', '成员姓名', '家庭成员姓名', '真实姓名'],
+  ['手机号', '手机号码', '联系电话', '联系方式', '移动电话', '本人电话'],
+  ['邮箱', '电子邮箱', '电子邮件', 'email', 'e-mail'],
+  ['身份证号码', '身份证号', '证件号码', '证件号'],
+  ['出生日期', '出生年月日', '生日'],
+  ['性别'],
+  ['民族'],
+  ['政治面貌'],
+  ['婚否', '婚姻状况'],
+  ['住址', '家庭住址', '现住址', '居住地址'],
+  ['通讯地址', '通信地址', '联系地址', '邮寄地址'],
+  ['通信地址邮政编码', '通讯地址邮政编码', '邮政编码', '邮编'],
+  ['出生地'],
+  ['籍贯地', '籍贯'],
+  ['户口所在地详细地址', '户籍地址', '户口所在地', '户籍所在地'],
+  ['档案所在单位', '档案保管单位'],
+  ['档案所在单位地址', '档案单位地址'],
+  ['档案所在单位邮政编码', '档案单位邮编'],
+  ['紧急电话', '紧急联系电话'],
+  ['关系', '与本人关系', '称谓', '家庭关系'],
+  ['工作单位及职务', '在何单位工作任何职务', '工作单位和职务', '单位及职务', '工作单位职务'],
+  ['学校', '就读学校', '本科院校', '毕业院校'],
+  ['院系', '学院', '所在学院', '所在院系'],
+  ['专业', '本科专业', '所学专业'],
+  ['学号'],
+  ['预计毕业年月', '毕业时间', '预计毕业时间'],
+  ['入学年月', '入学时间', '本科入学年月'],
+  ['GPA', '平均绩点', '绩点'],
+  ['综合排名', '成绩排名', '专业排名', '年级排名', '排名'],
+  ['排名基数', '专业人数', '年级人数', '总人数'],
+  ['预计能否获得推免资格', '是否获得推免资格', '推免资格'],
+  ['英语四级成绩', '四级成绩', 'CET4', 'CET-4'],
+  ['英语六级成绩', '六级成绩', 'CET6', 'CET-6'],
+  ['外语考试成绩', '外语成绩'],
+  ['考试名称', '外语水平', '外语等级', '考试类型'],
+  ['成绩', '考试成绩', '外语分数'],
+  ['考试日期', '取得成绩时间', '取得时间', '考试时间'],
+  ['备注', '说明'],
+  ['证书编号', '成绩单编号'],
+  ['辅导员姓名'],
+  ['辅导员电话', '辅导员联系方式'],
+  ['是否来自拔尖人才培养基地', '是否拔尖人才培养基地', '是否来自拔尖基地'],
+  ['拔尖人才培养基地名称', '拔尖基地名称'],
+  ['开始日期', '开始时间', '起始时间', '起始日期'],
+  ['结束日期', '结束时间', '终止时间', '终止日期'],
+  ['学校或单位', '学习或工作单位', '所在单位'],
+  ['专业或职务', '学习专业或工作职务'],
+  ['经历说明', '主要经历', '经历内容'],
+  ['成果名称', '论文名称', '专利名称', '项目名称'],
+  ['成果类型', '论文类型', '成果类别'],
+  ['发表或完成时间', '发表时间', '完成时间'],
+  ['本人排序', '作者排名', '署名顺序'],
+  ['成果说明', '成果简介'],
+  ['奖励名称', '奖项名称', '荣誉名称'],
+  ['奖励级别', '获奖级别', '奖项级别'],
+  ['获奖时间', '奖励时间'],
+  ['本人排名', '获奖排名'],
+  ['颁发单位', '授予单位'],
+];
+
+function normalize(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/cet[-\s]?4/g, '英语四级')
+    .replace(/cet[-\s]?6/g, '英语六级')
+    .replace(/请(输入|填写|选择)|您的|本人|主要|详细|信息|情况/g, '')
+    .replace(/[\s　：:，,。；;（）()【】\[\]\/|｜_*#]/g, '');
+}
+
+function aliasesFor(key: string): string[] {
+  const normalizedKey = normalize(key);
+  return ALIAS_GROUPS.find((group) => group.some((alias) => normalize(alias) === normalizedKey)) ?? [key];
+}
+
+function scoreKey(fieldText: string, key: string): number {
+  const normalizedField = normalize(fieldText);
+  if (!normalizedField) return 0;
+
+  let score = 0;
+  for (const alias of aliasesFor(key)) {
+    const normalizedAlias = normalize(alias);
+    if (!normalizedAlias) continue;
+    if (normalizedField === normalizedAlias) score = Math.max(score, 100);
+    else if (normalizedField.startsWith(normalizedAlias) || normalizedField.endsWith(normalizedAlias)) {
+      score = Math.max(score, 88 + Math.min(6, normalizedAlias.length));
+    } else if (normalizedField.includes(normalizedAlias)) {
+      score = Math.max(score, 76 + Math.min(8, normalizedAlias.length));
+    }
+  }
+  return score;
+}
+
+function fieldSemanticText(field: FormFieldInfo): string {
+  return [
+    field.columnLabel,
+    field.label,
+    field.placeholder,
+    field.ariaLabel,
+    field.title,
+    field.hint,
+    field.name,
+    field.id,
+  ].filter(Boolean).join(' | ');
+}
+
+function primaryFieldSemanticText(field: FormFieldInfo): string {
+  return [
+    field.columnLabel,
+    field.label,
+    field.placeholder,
+    field.ariaLabel,
+    field.title,
+    field.name,
+    field.id,
+  ].find((value) => value?.trim()) ?? '';
+}
+
+function rankedCandidates(semanticText: string, textFields: TextField[]) {
+  return textFields
+    .filter((source) => source.value.trim())
+    .map((source) => ({ source, score: scoreKey(semanticText, source.key) }))
+    .filter(({ score }) => score >= 76)
+    .sort((a, b) => b.score - a.score);
+}
+
+function chooseUnambiguousCandidate(candidates: ReturnType<typeof rankedCandidates>) {
+  const best = candidates[0];
+  if (!best) return undefined;
+  if (candidates[1] && candidates[1].score === best.score && candidates[1].source.key !== best.source.key) {
+    return undefined;
+  }
+  return best;
+}
+
+export function isMeaningfullyFilled(field: FormFieldInfo): boolean {
+  const value = (field.value ?? '').trim();
+  if (!value) return false;
+  return !/^(请选择|请选择一项|请选|--|---|无|未选择)$/i.test(value);
+}
+
+function adaptValueToOptions(value: string, options: string[] | undefined): string {
+  if (!options?.length) return value;
+  const normalizedValue = normalize(value);
+  const exact = options.find((option) => normalize(option) === normalizedValue);
+  if (exact) return exact;
+  const close = options.find((option) => normalize(option).includes(normalizedValue) || normalizedValue.includes(normalize(option)));
+  return close ?? value;
+}
+
+function makeMatch(
+  field: FormFieldInfo,
+  sourceKey: string,
+  sourceFieldKey: string,
+  value: string,
+  score: number,
+): MatchResult {
+  const rowLabel = field.rowIndex != null ? `第${field.rowIndex + 1}行` : '';
+  const label = [field.groupLabel, rowLabel, field.columnLabel || field.label || sourceFieldKey].filter(Boolean).join('·');
+  return {
+    kind: 'text',
+    index: field.index,
+    fieldKey: sourceKey,
+    value: adaptValueToOptions(value, field.options),
+    shortLabel: label || sourceFieldKey,
+    confidence: score >= 88 ? 'high' : 'medium',
+    fillMode: field.fillMode,
+  };
+}
+
+function findStructuredMatch(
+  field: FormFieldInfo,
+  blocks: BlockCategory[],
+  textFields: TextField[],
+): MatchResult | undefined {
+  if (field.rowIndex == null || !field.groupLabel) return undefined;
+  const block = blocks.find((candidate) => {
+    const section = getBlockSection(candidate);
+    return section?.title === field.groupLabel || normalize(candidate.title) === normalize(field.groupLabel ?? '');
+  });
+  const inferredLanguageItems = field.groupLabel === '外语水平' ? inferLanguageItems(textFields) : [];
+  const item = block?.items[field.rowIndex] ?? inferredLanguageItems[field.rowIndex];
+  if (!item) return undefined;
+  const blockTitle = block?.title ?? field.groupLabel;
+
+  const semanticText = field.columnLabel || field.label || fieldSemanticText(field);
+  const candidates = item.fields
+    .map((source) => ({ source, score: scoreKey(semanticText, source.key) }))
+    .filter(({ score }) => score >= 76)
+    .sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  if (!best || !best.source.value.trim()) return undefined;
+
+  return makeMatch(
+    field,
+    `${blockTitle}[${field.rowIndex + 1}].${best.source.key}`,
+    best.source.key,
+    best.source.value,
+    best.score,
+  );
+}
+
+function findFlatMatch(field: FormFieldInfo, textFields: TextField[]): MatchResult | undefined {
+  if (field.rowIndex != null && field.groupLabel) return undefined;
+  const primaryText = primaryFieldSemanticText(field);
+  const primaryCandidates = rankedCandidates(primaryText, textFields);
+  const best = chooseUnambiguousCandidate(primaryCandidates)
+    ?? chooseUnambiguousCandidate(rankedCandidates(fieldSemanticText(field), textFields));
+  if (!best) return undefined;
+  return makeMatch(field, best.source.key, best.source.key, best.source.value, best.score);
+}
+
+export function matchFieldsLocally(
+  fields: FormFieldInfo[],
+  textFields: TextField[],
+  blocks: BlockCategory[],
+): MatchResult[] {
+  return fields.flatMap((field) => {
+    if (field.kind === 'file' || field.protected || isMeaningfullyFilled(field)) return [];
+    const structured = findStructuredMatch(field, blocks, textFields);
+    if (structured) return [structured];
+    const flat = findFlatMatch(field, textFields);
+    return flat ? [flat] : [];
+  });
+}
+
+export function getAiEligibleFields(fields: FormFieldInfo[], localMatches: MatchResult[]): FormFieldInfo[] {
+  const locallyMatched = new Set(localMatches.map((match) => match.index));
+  return fields.filter((field) => (
+    field.kind !== 'file' &&
+    !field.protected &&
+    !isMeaningfullyFilled(field) &&
+    !locallyMatched.has(field.index) &&
+    !(field.rowIndex != null && field.groupLabel)
+  ));
+}

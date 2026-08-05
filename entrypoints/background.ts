@@ -1,6 +1,7 @@
 import { getApiConfig, isApiConfigured, setApiConfig } from '@/utils/storage';
 import {
   getAllCategories,
+  getAllBlockCategories,
   getAllFileRecords,
   getAllTextFields,
   saveAllTextFields,
@@ -8,18 +9,27 @@ import {
 import { matchFields, matchFieldsStream } from '@/utils/matcher';
 import type { Category, FileRecord } from '@/utils/db';
 import type { MatchResult, FormFieldInfo, MaterialRole } from '@/utils/matcher';
+import { flattenProfileValues, getBlockSection, inferLanguageItems } from '@/utils/profile-schema';
+import { getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '@/utils/local-matcher';
 
 interface MessageMap {
+  inspectPage: undefined;
   startScan: undefined;
   startFill: { matches: MatchResult[] };
+  manualFill: { value: string };
+  startAutoRun: undefined;
+  getAutoRunStatus: undefined;
+  stopAutoRun: undefined;
 }
 
 type MessageType = keyof MessageMap;
 
-interface Request<T extends MessageType> {
-  type: T;
-  payload: MessageMap[T];
-}
+type Request = {
+  [T in MessageType]: {
+    type: T;
+    payload: MessageMap[T];
+  };
+}[MessageType];
 
 interface ErrorResponse {
   ok: false;
@@ -42,10 +52,35 @@ interface FillSuccessResponse {
   failure: number;
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | ErrorResponse;
+interface InspectSuccessResponse {
+  ok: true;
+  type: 'inspect';
+  total: number;
+  required: number;
+  unfilled: number;
+  protected: number;
+}
+
+type AutoRunStatus = 'running' | 'paused' | 'complete' | 'stopped';
+
+interface AutoRunState {
+  tabId: number;
+  status: AutoRunStatus;
+  pageCount: number;
+  filledCount: number;
+  message: string;
+  updatedAt: number;
+}
+
+interface AutoRunSuccessResponse extends AutoRunState {
+  ok: true;
+  type: 'autoRun';
+}
+
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | AutoRunSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
-  | { kind: 'text'; index: number; value: string }
+  | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
   | { kind: 'file'; index: number; fileName: string; fileType: string; fileBody: string };
 
 interface RoleScore {
@@ -55,6 +90,7 @@ interface RoleScore {
 }
 
 const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+const autoRunInFlight = new Set<number>();
 
 const MATERIAL_LABELS: Record<MaterialRole, string> = {
   id_photo: '证件照',
@@ -81,15 +117,55 @@ function errorResponse(error: string): ErrorResponse {
   return { ok: false, error };
 }
 
+function getRepeatRowTargets(
+  blocks: Awaited<ReturnType<typeof getAllBlockCategories>>,
+  textFields: Awaited<ReturnType<typeof getAllTextFields>>,
+) {
+  return blocks.flatMap((block) => {
+    const section = getBlockSection(block);
+    if (!section || section.kind !== 'repeat') return [];
+    const inferredCount = section.id === 'language' ? inferLanguageItems(textFields).length : 0;
+    const count = Math.max(block.items.length, inferredCount);
+    return count > 0 ? [{ groupLabel: section.title, count }] : [];
+  });
+}
+
 async function getCurrentTab(): Promise<chrome.tabs.Tab | undefined> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
 }
 
-async function sendToContentScript<T>(tabId: number, message: unknown): Promise<T> {
+function autoRunKey(tabId: number): string {
+  return `autoRun:${tabId}`;
+}
+
+async function getAutoRunState(tabId: number): Promise<AutoRunState | null> {
+  const result = await chrome.storage.session.get(autoRunKey(tabId));
+  return (result[autoRunKey(tabId)] as AutoRunState | undefined) ?? null;
+}
+
+async function saveAutoRunState(state: AutoRunState): Promise<void> {
+  state.updatedAt = Date.now();
+  await chrome.storage.session.set({ [autoRunKey(state.tabId)]: state });
+  const badge = state.status === 'running' ? '…' : state.status === 'paused' ? '!' : state.status === 'complete' ? '✓' : '';
+  const color = state.status === 'paused' ? '#f59e0b' : state.status === 'complete' ? '#22c55e' : '#257ffd';
+  await chrome.action.setBadgeBackgroundColor({ tabId: state.tabId, color }).catch(() => undefined);
+  await chrome.action.setBadgeText({ tabId: state.tabId, text: badge }).catch(() => undefined);
+}
+
+function autoRunResponse(state: AutoRunState): AutoRunSuccessResponse {
+  return { ok: true, type: 'autoRun', ...state };
+}
+
+async function sendToContentScript<T>(
+  tabId: number,
+  message: unknown,
+  retryAfterInjection = true,
+): Promise<T> {
   try {
     return await chrome.tabs.sendMessage(tabId, message) as T;
   } catch (err) {
+    if (!retryAfterInjection) throw err;
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content-scripts/content.js'],
@@ -269,7 +345,7 @@ export default defineBackground(() => {
     seedDevData();
   }
 
-  chrome.runtime.onMessage.addListener((request: Request<MessageType>, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((request: Request, _sender, sendResponse) => {
     handleMessage(request)
       .then(sendResponse)
       .catch((err) => sendResponse(errorResponse(err.message)));
@@ -284,6 +360,18 @@ export default defineBackground(() => {
         await handleStreamScan(port);
       }
     });
+  });
+
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status !== 'complete') return;
+    void getAutoRunState(tabId).then((state) => {
+      if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);
+    });
+  });
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    autoRunInFlight.delete(tabId);
+    void chrome.storage.session.remove(autoRunKey(tabId));
   });
 
   chrome.commands.onCommand.addListener(async (command) => {
@@ -321,51 +409,153 @@ async function seedDevData() {
   }
 }
 
-async function handleMessage(request: Request<MessageType>): Promise<Response> {
+async function handleMessage(request: Request): Promise<Response> {
+  if (request.type === 'inspectPage') {
+    return handleInspectPage();
+  }
   if (request.type === 'startScan') {
     return handleScan();
   }
   if (request.type === 'startFill') {
     return handleFill(request.payload!.matches);
   }
+  if (request.type === 'manualFill') {
+    return handleManualFill(request.payload!.value);
+  }
+  if (request.type === 'startAutoRun') {
+    return handleStartAutoRun();
+  }
+  if (request.type === 'getAutoRunStatus') {
+    return handleGetAutoRunStatus();
+  }
+  if (request.type === 'stopAutoRun') {
+    return handleStopAutoRun();
+  }
   return errorResponse('Unknown message type');
+}
+
+async function handleInspectPage(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
+    tab.id,
+    { type: 'scan' },
+  );
+  const fields = (scanResults ?? []).map((result) => result.field);
+  return {
+    ok: true,
+    type: 'inspect',
+    total: fields.length,
+    required: fields.filter((field) => field.required).length,
+    unfilled: fields.filter((field) => !isMeaningfullyFilled(field)).length,
+    protected: fields.filter((field) => field.protected).length,
+  };
+}
+
+async function handleManualFill(value: string): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const result = await sendToContentScript<{ ok: boolean }>(tab.id, { type: 'manualFill', value });
+  return result.ok
+    ? { ok: true, type: 'fill', success: 1, failure: 0 }
+    : { ok: true, type: 'fill', success: 0, failure: 1 };
+}
+
+async function handleGetAutoRunStatus(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const state = await getAutoRunState(tab.id);
+  return autoRunResponse(state ?? {
+    tabId: tab.id,
+    status: 'stopped',
+    pageCount: 0,
+    filledCount: 0,
+    message: '尚未开始连续填写',
+    updatedAt: Date.now(),
+  });
+}
+
+async function handleStartAutoRun(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const previous = await getAutoRunState(tab.id);
+  const state: AutoRunState = {
+    tabId: tab.id,
+    status: 'running',
+    pageCount: previous?.status === 'paused' ? previous.pageCount : 0,
+    filledCount: previous?.status === 'paused' ? previous.filledCount : 0,
+    message: '后台正在填写当前页面',
+    updatedAt: Date.now(),
+  };
+  await saveAutoRunState(state);
+  void processAutoRun(tab.id);
+  return autoRunResponse(state);
+}
+
+async function handleStopAutoRun(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const previous = await getAutoRunState(tab.id);
+  const state: AutoRunState = {
+    tabId: tab.id,
+    status: 'stopped',
+    pageCount: previous?.pageCount ?? 0,
+    filledCount: previous?.filledCount ?? 0,
+    message: '已停止连续填写',
+    updatedAt: Date.now(),
+  };
+  await saveAutoRunState(state);
+  return autoRunResponse(state);
+}
+
+async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSuccessResponse> {
+  const [textFields, blocks, apiConfig, textApiReady] = await Promise.all([
+    getAllTextFields(),
+    getAllBlockCategories(),
+    getApiConfig(),
+    isApiConfigured(),
+  ]);
+  await sendToContentScript(tabId, {
+    type: 'prepareRepeatRows',
+    targets: getRepeatRowTargets(blocks, textFields),
+  });
+
+  const scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
+    tabId,
+    { type: 'scan' },
+  );
+  if (!scanResults?.length) {
+    return { ok: true, type: 'scan', total: 0, matched: 0, matches: [], fields: [] };
+  }
+
+  const fieldInfos = scanResults.map((result) => ({ ...result.field, index: result.index }));
+  const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
+  const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
+  const aiFields = getAiEligibleFields(textFieldInfos, localMatches);
+  const profileValues = flattenProfileValues(textFields, blocks);
+  let aiMatches: MatchResult[] = [];
+  if (allowAi && textApiReady && aiFields.length > 0 && profileValues.length > 0) {
+    try {
+      aiMatches = await matchFields(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value })));
+    } catch {
+      aiMatches = [];
+    }
+  }
+  const matches = [...localMatches, ...aiMatches];
+  return {
+    ok: true,
+    type: 'scan',
+    total: fieldInfos.length,
+    matched: matches.length,
+    matches,
+    fields: fieldInfos,
+  };
 }
 
 async function handleScan(): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
-
-  const scanResults = await sendToContentScript<
-    Array<{ index: number; field: FormFieldInfo }>
-  >(tab.id, { type: 'scan' });
-
-  if (!scanResults || scanResults.length === 0) {
-    return { ok: true, type: 'scan', total: 0, matched: 0, matches: [], fields: [] };
-  }
-
-  const fieldInfos = scanResults.map((r) => ({ ...r.field, index: r.index }));
-  const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
-
-  const [textFields, apiConfig, textApiReady, fileRecords, categories] = await Promise.all([
-    getAllTextFields(),
-    getApiConfig(),
-    isApiConfigured(),
-    getAllFileRecords(),
-    getAllCategories(),
-  ]);
-
-  const textMatches = textApiReady ? await matchFields(textFieldInfos, apiConfig, textFields) : [];
-  const fileMatches = matchFileFields(fieldInfos, fileRecords, categories);
-  const matches = [...textMatches, ...fileMatches];
-
-  return {
-    ok: true,
-    type: 'scan',
-    total: scanResults.length,
-    matched: matches.length,
-    matches,
-    fields: fieldInfos,
-  };
+  return collectTabScan(tab.id);
 }
 
 async function handleFill(
@@ -397,7 +587,7 @@ async function handleFill(
         fileBody: arrayBufferToBase64(await record.fileBody.arrayBuffer()),
       });
     } else {
-      items.push({ kind: 'text', index: match.index, value: match.value });
+      items.push({ kind: 'text', index: match.index, value: match.value, confidence: match.confidence });
     }
   }
 
@@ -407,6 +597,106 @@ async function handleFill(
   );
 
   return { ok: true, type: 'fill', success: result.success, failure: result.failure };
+}
+
+async function processAutoRun(tabId: number): Promise<void> {
+  if (autoRunInFlight.has(tabId)) return;
+  autoRunInFlight.add(tabId);
+  try {
+    const state = await getAutoRunState(tabId);
+    if (!state || state.status !== 'running') return;
+    if (state.pageCount >= 20) {
+      state.status = 'paused';
+      state.message = '已连续处理 20 页，为避免误操作已暂停，请人工检查';
+      await saveAutoRunState(state);
+      return;
+    }
+
+    state.message = `正在处理第 ${state.pageCount + 1} 页`;
+    await saveAutoRunState(state);
+    if (state.pageCount > 0) {
+      // Full navigations may report complete just before the new content script
+      // has finished its first DOM pass. Give the page a short settling window.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+    let scan = await collectTabScan(tabId);
+    if (scan.total === 0 && state.pageCount > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      scan = await collectTabScan(tabId);
+    }
+    const selectedMatches = scan.matches.filter((match) => match.confidence !== 'low');
+    const result = await sendToContentScript<{ success: number; failure: number }>(tabId, {
+      type: 'fill',
+      items: selectedMatches.map((match) => ({
+        kind: 'text',
+        index: match.index,
+        value: match.value,
+        confidence: match.confidence,
+      })),
+    });
+    state.filledCount += result.success;
+
+    const afterResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
+      tabId,
+      { type: 'scan' },
+    );
+    const blockers = (afterResults ?? [])
+      .map((resultItem) => ({ ...resultItem.field, index: resultItem.index }))
+      .filter((field) => field.required && !isMeaningfullyFilled(field));
+    if (blockers.length > 0) {
+      const labels = blockers.slice(0, 3).map((field) => field.label || field.columnLabel || `字段${field.index + 1}`);
+      state.status = 'paused';
+      state.message = `本页还有 ${blockers.length} 个必填项需处理：${labels.join('、')}`;
+      await saveAutoRunState(state);
+      return;
+    }
+
+    state.message = '本页填写完成，正在安全进入下一步';
+    await saveAutoRunState(state);
+    let advance: { clicked: boolean; advanced: boolean; reason: string };
+    try {
+      // Never replay a navigation command after its message channel disconnects:
+      // the disconnect usually means the first click already opened the next page.
+      advance = await sendToContentScript(tabId, { type: 'advanceToNextStep' }, false);
+    } catch {
+      // A full-page navigation destroys the old content-script message channel.
+      // The disconnect can arrive after the new tab already reports "complete",
+      // so tab.status alone is not a reliable navigation signal.
+      state.pageCount++;
+      state.message = '页面切换中，后台会在新页面稳定后继续填写';
+      await saveAutoRunState(state);
+      setTimeout(() => { void processAutoRun(tabId); }, 700);
+      return;
+    }
+
+    if (!advance.clicked) {
+      state.pageCount++;
+      state.status = 'complete';
+      state.message = '已到最终审核页，未执行提交，请逐项核对后本人决定';
+      await saveAutoRunState(state);
+      return;
+    }
+    if (!advance.advanced) {
+      state.status = 'paused';
+      state.message = advance.reason;
+      await saveAutoRunState(state);
+      return;
+    }
+
+    state.pageCount++;
+    state.message = '已进入下一页，后台继续填写';
+    await saveAutoRunState(state);
+    setTimeout(() => { void processAutoRun(tabId); }, 250);
+  } catch (error) {
+    const state = await getAutoRunState(tabId);
+    if (state?.status === 'running') {
+      state.status = 'paused';
+      state.message = error instanceof Error ? error.message : '连续填写遇到错误，已暂停';
+      await saveAutoRunState(state);
+    }
+  } finally {
+    autoRunInFlight.delete(tabId);
+  }
 }
 
 async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
@@ -422,7 +712,19 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
   };
 
   try {
-    // 1. Scan fields
+    // 1. Load data and safely add missing visible rows in recognized repeat tables
+    const [textFields, blocks, apiConfig, textApiReady] = await Promise.all([
+      getAllTextFields(),
+      getAllBlockCategories(),
+      getApiConfig(),
+      isApiConfigured(),
+    ]);
+    await sendToContentScript(tab.id, {
+      type: 'prepareRepeatRows',
+      targets: getRepeatRowTargets(blocks, textFields),
+    });
+
+    // 2. Scan fields
     const scanResults = await sendToContentScript<
       Array<{ index: number; field: FormFieldInfo }>
     >(tab.id, { type: 'scan' });
@@ -437,15 +739,6 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
     const textFieldInfos = fieldInfos.filter((f) => f.kind !== 'file');
     const totalFields = fieldInfos.length;
 
-    // 2. Load data
-    const [textFields, apiConfig, textApiReady, fileRecords, categories] = await Promise.all([
-      getAllTextFields(),
-      getApiConfig(),
-      isApiConfigured(),
-      getAllFileRecords(),
-      getAllCategories(),
-    ]);
-
     let matched = 0;
     let errorCount = 0;
 
@@ -455,32 +748,26 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
       items: fieldInfos.map((f) => ({ index: f.index, fillMode: f.fillMode ?? 'short' })),
     });
 
-    // 4. File matches (non-streaming, fill immediately)
-    const fileMatches = matchFileFields(fieldInfos, fileRecords, categories);
-    const fileRecordById = new Map<number, FileRecord>();
-    if (fileMatches.length > 0) {
-      const records = await getAllFileRecords();
-      for (const r of records) { if (r.id != null) fileRecordById.set(r.id, r); }
-    }
-
-    for (const fm of fileMatches) {
-      if (fm.fileRecordId == null) continue;
-      const record = fileRecordById.get(fm.fileRecordId);
-      if (!record) continue;
+    // 4. Local deterministic matches (AI is optional)
+    const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
+    for (const match of localMatches) {
       try {
         await sendToContentScript(tab.id, {
           type: 'fillField',
-          index: fm.index,
-          value: fm.value,
+          index: match.index,
+          value: match.value,
+          confidence: match.confidence,
         });
         matched++;
-        sendProgress(matched, totalFields, fm.shortLabel);
+        sendProgress(matched, totalFields, match.shortLabel);
       } catch { errorCount++; }
     }
 
     // 5. Stream text matches
-    if (textApiReady && textFieldInfos.length > 0 && textFields.length > 0) {
-      for await (const event of matchFieldsStream(textFieldInfos, apiConfig, textFields)) {
+    const aiFields = getAiEligibleFields(textFieldInfos, localMatches);
+    const profileValues = flattenProfileValues(textFields, blocks);
+    if (textApiReady && aiFields.length > 0 && profileValues.length > 0) {
+      for await (const event of matchFieldsStream(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value })))) {
         if (event.type === 'value_chunk') {
           try {
             await sendToContentScript(tab.id, {
@@ -502,6 +789,7 @@ async function handleStreamScan(port?: chrome.runtime.Port): Promise<void> {
                 type: 'fillField',
                 index: match.index,
                 value: match.value,
+                confidence: match.confidence,
               });
             }
             matched++;

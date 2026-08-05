@@ -1,16 +1,22 @@
 import { getApiConfig, setApiConfig } from '../../utils/storage';
+import type { ApiConfig, ApiMode } from '../../utils/storage';
 import {
   getAllTextFields, saveAllTextFields, getAllBlockCategories, saveBlockCategory, deleteBlockCategory,
+  ensureProfileBlocksSeeded,
   getAllCategories, addCategory, updateCategory, deleteCategory,
   getAllFileRecords, getFileRecordsByCategory, addFileRecord, updateFileRecord, deleteFileRecord,
   moveFileRecordsToCategory, getUncategorizedId, ensureCategoriesSeeded,
 } from '../../utils/db';
 import type { TextField, BlockCategory, BlockItem, Category, FileRecord } from '../../utils/db';
+import { DEFAULT_REPEAT_SECTIONS, PROFILE_SECTIONS, getBlockSection, getFlatSectionId } from '../../utils/profile-schema';
 import { PROVIDER_PRESETS, getProviderById } from '../../utils/providers';
 import { mergeFilesToPdf, type MergeFileItem } from '../../utils/pdf-merge';
 import {
+  appendProfileFields,
+  appendProfileBlocks,
   mergeProfileFields,
-  parseProfileImport,
+  mergeProfileBlocks,
+  parseProfileImportBundle,
   stringifyProfileExport,
   type ProfileFieldData,
 } from '../../utils/profile-data';
@@ -44,14 +50,19 @@ const PRESET_FIELDS: { key: string; label: string }[] = [
   { key: '院系', label: '院系' },
   { key: '学校', label: '学校' },
   { key: '专业', label: '专业' },
+  { key: '入学年月', label: '入学年月' },
   { key: '预计毕业年月', label: '预计毕业年月' },
   { key: '外语考试成绩', label: '外语考试成绩' },
+  { key: '英语四级成绩', label: '英语四级 / CET-4 成绩' },
   { key: '英语六级成绩', label: '英语六级 / CET-6 成绩' },
   { key: '综合排名', label: '综合排名' },
+  { key: '成绩排名', label: '成绩排名' },
   { key: '排名基数', label: '排名基数 / 年级总人数' },
   { key: 'GPA', label: 'GPA' },
   { key: '预计能否获得推免资格', label: '预计能否获得推免资格' },
   { key: '学号', label: '学号' },
+  { key: '是否来自拔尖人才培养基地', label: '是否来自拔尖人才培养基地' },
+  { key: '拔尖人才培养基地名称', label: '拔尖人才培养基地名称' },
 ];
 const PROFILE_TEMPLATE_FIELDS = PRESET_FIELDS.map(({ key }) => ({ key, value: '' }));
 
@@ -59,19 +70,19 @@ const PAGE_CONFIG: Record<string, { title: string; subtitle: string }> = {
   home: { title: '首页', subtitle: '概览与快捷入口' },
   profile: { title: '首页', subtitle: '' },
   certificates: { title: '证书材料', subtitle: '管理与维护您的证书和证明材料' },
-  docfill: { title: '上传文档智能填充', subtitle: '支持上传 Word / PDF 文档，系统会自动识别字段并匹配信息' },
   pdf: { title: '按顺序生成 PDF', subtitle: '将证明材料按指定顺序排列，生成完整申请材料 PDF' },
   settings: { title: '设置', subtitle: '个人信息、API 配置与账户设置' },
 };
 
 let currentPage = 'profile';
+let profileImportMode: 'merge' | 'append' = 'merge';
 let textFields: TextField[] = [];
 let blockCategories: BlockCategory[] = [];
 let categories: Category[] = [];
 let fileRecords: FileRecord[] = [];
 let selectedCategoryId: number | null = null;
 let certViewMode: 'grid' | 'list' = 'list';
-let apiConfigData: { baseUrl: string; apiKey: string; model: string; providerId: string } | null = null;
+let apiConfigData: ApiConfig | null = null;
 let nextFieldId = 0;
 let pdfMergeQueue: { fileRecordId: number; name: string; type: string }[] = [];
 
@@ -348,33 +359,61 @@ function showPdfFilePickerModal() {
 function renderProfilePage() {
   const fieldMap = Object.fromEntries(textFields.map((f) => [f.key, f.value]));
 
-  const infoFields = textFields.filter((f) => f.value);
+  const renderFlatFields = (fields: TextField[]) => fields.map((f) => `
+    <div class="profile-field">
+      <span class="label">${escapeHtml(f.key)}</span>
+      <span class="value">${escapeHtml(f.value) || '<span class="empty">未填写</span>'}</span>
+    </div>
+  `).join('');
 
-  const infoHtml = infoFields.map((f) => {
-    return `
-      <div class="profile-field">
-        <span class="label">${escapeHtml(f.key)}</span>
-        <span class="value">${escapeHtml(f.value)}</span>
-      </div>
-    `;
-  }).join('');
-
-  // Block categories (dynamic from IndexedDB)
-  const blocksHtml = blockCategories.map((cat) => {
+  const renderBlock = (cat: BlockCategory, extraFields: TextField[] = []) => {
     const catId = cat.id!;
     const itemsHtml = cat.items.map((item, itemIdx) => renderBlockItemHtml(item, catId, itemIdx)).join('');
-    const emptyHtml = cat.items.length === 0 ? '<div class="block-empty">暂无内容，点击下方按钮添加</div>' : '';
+    const emptyHtml = cat.items.length === 0 ? '<div class="block-empty">暂无条目，点击下方按钮添加</div>' : '';
+    const section = getBlockSection(cat);
     return `
-      <div class="card">
+      <div class="card profile-section-card" data-section="${escapeAttr(section?.id ?? 'custom')}">
         <div class="card-header">
-          <span class="card-title">${escapeHtml(cat.title)}</span>
-          <button class="card-action block-delete-btn" data-cat-id="${catId}" title="删除此分类">删除分类</button>
+          <span class="card-title">${section?.icon ?? '📁'} ${escapeHtml(cat.title)}</span>
+          ${cat.sectionId ? '' : `<button class="card-action block-delete-btn" data-cat-id="${catId}" title="删除此分类">删除分类</button>`}
         </div>
+        ${extraFields.length ? `<div class="profile-fields section-flat-fields">${renderFlatFields(extraFields)}</div>` : ''}
         <div class="exp-list">${itemsHtml}${emptyHtml}</div>
         <button class="add-btn block-add-item-btn" data-cat-id="${catId}">+ 添加条目</button>
       </div>
     `;
+  };
+
+  const sectionCardsHtml = PROFILE_SECTIONS.map((section) => {
+    const sectionFields = textFields.filter((field) => getFlatSectionId(field.key) === section.id);
+    if (section.kind === 'flat') {
+      return `
+        <div class="card profile-section-card" data-section="${section.id}">
+          <div class="card-header">
+            <span class="card-title">${section.icon} ${section.title}</span>
+            <button class="card-action edit-section-btn">编辑</button>
+          </div>
+          <div class="profile-fields">${renderFlatFields(sectionFields)}</div>
+        </div>
+      `;
+    }
+
+    const block = blockCategories.find((cat) => cat.sectionId === section.id || cat.title === section.title);
+    return block ? renderBlock(block, section.id === 'language' ? sectionFields : []) : '';
   }).join('');
+
+  const customFields = textFields.filter((field) => getFlatSectionId(field.key) === 'custom');
+  const customFieldsHtml = customFields.length ? `
+    <div class="card profile-section-card" data-section="custom">
+      <div class="card-header">
+        <span class="card-title">🗂 其他资料</span>
+        <button class="card-action edit-section-btn">编辑</button>
+      </div>
+      <div class="profile-fields">${renderFlatFields(customFields)}</div>
+    </div>
+  ` : '';
+
+  const customBlocksHtml = blockCategories.filter((cat) => !getBlockSection(cat)).map((cat) => renderBlock(cat)).join('');
 
   // Add block category button
   const addBlockHtml = `
@@ -402,24 +441,23 @@ function renderProfilePage() {
         `;
       }).join('');
 
-  const firstName = fieldMap['name']?.[0] || '用';
+  const firstName = fieldMap['姓名']?.[0] || fieldMap['name']?.[0] || '用';
 
   pageContent.innerHTML = `
     <div class="profile-grid">
       <div class="profile-left">
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">个人信息</span>
-            <button class="card-action" id="editProfileBtn">编辑</button>
-          </div>
-          <div class="profile-info">
-            <div class="profile-avatar">${firstName}</div>
-            <div class="profile-fields">${infoHtml}</div>
+        <div class="profile-summary-card">
+          <div class="profile-avatar">${firstName}</div>
+          <div>
+            <div class="profile-summary-title">七类推免资料</div>
+            <div class="profile-summary-subtitle">基础字段与多条经历统一管理，填充前请保持资料最新。</div>
           </div>
         </div>
 
+        ${sectionCardsHtml}
+        ${customFieldsHtml}
         ${addBlockHtml}
-        ${blocksHtml}
+        ${customBlocksHtml}
       </div>
 
       <div class="profile-right">
@@ -439,6 +477,10 @@ function renderProfilePage() {
 
   document.getElementById('editProfileBtn')?.addEventListener('click', () => {
     switchPage('settings');
+  });
+
+  document.querySelectorAll('.edit-section-btn').forEach((button) => {
+    button.addEventListener('click', () => switchPage('settings'));
   });
 
   document.getElementById('goToMaterialsBtn')?.addEventListener('click', () => {
@@ -584,7 +626,11 @@ async function bindBlockEvents() {
       const catId = Number(btn.dataset.catId);
       const cat = blockCategories.find(c => c.id === catId);
       if (!cat) return;
-      const newItem: BlockItem = { fields: [{ key: '', value: '' }] };
+      const newItem: BlockItem = {
+        fields: cat.templateFields?.length
+          ? cat.templateFields.map((key) => ({ key, value: '' }))
+          : [{ key: '', value: '' }],
+      };
       cat.items.push(newItem);
       renderProfilePage();
       const editCards = document.querySelectorAll<HTMLElement>('.block-item-edit');
@@ -1325,7 +1371,14 @@ function showPreviewModal(file: FileRecord) {
 
 // ===== Settings Page =====
 function renderSettingsPage() {
-  const api = apiConfigData ?? { baseUrl: '', apiKey: '', model: '', providerId: '' };
+  const api = apiConfigData ?? {
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+    providerId: '',
+    apiMode: 'chat_completions' as ApiMode,
+    fastMode: false,
+  };
 
   nextFieldId = 0;
   const fieldRows = textFields.map((f) => createFieldRowHtml(f.key, f.value)).join('');
@@ -1337,11 +1390,12 @@ function renderSettingsPage() {
             <h2>个人信息</h2>
             <div class="profile-data-actions">
               <button class="btn-secondary" id="exportProfileBtn">导出 JSON</button>
-              <button class="btn-secondary" id="importProfileBtn">导入 JSON</button>
+              <button class="btn-secondary" id="importProfileBtn">导入/更新 JSON</button>
+              <button class="btn-secondary" id="appendProfileBtn">新增 JSON</button>
               <button class="btn-secondary" id="templateProfileBtn">下载模板</button>
             </div>
           </div>
-          <p class="settings-section-hint">仅导入导出个人信息字段，不包含 API Key 与材料文件。</p>
+          <p class="settings-section-hint">“导入/更新”会更新同名资料；“新增”只补充缺少字段并追加不重复的多行记录。备份不包含 API Key 和材料文件。</p>
           <ul class="profile-field-list" id="fieldList">${fieldRows}</ul>
           <button class="add-btn" id="addFieldBtn">+ 添加字段</button>
           <input type="file" id="profileImportInput" class="hidden" accept="application/json,.json" />
@@ -1361,6 +1415,14 @@ function renderSettingsPage() {
           <input type="text" id="baseUrl" value="${escapeAttr(api.baseUrl)}" placeholder="https://api.openai.com/v1" />
         </div>
         <div class="form-group">
+          <label for="apiMode">API 协议</label>
+          <select id="apiMode">
+            <option value="chat_completions"${api.apiMode === 'chat_completions' ? ' selected' : ''}>Chat Completions（/chat/completions）</option>
+            <option value="responses"${api.apiMode === 'responses' ? ' selected' : ''}>Responses（/responses）</option>
+          </select>
+          <span class="api-key-hint">Codex 类模型或只支持 Responses 的中转请选择 Responses。</span>
+        </div>
+        <div class="form-group">
           <label for="apiKey">API Key</label>
           <input type="password" id="apiKey" value="${escapeAttr(api.apiKey)}" placeholder="请输入 API Key" />
           <span class="api-key-hint" id="apiKeyHint"></span>
@@ -1372,6 +1434,20 @@ function renderSettingsPage() {
           </select>
           <input type="text" id="modelCustom" class="hidden" placeholder="输入自定义模型名称" />
         </div>
+        <div class="form-group">
+          <label>处理速度</label>
+          <label class="fast-mode-option" for="fastMode">
+            <input type="checkbox" id="fastMode"${api.fastMode ? ' checked' : ''} />
+            <span>开启 Fast 模式</span>
+          </label>
+          <span class="api-key-hint">请求会携带 <code>service_tier: fast</code>。仅在模型和中转支持时开启，可能产生更高费用。</span>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h2>扩展更新</h2>
+        <p class="settings-section-hint">当前版本 ${escapeHtml(chrome.runtime.getManifest().version)}。保持同一个扩展目录和扩展 ID，重新加载不会清空资料、API 配置或材料库。</p>
+        <button class="btn-secondary" id="reloadExtensionBtn">重新加载扩展</button>
       </div>
 
       <div class="settings-actions">
@@ -1393,11 +1469,20 @@ function renderSettingsPage() {
 
   document.getElementById('exportProfileBtn')?.addEventListener('click', exportProfileData);
   document.getElementById('importProfileBtn')?.addEventListener('click', () => {
+    profileImportMode = 'merge';
+    document.getElementById('profileImportInput')?.click();
+  });
+  document.getElementById('appendProfileBtn')?.addEventListener('click', () => {
+    profileImportMode = 'append';
     document.getElementById('profileImportInput')?.click();
   });
   document.getElementById('templateProfileBtn')?.addEventListener('click', downloadProfileTemplate);
   document.getElementById('profileImportInput')?.addEventListener('change', importProfileData);
   document.getElementById('saveBtn')?.addEventListener('click', saveSettings);
+  document.getElementById('reloadExtensionBtn')?.addEventListener('click', () => {
+    showStatus('正在重新加载扩展，资料不会被清空');
+    setTimeout(() => chrome.runtime.reload(), 250);
+  });
 }
 
 function buildProviderOptions(currentProviderId: string): string {
@@ -1544,12 +1629,19 @@ function exportProfileData() {
   const fields = collectProfileFieldsFromForm();
   const date = new Date();
   const stamp = date.toISOString().slice(0, 10).replace(/-/g, '');
-  downloadJson(`auto-filler-profile-${stamp}.json`, stringifyProfileExport(fields, date));
-  showStatus(`已导出 ${fields.length} 个字段`);
+  downloadJson(`baotian-profile-${stamp}.json`, stringifyProfileExport(fields, date, blockCategories));
+  const rowCount = blockCategories.reduce((count, block) => count + block.items.length, 0);
+  showStatus(`已备份 ${fields.length} 个字段和 ${rowCount} 条多行资料`);
 }
 
 function downloadProfileTemplate() {
-  downloadJson('auto-filler-profile-template.json', stringifyProfileExport(PROFILE_TEMPLATE_FIELDS));
+  const templateBlocks = DEFAULT_REPEAT_SECTIONS.map((section) => ({
+    title: section.title,
+    sectionId: section.id,
+    templateFields: section.fieldKeys,
+    items: [],
+  }));
+  downloadJson('baotian-profile-template.json', stringifyProfileExport(PROFILE_TEMPLATE_FIELDS, new Date(), templateBlocks));
   showStatus('已下载模板');
 }
 
@@ -1559,47 +1651,78 @@ async function importProfileData(event: Event) {
   if (!file) return;
 
   try {
-    const importedFields = parseProfileImport(await file.text());
-    if (importedFields.length === 0) {
-      showStatus('未找到可导入字段');
+    const imported = parseProfileImportBundle(await file.text());
+    if (imported.fields.length === 0 && imported.blocks.length === 0) {
+      showStatus('未找到可导入资料');
       return;
     }
 
+    const importedRows = imported.blocks.reduce((count, block) => count + block.items.length, 0);
+
+    const importDescription = profileImportMode === 'append'
+      ? '只新增缺少的普通字段，并向多行资料追加非重复条目；现有内容不会覆盖'
+      : '同名普通字段会更新，重复资料分组会按文件内容替换；其他现有资料会保留';
     const confirmed = window.confirm(
-      `将导入 ${importedFields.length} 个字段：同名字段会覆盖，新字段会追加，现有其他字段会保留。是否继续？`,
+      `将处理 ${imported.fields.length} 个字段和 ${importedRows} 条多行资料：${importDescription}。是否继续？`,
     );
     if (!confirmed) return;
 
-    const mergedFields = mergeProfileFields(collectProfileFieldsFromForm(), importedFields);
+    const mergedFields = profileImportMode === 'append'
+      ? appendProfileFields(collectProfileFieldsFromForm(), imported.fields)
+      : mergeProfileFields(collectProfileFieldsFromForm(), imported.fields);
+    const mergedBlocks = profileImportMode === 'append'
+      ? appendProfileBlocks(blockCategories, imported.blocks)
+      : mergeProfileBlocks(blockCategories, imported.blocks);
     await saveAllTextFields(mergedFields);
+    for (const block of mergedBlocks) {
+      block.id = await saveBlockCategory(block);
+    }
     textFields = mergedFields;
+    blockCategories = mergedBlocks;
     renderSettingsPage();
-    showStatus(`已导入 ${importedFields.length} 个字段`);
+    const statusPrefix = profileImportMode === 'append' ? '新增导入完成' : '导入更新完成';
+    showStatus(`${statusPrefix}：已处理 ${imported.fields.length} 个字段和 ${importedRows} 条多行资料`);
   } catch (err) {
     showStatus(err instanceof Error ? err.message : '导入失败');
   } finally {
     input.value = '';
+    profileImportMode = 'merge';
   }
 }
 
 async function saveSettings() {
   const fields = collectProfileFieldsFromForm();
+  const baseUrl = (document.getElementById('baseUrl') as HTMLInputElement).value.trim();
+  const apiKey = (document.getElementById('apiKey') as HTMLInputElement).value.trim();
+  const model = getModelValue();
+  const providerId = (document.getElementById('providerSelect') as HTMLSelectElement).value;
+  const apiMode = (document.getElementById('apiMode') as HTMLSelectElement).value as ApiMode;
+  const fastMode = (document.getElementById('fastMode') as HTMLInputElement).checked;
+
+  if (apiKey && (!baseUrl || !model)) {
+    showStatus('请完整填写 Base URL 和模型名称');
+    return;
+  }
 
   await saveAllTextFields(fields);
   textFields = fields;
 
   await setApiConfig({
-    baseUrl: (document.getElementById('baseUrl') as HTMLInputElement).value.trim(),
-    apiKey: (document.getElementById('apiKey') as HTMLInputElement).value.trim(),
-    model: getModelValue(),
-    providerId: (document.getElementById('providerSelect') as HTMLSelectElement).value,
+    baseUrl,
+    apiKey,
+    model,
+    providerId,
+    apiMode,
+    fastMode,
   });
 
   apiConfigData = {
-    baseUrl: (document.getElementById('baseUrl') as HTMLInputElement).value.trim(),
-    apiKey: (document.getElementById('apiKey') as HTMLInputElement).value.trim(),
-    model: getModelValue(),
-    providerId: (document.getElementById('providerSelect') as HTMLSelectElement).value,
+    baseUrl,
+    apiKey,
+    model,
+    providerId,
+    apiMode,
+    fastMode,
   };
 
   showStatus('已保存');
@@ -1644,7 +1767,7 @@ async function init() {
   const [rawFields, apiConfig, blocks, cats, files] = await Promise.all([
     getAllTextFields(),
     getApiConfig(),
-    getAllBlockCategories(),
+    ensureProfileBlocksSeeded(),
     getAllCategories(),
     getAllFileRecords(),
   ]);

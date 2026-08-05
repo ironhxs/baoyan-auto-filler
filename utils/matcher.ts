@@ -1,4 +1,4 @@
-import type { ApiConfig } from './storage';
+import type { ApiConfig, ApiMode } from './storage';
 
 export interface FormFieldInfo {
   kind?: 'text' | 'file';
@@ -21,6 +21,14 @@ export interface FormFieldInfo {
   renderHeight?: number;
   context: string;
   html?: string;
+  required?: boolean;
+  groupLabel?: string;
+  columnLabel?: string;
+  rowIndex?: number;
+  repeatGroup?: string;
+  selectionMode?: 'dialog';
+  protected?: boolean;
+  protectionReason?: string;
 }
 
 export type MaterialRole = 'id_photo' | 'id_card_front' | 'id_card_back';
@@ -58,7 +66,10 @@ function buildPrompt(fields: FormFieldInfo[], textFields: { key: string; value: 
       const currentValue = f.value ? `, currentValue="${f.value}"` : '';
       const fillMode = f.fillMode ?? 'short';
       const size = f.renderWidth && f.renderHeight ? `, renderedSize=${f.renderWidth}x${f.renderHeight}` : '';
-      return `  [${f.index}] tag=${f.tag}, type=${f.type}, fillMode=${fillMode}${size}, label="${label}", hint="${hint}", context="${context}", html="${html}"${options}${currentValue}${technical ? `, ${technical}` : ''}`;
+      const repeat = f.groupLabel || f.columnLabel || f.rowIndex != null
+        ? `, group="${f.groupLabel ?? ''}", row=${f.rowIndex != null ? f.rowIndex + 1 : ''}, column="${f.columnLabel ?? ''}"`
+        : '';
+      return `  [${f.index}] tag=${f.tag}, type=${f.type}, fillMode=${fillMode}${size}, label="${label}", hint="${hint}", context="${context}", html="${html}"${repeat}${options}${currentValue}${technical ? `, ${technical}` : ''}`;
     })
     .join('\n');
 
@@ -121,6 +132,126 @@ function fallbackShortLabel(field: FormFieldInfo | undefined, fieldKey: string, 
   return compact.slice(0, 12) || `字段${index}`;
 }
 
+function getApiMode(apiConfig: ApiConfig): ApiMode {
+  return apiConfig.apiMode === 'responses' ? 'responses' : 'chat_completions';
+}
+
+export function getRequestUrl(apiConfig: ApiConfig): string {
+  const baseUrl = apiConfig.baseUrl.replace(/\/+$/, '');
+  return `${baseUrl}/${getApiMode(apiConfig) === 'responses' ? 'responses' : 'chat/completions'}`;
+}
+
+export function getRequestBody(apiConfig: ApiConfig, prompt: string, stream: boolean): Record<string, unknown> {
+  const common = {
+    model: apiConfig.model,
+    stream,
+    ...(apiConfig.fastMode ? { service_tier: 'fast' } : {}),
+  };
+
+  if (getApiMode(apiConfig) === 'responses') {
+    return {
+      ...common,
+      input: prompt,
+      store: false,
+    };
+  }
+
+  return {
+    ...common,
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0,
+  };
+}
+
+export function extractResponseText(data: unknown, apiMode: ApiMode): string {
+  if (!data || typeof data !== 'object') return '';
+  const record = data as Record<string, unknown>;
+
+  if (apiMode === 'chat_completions') {
+    const choices = record.choices;
+    if (!Array.isArray(choices)) return '';
+    const first = choices[0] as Record<string, unknown> | undefined;
+    const message = first?.message as Record<string, unknown> | undefined;
+    return typeof message?.content === 'string' ? message.content : '';
+  }
+
+  if (typeof record.output_text === 'string') return record.output_text;
+  if (!Array.isArray(record.output)) return '';
+
+  return record.output.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const content = (item as Record<string, unknown>).content;
+    if (!Array.isArray(content)) return [];
+    return content.flatMap((part) => {
+      if (!part || typeof part !== 'object') return [];
+      const text = (part as Record<string, unknown>).text;
+      return typeof text === 'string' ? [text] : [];
+    });
+  }).join('');
+}
+
+export function extractStreamText(data: unknown, apiMode: ApiMode): string {
+  if (!data || typeof data !== 'object') return '';
+  const record = data as Record<string, unknown>;
+
+  if (apiMode === 'responses' && record.type === 'response.output_text.delta') {
+    return typeof record.delta === 'string' ? record.delta : '';
+  }
+
+  const choices = record.choices;
+  if (!Array.isArray(choices)) return '';
+  const first = choices[0] as Record<string, unknown> | undefined;
+  const delta = first?.delta as Record<string, unknown> | undefined;
+  return typeof delta?.content === 'string' ? delta.content : '';
+}
+
+export function extractStreamError(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const record = data as Record<string, unknown>;
+  if (record.type !== 'error' && record.type !== 'response.failed') return '';
+
+  const error = record.error && typeof record.error === 'object'
+    ? record.error as Record<string, unknown>
+    : undefined;
+  const response = record.response && typeof record.response === 'object'
+    ? record.response as Record<string, unknown>
+    : undefined;
+  const responseError = response?.error && typeof response.error === 'object'
+    ? response.error as Record<string, unknown>
+    : undefined;
+
+  return String(error?.message ?? responseError?.message ?? '模型流式响应失败');
+}
+
+async function throwApiError(response: Response): Promise<never> {
+  const raw = await response.text();
+  const contentType = response.headers.get('content-type') ?? '';
+  const isHtml = contentType.includes('text/html') || /^\s*<!doctype html/i.test(raw);
+  const detail = isHtml
+    ? '上游网关返回了 HTML 错误页，请检查中转线路或稍后重试'
+    : raw.slice(0, 1200);
+  throw new Error(`LLM API error ${response.status}: ${detail}`);
+}
+
+export async function requestModelText(apiConfig: ApiConfig, prompt: string): Promise<string> {
+  if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
+  const apiMode = getApiMode(apiConfig);
+  const response = await fetch(getRequestUrl(apiConfig), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiConfig.apiKey}`,
+    },
+    body: JSON.stringify(getRequestBody(apiConfig, prompt, false)),
+  });
+  if (!response.ok) await throwApiError(response);
+
+  const data = await response.json();
+  const content = extractResponseText(data, apiMode);
+  if (!content) throw new Error('模型返回了空内容');
+  return content;
+}
+
 export async function matchFields(
   fields: FormFieldInfo[],
   apiConfig: ApiConfig,
@@ -130,42 +261,22 @@ export async function matchFields(
 
   const textLikeFields = fields.filter((field) => field.kind !== 'file');
   if (textLikeFields.length === 0) return [];
+  if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
 
   const prompt = buildPrompt(textLikeFields, textFields);
-  const baseUrl = apiConfig.baseUrl.replace(/\/+$/, '');
-  const url = `${baseUrl}/chat/completions`;
+  const url = getRequestUrl(apiConfig);
 
   console.group('%c🔍 LLM 匹配请求', 'color:#1E88E5;font-weight:bold');
   console.log('%cAPI:', 'color:#888', url);
-  console.log('%cModel:', 'color:#888', apiConfig.model || 'gpt-4o-mini');
+  console.log('%cModel:', 'color:#888', apiConfig.model);
+  console.log('%cAPI mode:', 'color:#888', getApiMode(apiConfig));
   console.log('%cPrompt:\n' + prompt, 'color:#333');
   console.groupEnd();
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiConfig.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: apiConfig.model || 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0,
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`LLM API error ${response.status}: ${text}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error('Empty response from LLM');
+  const content = await requestModelText(apiConfig, prompt);
 
   console.group('%c✅ LLM 匹配响应', 'color:#4caf50;font-weight:bold');
   console.log('%cRaw:', 'color:#888', content);
-  console.log('%cTokens usage:', 'color:#888', JSON.stringify(data.usage));
   console.groupEnd();
 
   const jsonMatch = content.match(/\[[\s\S]*\]/);
@@ -465,14 +576,16 @@ export async function* matchFieldsStream(
 
   const textLikeFields = fields.filter((f) => f.kind !== 'file');
   if (textLikeFields.length === 0) return;
+  if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
 
   const prompt = buildPrompt(textLikeFields, textFields);
-  const baseUrl = apiConfig.baseUrl.replace(/\/+$/, '');
-  const url = `${baseUrl}/chat/completions`;
+  const apiMode = getApiMode(apiConfig);
+  const url = getRequestUrl(apiConfig);
 
   console.group('%c🔍 LLM 流式匹配请求', 'color:#1E88E5;font-weight:bold');
   console.log('%cAPI:', 'color:#888', url);
-  console.log('%cModel:', 'color:#888', apiConfig.model || 'gpt-4o-mini');
+  console.log('%cModel:', 'color:#888', apiConfig.model);
+  console.log('%cAPI mode:', 'color:#888', apiMode);
   console.groupEnd();
 
   const response = await fetch(url, {
@@ -481,17 +594,11 @@ export async function* matchFieldsStream(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiConfig.apiKey}`,
     },
-    body: JSON.stringify({
-      model: apiConfig.model || 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0,
-      stream: true,
-    }),
+    body: JSON.stringify(getRequestBody(apiConfig, prompt, true)),
   });
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`LLM API error ${response.status}: ${text}`);
+    await throwApiError(response);
   }
 
   const reader = response.body?.getReader();
@@ -513,20 +620,25 @@ export async function* matchFieldsStream(
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed.startsWith('data: ')) continue;
-        const payload = trimmed.slice(6);
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trimStart();
         if (payload === '[DONE]') { done = true; break; }
 
+        let parsed: unknown;
         try {
-          const parsed = JSON.parse(payload);
-          const content = parsed.choices?.[0]?.delta?.content;
-          if (content) {
-            for (const event of parser.feed(content)) {
-              yield event;
-            }
-          }
+          parsed = JSON.parse(payload);
         } catch {
-          // skip malformed SSE payloads
+          continue;
+        }
+
+        const streamError = extractStreamError(parsed);
+        if (streamError) throw new Error(`LLM stream error: ${streamError}`);
+
+        const content = extractStreamText(parsed, apiMode);
+        if (content) {
+          for (const event of parser.feed(content)) {
+            yield event;
+          }
         }
       }
     }

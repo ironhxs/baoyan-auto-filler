@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-秒填鸭 is a Chrome extension that uses LLM-powered semantic matching to automatically fill web forms with user-stored personal information. Data stays local (IndexedDB + chrome.storage). Works with any OpenAI-compatible API.
+保填 is a Chrome extension that fills graduate-application forms from seven locally stored profile groups. Deterministic local matching handles common fields; an OpenAI-compatible LLM is an optional fallback. It supports repeatable rows and guarded background multi-step filling.
 
 ## Commands
 
@@ -14,9 +14,12 @@ npm run dev:firefox      # Firefox dev mode
 npm run build            # Production build
 npm run zip              # Package as .zip for Chrome Web Store
 npm run compile          # Type-check only (tsc --noEmit)
+npm run test:profile     # Profile backup/restore tests
+npm run test:local-matcher # Local matching tests
+npm run test:llm-api     # Chat Completions / Responses protocol tests
 ```
 
-No test framework is configured. No linter is configured.
+Tests are lightweight Node/tsx scripts. No linter is configured.
 
 ## Architecture
 
@@ -36,13 +39,16 @@ Built with **WXT** (browser extension framework on top of Vite). Convention over
 1. User enters personal info (key-value pairs) in Options page → `utils/db.ts` (IndexedDB)
 2. User configures API endpoint/key/model → `utils/storage.ts` (chrome.storage.local)
 3. Popup "scan" → background messages content script → content extracts form fields with labels/placeholders/names
-4. Background sends fields + user data to LLM via `utils/matcher.ts` (OpenAI-compatible `/chat/completions`)
-5. LLM returns semantic matches as JSON → Popup displays for user confirmation → content script fills values
+4. `utils/local-matcher.ts` matches common and repeatable fields locally
+5. Remaining eligible fields may be sent to `utils/matcher.ts` when AI is configured
+6. Popup displays matches for review, or background auto-run fills each safe page and stops at final review
 
 ### Key Modules
 
 - `utils/db.ts` — IndexedDB wrapper (`textFields` store for personal info, `fileRecords` store for uploaded files)
-- `utils/storage.ts` — `chrome.storage.local` wrapper for `ApiConfig { baseUrl, apiKey, model }`
+- `utils/storage.ts` — `chrome.storage.local` wrapper for `ApiConfig { baseUrl, apiKey, model, apiMode, fastMode }`
+- `utils/profile-schema.ts` — seven profile groups and inferred language rows
+- `utils/local-matcher.ts` — deterministic field and table-column matching
 - `utils/matcher.ts` — Builds prompt with field clues (label, placeholder, aria-label, name, id) and user data, parses LLM JSON response into `MatchResult[]`
 
 ### Message Protocol
@@ -50,6 +56,7 @@ Built with **WXT** (browser extension framework on top of Vite). Convention over
 Components communicate via `chrome.runtime.sendMessage`:
 - `startScan` (popup → background → content): scans page fields, returns matches
 - `startFill` (popup → background → content): fills selected fields
+- `startAutoRun` / `getAutoRunStatus` / `stopAutoRun`: guarded cross-page background workflow
 - `scan` / `fill` (background → content): direct content script commands
 
 ### UI

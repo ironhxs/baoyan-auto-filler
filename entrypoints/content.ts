@@ -18,6 +18,14 @@ interface FormField {
   renderHeight: number;
   context: string;
   html: string;
+  required: boolean;
+  groupLabel: string;
+  columnLabel: string;
+  rowIndex?: number;
+  repeatGroup: string;
+  selectionMode?: 'dialog';
+  protected: boolean;
+  protectionReason: string;
 }
 
 interface FieldResult {
@@ -29,6 +37,7 @@ interface TextFillItem {
   kind?: 'text';
   index: number;
   value: string;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 interface FileFillItem {
@@ -49,13 +58,18 @@ interface FillResult {
 interface ScanMessage { type: 'scan' }
 interface FillMessage { type: 'fill'; items: FillItem[] }
 interface FillStreamInitMessage { type: 'fillStreamInit'; items: Array<{ index: number; fillMode: 'short' | 'long' }> }
-interface FillFieldMessage { type: 'fillField'; index: number; value: string }
+interface FillFieldMessage { type: 'fillField'; index: number; value: string; confidence?: 'high' | 'medium' | 'low' }
 interface FillTypeChunkMessage { type: 'fillTypeChunk'; index: number; chunk: string }
 interface FillTypeCommitMessage { type: 'fillTypeCommit'; index: number }
 interface FillStreamCompleteMessage { type: 'fillStreamComplete' }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage;
+interface ManualFillMessage { type: 'manualFill'; value: string }
+interface PrepareRepeatRowsMessage { type: 'prepareRepeatRows'; targets: Array<{ groupLabel: string; count: number }> }
+interface AdvanceToNextStepMessage { type: 'advanceToNextStep' }
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage;
 
 let elementMap = new Map<number, HTMLElement>();
+let protectedIndices = new Set<number>();
+let lastFocusedElement: HTMLElement | null = null;
 
 function findLabel(el: HTMLElement): string {
   if (el.id) {
@@ -117,10 +131,37 @@ function isVisible(el: HTMLElement): boolean {
   return el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0;
 }
 
+function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
+  let container: HTMLElement | null = el.parentElement;
+  for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
+    const controls = Array.from(container.querySelectorAll<HTMLElement>(
+      'button,input[type="button"],a,[role="button"]',
+    ));
+    const trigger = controls.find((candidate) => {
+      if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+      const text = normalizeText((candidate as HTMLInputElement).value || candidate.textContent || '');
+      return /^(选择|请选择|选取)$/.test(text);
+    });
+    if (trigger) return trigger;
+    if (container.matches('tr,.form-group,.form-item,.form-row,.ant-form-item,.el-form-item')) break;
+  }
+  return null;
+}
+
+function isSupportedDialogSelection(el: HTMLElement): boolean {
+  if (!(el instanceof HTMLInputElement)) return false;
+  const text = joinUnique([findLabel(el), el.name, el.id, el.placeholder]);
+  return /学校|院校|专业/.test(text) && Boolean(findSelectionTrigger(el));
+}
+
 function isFillable(el: HTMLElement): boolean {
   if (!el.matches(SCANNABLE_SELECTOR)) return false;
   if ((el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled) return false;
-  if (!(el instanceof HTMLInputElement && el.type === 'file') && (el as HTMLInputElement | HTMLTextAreaElement).readOnly) return false;
+  if (
+    !(el instanceof HTMLInputElement && el.type === 'file') &&
+    (el as HTMLInputElement | HTMLTextAreaElement).readOnly &&
+    !isSupportedDialogSelection(el)
+  ) return false;
   return isVisible(el);
 }
 
@@ -160,6 +201,9 @@ function getOptions(el: HTMLElement): string[] {
 function getCurrentValue(el: HTMLElement): string {
   if (el instanceof HTMLInputElement && el.type === 'file') {
     return Array.from(el.files ?? []).map((file) => file.name).join(', ');
+  }
+  if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
+    return el.checked ? (el.value || 'true') : '';
   }
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.value;
   if (el instanceof HTMLSelectElement) {
@@ -241,6 +285,225 @@ function joinUnique(parts: Array<string | undefined>): string {
   return result.join(' | ');
 }
 
+interface RepeatFieldMeta {
+  groupLabel: string;
+  columnLabel: string;
+  rowIndex?: number;
+  repeatGroup: string;
+}
+
+function detectProfileGroup(text: string): string {
+  const normalized = normalizeText(text);
+  const aliases: Array<[string, RegExp]> = [
+    ['家庭成员', /家庭|社会关系|父亲|母亲|家长/],
+    ['学习和工作经历', /学习.{0,3}工作经历|教育经历|工作经历|学习经历/],
+    ['学术成果', /学术成果|科研成果|论文|专利|著作|竞赛成果/],
+    ['奖励情况', /奖励|获奖|荣誉|奖惩/],
+    ['外语水平', /外语|英语|四六级|雅思|托福/],
+    ['学习信息', /学习信息|学籍|教育信息|本科信息|成绩信息/],
+    ['基本信息', /基本信息|个人信息/],
+  ];
+  return aliases.find(([, pattern]) => pattern.test(normalized))?.[0] ?? '';
+}
+
+function findGroupText(el: HTMLElement, table: HTMLTableElement | null): string {
+  const parts: string[] = [];
+  if (table) {
+    parts.push(textWithoutControls(table));
+    const caption = table.querySelector('caption');
+    if (caption) parts.push(normalizeText(caption.textContent ?? ''));
+  }
+
+  let node: HTMLElement | null = table ?? el;
+  for (let depth = 0; node && node !== document.body && depth < 5; depth++, node = node.parentElement) {
+    const heading = node.querySelector<HTMLElement>('h1,h2,h3,h4,legend,.title,.form-title,.panel-title');
+    if (heading) parts.push(normalizeText(heading.textContent ?? ''));
+    let previous = node.previousElementSibling as HTMLElement | null;
+    for (let i = 0; previous && i < 2; i++, previous = previous.previousElementSibling as HTMLElement | null) {
+      parts.push(textWithoutControls(previous));
+    }
+  }
+
+  return joinUnique(parts);
+}
+
+function findNearestHeadingText(el: HTMLElement): string {
+  const headings = Array.from(document.querySelectorAll<HTMLElement>(
+    'h1,h2,h3,h4,legend,.title,.form-title,.panel-title',
+  ));
+  const preceding = headings.filter((heading) => (
+    heading === el || Boolean(heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)
+  ));
+  return normalizeText(preceding.at(-1)?.textContent ?? '');
+}
+
+function getTableColumnLabel(el: HTMLElement, table: HTMLTableElement, row: HTMLTableRowElement): string {
+  const rowInputs = Array.from(row.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR)).filter(isFillable);
+  const inputIndex = rowInputs.indexOf(el);
+  const precedingRows = Array.from(table.querySelectorAll<HTMLTableRowElement>('tr'))
+    .filter((candidate) => candidate !== row && (candidate.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING))
+    .filter((candidate) => countEditables(candidate) === 0);
+  const headerRow = precedingRows.reverse().find((candidate) => {
+    const labels = Array.from(candidate.cells).map((cell) => textWithoutControls(cell)).filter(Boolean);
+    return labels.length >= Math.max(2, rowInputs.length);
+  });
+
+  if (!headerRow) return '';
+  const headerCells = Array.from(headerRow.cells).filter((cell) => textWithoutControls(cell));
+  if (inputIndex >= 0 && headerCells[inputIndex]) return textWithoutControls(headerCells[inputIndex]);
+
+  const centerX = el.getBoundingClientRect().left + el.getBoundingClientRect().width / 2;
+  const closest = headerCells
+    .map((cell) => {
+      const rect = cell.getBoundingClientRect();
+      return { cell, distance: Math.abs(centerX - (rect.left + rect.width / 2)) };
+    })
+    .sort((a, b) => a.distance - b.distance)[0]?.cell;
+  return closest ? textWithoutControls(closest) : '';
+}
+
+function getRepeatFieldMeta(el: HTMLElement): RepeatFieldMeta {
+  const row = el.closest<HTMLTableRowElement>('tr');
+  const table = el.closest<HTMLTableElement>('table');
+  const groupText = table ? findGroupText(el, table) : findNearestHeadingText(el);
+  const groupLabel = detectProfileGroup(groupText);
+  const repeatProfileGroups = new Set(['家庭成员', '外语水平', '学习和工作经历', '学术成果', '奖励情况']);
+
+  if (!row || !table || !repeatProfileGroups.has(groupLabel)) {
+    return {
+      groupLabel,
+      columnLabel: '',
+      repeatGroup: groupLabel,
+    };
+  }
+
+  const dataRows = Array.from(table.querySelectorAll<HTMLTableRowElement>('tr'))
+    .filter((candidate) => countEditables(candidate) >= 2);
+  const rowIndex = dataRows.indexOf(row);
+  const columnLabel = getTableColumnLabel(el, table, row);
+
+  return {
+    groupLabel,
+    columnLabel,
+    rowIndex: rowIndex >= 0 ? rowIndex : undefined,
+    repeatGroup: groupLabel || normalizeText(table.getAttribute('id') ?? table.getAttribute('class') ?? ''),
+  };
+}
+
+function repeatDataRows(table: HTMLTableElement): HTMLTableRowElement[] {
+  return Array.from(table.querySelectorAll<HTMLTableRowElement>('tr'))
+    .filter((candidate) => countEditables(candidate) >= 2);
+}
+
+function findRepeatTable(groupLabel: string): HTMLTableElement | undefined {
+  return Array.from(document.querySelectorAll<HTMLTableElement>('table')).find((table) => (
+    detectProfileGroup(findGroupText(table, table)) === groupLabel
+  ));
+}
+
+function findAddRowControl(table: HTMLTableElement): HTMLElement | undefined {
+  let container: HTMLElement | null = table.parentElement;
+  for (let depth = 0; container && container !== document.body && depth < 5; depth++, container = container.parentElement) {
+    const control = Array.from(container.querySelectorAll<HTMLElement>('button,a,[role="button"]')).find((candidate) => {
+      if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+      const text = normalizeText(candidate.textContent ?? '').replace(/\s+/g, '');
+      return /^(新增|添加)(一行|行|一条|成员|经历|记录)$/.test(text);
+    });
+    if (control) return control;
+  }
+  return undefined;
+}
+
+async function waitForRowIncrease(table: HTMLTableElement, previousCount: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (repeatDataRows(table).length > previousCount) return true;
+  }
+  return false;
+}
+
+async function prepareRepeatRows(targets: Array<{ groupLabel: string; count: number }>): Promise<number> {
+  let added = 0;
+  for (const target of targets) {
+    const table = findRepeatTable(target.groupLabel);
+    if (!table) continue;
+    const safeTarget = Math.min(Math.max(Math.floor(target.count), 0), 10);
+    while (repeatDataRows(table).length < safeTarget) {
+      const previousCount = repeatDataRows(table).length;
+      const control = findAddRowControl(table);
+      if (!control) break;
+      control.click();
+      if (!await waitForRowIncrease(table, previousCount)) break;
+      added++;
+    }
+  }
+  return added;
+}
+
+function nextPageSignature(): string {
+  const headings = Array.from(document.querySelectorAll<HTMLElement>('h1,h2,h3,legend,.title,.form-title,.panel-title'))
+    .filter(isVisible)
+    .map((heading) => normalizeText(heading.textContent ?? ''))
+    .join('|');
+  const controls = Array.from(document.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR))
+    .filter(isFillable)
+    .map((control) => `${control.tagName}:${control.getAttribute('name') ?? ''}:${control.getAttribute('id') ?? ''}`)
+    .join('|');
+  return `${location.href}::${headings}::${controls}`;
+}
+
+function findSafeNextControl(): HTMLElement | null {
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+    'button,input[type="button"],input[type="submit"],a,[role="button"]',
+  ));
+  return candidates.find((candidate) => {
+    if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+    const text = normalizeText((candidate as HTMLInputElement).value || candidate.textContent || '').replace(/\s+/g, '');
+    if (/提交|确认提交|完成申请|支付|缴费|删除/.test(text)) return false;
+    return /^(下一步|保存并下一步|保存后下一步|保存并继续|继续下一步)$/.test(text);
+  }) ?? null;
+}
+
+async function advanceToNextStep(): Promise<{ clicked: boolean; advanced: boolean; reason: string }> {
+  const control = findSafeNextControl();
+  if (!control) return { clicked: false, advanced: false, reason: '已到最终审核页或未找到安全的下一步按钮' };
+  const before = nextPageSignature();
+  control.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  control.click();
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (nextPageSignature() !== before) {
+      return { clicked: true, advanced: true, reason: '已进入下一页' };
+    }
+  }
+  return { clicked: true, advanced: false, reason: '页面没有切换，可能仍有校验项需要本人处理' };
+}
+
+function getProtection(el: HTMLElement, fieldText: string, isFile: boolean): { protected: boolean; reason: string } {
+  if (isFile) return { protected: true, reason: '文件上传需本人确认' };
+  if (/验证码|短信码|图形码|动态码/.test(fieldText)) return { protected: true, reason: '验证码不自动填写' };
+  if (/承诺书|诚信承诺|同意条款|本人承诺/.test(fieldText)) return { protected: true, reason: '承诺与协议需本人操作' };
+  if (/支付|缴费|付款/.test(fieldText)) return { protected: true, reason: '支付操作不自动处理' };
+  if (/志愿|导师|调剂/.test(fieldText)) return { protected: true, reason: '志愿和导师选择需本人决定' };
+
+  const isCustomCombo = el.getAttribute('role') === 'combobox' && !(el instanceof HTMLSelectElement);
+  if (isCustomCombo && /地区|学校|专业/.test(fieldText) && !isSupportedDialogSelection(el)) {
+    return { protected: true, reason: '弹窗选择需本人确认' };
+  }
+  return { protected: false, reason: '' };
+}
+
+function getPairedSelectorLabel(el: HTMLElement): string {
+  if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return '';
+  const container = el.closest<HTMLElement>('tr,.form-row,.form-group,.form-item,.ant-form-item,.el-form-item');
+  if (!container) return '';
+  const textInputs = Array.from(container.querySelectorAll<HTMLInputElement>('input:not([type="hidden"]):not([type="button"])'));
+  const selects = Array.from(container.querySelectorAll<HTMLSelectElement>('select'));
+  if (textInputs.length !== 1 || selects.length !== 1) return '';
+  return normalizeText(selects[0].selectedOptions[0]?.textContent ?? selects[0].value);
+}
+
 function getSemanticContainer(el: HTMLElement): HTMLElement {
   const row = el.closest<HTMLElement>('tr');
   if (row) return row;
@@ -301,7 +564,16 @@ function extractField(el: HTMLElement): FormField {
   const isFile = el instanceof HTMLInputElement && el.type === 'file';
   const renderedSize = getRenderedSize(el);
   const context = findContext(el);
-  const label = findLabel(el);
+  const repeatMeta = getRepeatFieldMeta(el);
+  const label = repeatMeta.columnLabel || getPairedSelectorLabel(el) || findLabel(el);
+  const hint = findHint(el, label, context);
+  const fieldText = joinUnique([repeatMeta.groupLabel, repeatMeta.columnLabel, label, hint, context]);
+  const protection = getProtection(el, fieldText, isFile);
+  const required = Boolean(
+    (el as HTMLInputElement).required ||
+    el.getAttribute('aria-required') === 'true' ||
+    /必填|不能为空|\*/.test(fieldText)
+  );
   return {
     kind: isFile ? 'file' : 'text',
     tag,
@@ -309,7 +581,7 @@ function extractField(el: HTMLElement): FormField {
     name: el.getAttribute('name') ?? '',
     id: el.getAttribute('id') ?? '',
     label,
-    hint: findHint(el, label, context),
+    hint,
     placeholder: el.getAttribute('placeholder') ?? '',
     ariaLabel: el.getAttribute('aria-label') ?? '',
     title: el.getAttribute('title') ?? '',
@@ -322,11 +594,17 @@ function extractField(el: HTMLElement): FormField {
     renderHeight: renderedSize.height,
     context,
     html: sanitizeHtml(getSemanticContainer(el)),
+    required,
+    ...repeatMeta,
+    selectionMode: isSupportedDialogSelection(el) ? 'dialog' : undefined,
+    protected: protection.protected,
+    protectionReason: protection.reason,
   };
 }
 
 function scanFields(): FieldResult[] {
   elementMap.clear();
+  protectedIndices.clear();
 
   const elements = document.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR);
   const results: FieldResult[] = [];
@@ -335,8 +613,10 @@ function scanFields(): FieldResult[] {
   elements.forEach((el) => {
     if (!isFillable(el)) return;
 
+    const field = extractField(el);
     elementMap.set(index, el);
-    results.push({ index, field: extractField(el) });
+    if (field.protected) protectedIndices.add(index);
+    results.push({ index, field });
     index++;
   });
 
@@ -369,11 +649,126 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
-function fillOneField(index: number, value: string): boolean {
-  const el = elementMap.get(index);
-  if (!el) return false;
+function ensureMarkerStyles(): void {
+  if (document.getElementById('auto-filler-marker-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'auto-filler-marker-styles';
+  style.textContent = `
+    [data-auto-filler-status="verified"] { outline: 2px solid #22c55e !important; outline-offset: 2px !important; }
+    [data-auto-filler-status="review"] { outline: 2px solid #f59e0b !important; outline-offset: 2px !important; }
+    [data-auto-filler-status="mismatch"] { outline: 2px solid #ef4444 !important; outline-offset: 2px !important; }
+  `;
+  document.documentElement.appendChild(style);
+}
 
-  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+function markField(el: HTMLElement, status: 'verified' | 'review' | 'mismatch'): void {
+  ensureMarkerStyles();
+  el.dataset.autoFillerStatus = status;
+  el.title = [el.title, status === 'verified'
+    ? '保填：已填写并回读一致'
+    : status === 'review'
+      ? '保填：已填写，建议确认'
+      : '保填：页面回读不一致，请手动检查'].filter(Boolean).join(' | ');
+}
+
+function valueMatches(el: HTMLElement, expected: string): boolean {
+  if (el instanceof HTMLInputElement && el.type === 'radio') {
+    return el.checked && normalizeText(el.value).toLowerCase() === normalizeText(expected).toLowerCase();
+  }
+  if (el instanceof HTMLInputElement && el.type === 'checkbox') {
+    const shouldBeChecked = expected === 'true' || expected === '1' || expected === el.value;
+    return el.checked === shouldBeChecked;
+  }
+  const actual = getCurrentValue(el);
+  const normalizedExpected = normalizeText(expected).toLowerCase();
+  const normalizedActual = normalizeText(actual).toLowerCase();
+  if (el instanceof HTMLSelectElement) {
+    return normalizedActual === normalizedExpected || normalizeText(el.value).toLowerCase() === normalizedExpected;
+  }
+  return normalizedActual === normalizedExpected;
+}
+
+function getVisibleDialogRoots(): HTMLElement[] {
+  const roots = Array.from(document.querySelectorAll<HTMLElement>(
+    '[role="dialog"],.modal,.dialog,.popup,.layui-layer,.ui-dialog,.el-dialog,.ant-modal,.window',
+  )).filter(isVisible);
+  return roots.length ? roots : [document.body];
+}
+
+function normalizeSelectionText(text: string): string {
+  return normalizeText(text).trim();
+}
+
+async function waitForDialogChoice(value: string, timeoutMs = 2500): Promise<HTMLElement | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const candidates = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>(
+      '[role="option"],li,td,a,button,.option,.item,.tree-node,.el-tree-node__label,.ant-select-item-option-content',
+    ))).filter((candidate) => isVisible(candidate) && candidate.childElementCount <= 3);
+    const exact = candidates.find((candidate) => normalizeSelectionText(candidate.textContent ?? '') === normalizeSelectionText(value));
+    if (exact) return exact;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  return null;
+}
+
+async function fillDialogSelection(
+  el: HTMLElement,
+  value: string,
+  confidence: 'high' | 'medium' | 'low',
+): Promise<boolean> {
+  const trigger = findSelectionTrigger(el);
+  if (!trigger) return false;
+  trigger.click();
+  let choice = await waitForDialogChoice(value, 1200);
+
+  if (!choice) {
+    const search = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLInputElement>(
+      'input[type="text"],input:not([type])',
+    ))).find((input) => input !== el && isVisible(input) && !input.readOnly && !input.disabled);
+    if (search) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(search, value); else search.value = value;
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+      search.dispatchEvent(new Event('change', { bubbles: true }));
+      choice = await waitForDialogChoice(value, 1800);
+    }
+  }
+
+  if (!choice) {
+    markField(el, 'review');
+    return false;
+  }
+  choice.click();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  if (!valueMatches(el, value)) {
+    const confirm = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>('button,a,[role="button"]')))
+      .find((candidate) => isVisible(candidate) && /^(确定|确认|保存)$/.test(normalizeText(candidate.textContent ?? '')));
+    confirm?.click();
+    await new Promise((resolve) => setTimeout(resolve, 180));
+  }
+
+  const verified = valueMatches(el, value);
+  markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+  return verified;
+}
+
+async function fillElementAsync(
+  el: HTMLElement,
+  value: string,
+  confidence: 'high' | 'medium' | 'low' = 'medium',
+): Promise<boolean> {
+  if (isSupportedDialogSelection(el)) return fillDialogSelection(el, value, confidence);
+  return fillElement(el, value, confidence);
+}
+
+function fillElement(el: HTMLElement, value: string, confidence: 'high' | 'medium' | 'low' = 'medium'): boolean {
+  const field = extractField(el);
+  if (field.protected) {
+    markField(el, 'mismatch');
+    return false;
+  }
 
   try {
     const tag = el.tagName.toLowerCase();
@@ -381,52 +776,56 @@ function fillOneField(index: number, value: string): boolean {
 
     if (type === 'radio') {
       const input = el as HTMLInputElement;
-      if (input.value === value) {
-        input.checked = true;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      return true;
-    }
-    if (type === 'checkbox') {
+      if (input.value !== value) return false;
+      input.checked = true;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (type === 'checkbox') {
       const input = el as HTMLInputElement;
       input.checked = value === 'true' || value === '1' || value === input.value;
       input.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    if (tag === 'select') {
+    } else if (tag === 'select') {
       const select = el as HTMLSelectElement;
       const option = Array.from(select.options).find(
         (opt) => opt.value === value || opt.textContent?.trim() === value,
       );
       select.value = option ? option.value : value;
+      select.dispatchEvent(new Event('input', { bubbles: true }));
       select.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    if (tag === 'textarea' || tag === 'input') {
+    } else if (tag === 'textarea' || tag === 'input') {
       const target = el as HTMLInputElement | HTMLTextAreaElement;
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      if (nativeSetter && tag === 'input') {
-        nativeSetter.call(target, value);
-      } else {
-        target.value = value;
-      }
+      const prototype = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const nativeSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      if (nativeSetter) nativeSetter.call(target, value);
+      else target.value = value;
       target.dispatchEvent(new Event('input', { bubbles: true }));
       target.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+      target.dispatchEvent(new Event('blur', { bubbles: true }));
+    } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
       el.textContent = value;
       el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
+    } else {
+      return false;
     }
-    return false;
+
+    const verified = valueMatches(el, value);
+    markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+    return verified;
   } catch {
+    markField(el, 'mismatch');
     return false;
   }
 }
 
-function fillFields(items: FillItem[]): FillResult {
+async function fillOneField(index: number, value: string, confidence: 'high' | 'medium' | 'low' = 'medium'): Promise<boolean> {
+  const el = elementMap.get(index);
+  if (!el || protectedIndices.has(index)) return false;
+
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  return fillElementAsync(el, value, confidence);
+}
+
+async function fillFields(items: FillItem[]): Promise<FillResult> {
   let success = 0;
   let failure = 0;
 
@@ -445,7 +844,7 @@ function fillFields(items: FillItem[]): FillResult {
         success++;
       } catch { failure++; }
     } else {
-      fillOneField(item.index, item.value) ? success++ : failure++;
+      await fillOneField(item.index, item.value, item.confidence) ? success++ : failure++;
     }
   }
 
@@ -541,14 +940,28 @@ function commitTyping(index: number): void {
 export default defineContentScript({
   matches: ['<all_urls>'],
   main() {
+    document.addEventListener('focusin', (event) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.matches(SCANNABLE_SELECTOR) && isFillable(target)) {
+        lastFocusedElement = target;
+      }
+    }, true);
+
     chrome.runtime.onMessage.addListener(
       (message: Message, _sender, sendResponse) => {
         if (message.type === 'scan') {
           const results = scanFields();
           sendResponse(results);
+        } else if (message.type === 'prepareRepeatRows') {
+          prepareRepeatRows(message.targets)
+            .then((added) => sendResponse({ ok: true, added }))
+            .catch(() => sendResponse({ ok: false, added: 0 }));
+        } else if (message.type === 'advanceToNextStep') {
+          advanceToNextStep()
+            .then(sendResponse)
+            .catch(() => sendResponse({ clicked: false, advanced: false, reason: '无法安全进入下一页' }));
         } else if (message.type === 'fill') {
-          const results = fillFields(message.items);
-          sendResponse(results);
+          fillFields(message.items).then(sendResponse).catch(() => sendResponse({ success: 0, failure: message.items.length }));
         } else if (message.type === 'fillStreamInit') {
           typingMap.clear();
           for (const item of message.items) {
@@ -576,8 +989,14 @@ export default defineContentScript({
           }
           sendResponse({ ok: true });
         } else if (message.type === 'fillField') {
-          fillOneField(message.index, message.value);
-          sendResponse({ ok: true });
+          fillOneField(message.index, message.value, message.confidence)
+            .then((success) => sendResponse({ ok: success }))
+            .catch(() => sendResponse({ ok: false }));
+        } else if (message.type === 'manualFill') {
+          if (!lastFocusedElement) sendResponse({ ok: false });
+          else fillElementAsync(lastFocusedElement, message.value, 'medium')
+            .then((success) => sendResponse({ ok: success }))
+            .catch(() => sendResponse({ ok: false }));
         } else if (message.type === 'fillTypeChunk') {
           enqueueTyping(message.index, message.chunk);
           sendResponse({ ok: true });

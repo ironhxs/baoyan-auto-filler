@@ -16,7 +16,7 @@ for (const p of CHROMIUM_FALLBACKS) {
 
 export default defineConfig({
   manifest: {
-    name: '秒填鸭',
+    name: '保填',
     permissions: ['storage', 'activeTab', 'scripting'],
     host_permissions: ['<all_urls>'],
     commands: {

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>推免申请家庭成员测试页</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, "Microsoft YaHei", sans-serif; color: #303846; background: #f4f7fb; }
+    main { width: 1040px; margin: 28px auto; padding: 30px 36px 46px; background: white; border-radius: 10px; box-shadow: 0 6px 28px #15284c14; }
+    .breadcrumb { padding-bottom: 16px; color: #78879a; border-bottom: 1px solid #dbe2eb; }
+    .breadcrumb strong { color: #ff7a19; }
+    h2 { margin: 22px 0 14px; padding-bottom: 10px; color: #327bd6; font-weight: 500; border-bottom: 1px solid #dbe2eb; }
+    .basic-grid { display: grid; grid-template-columns: 100px 260px 100px 260px; gap: 12px 14px; align-items: center; }
+    label { font-size: 14px; text-align: right; }
+    input, select { width: 100%; height: 38px; padding: 7px 10px; border: 1px solid #cdd6e1; border-radius: 5px; font-size: 14px; }
+    table { width: 100%; border-collapse: separate; border-spacing: 12px 9px; }
+    th { padding: 0 6px 8px; font-size: 14px; font-weight: 600; border-bottom: 1px solid #cfd8e3; }
+    td { padding: 0; }
+    td input { min-width: 0; }
+    .family-layout { display: grid; grid-template-columns: 190px 1fr; gap: 18px; align-items: start; }
+    .family-note { padding-top: 50px; font-size: 14px; font-weight: 600; line-height: 1.55; }
+    .family-note span { color: #f13e32; }
+    button { padding: 9px 18px; border: 0; border-radius: 5px; color: white; background: #27a5e8; cursor: pointer; }
+    .table-actions { margin-left: 12px; }
+    .risk-grid { display: grid; grid-template-columns: 130px 280px; gap: 12px; align-items: center; margin-top: 20px; }
+    .footer-actions { display: flex; justify-content: center; gap: 20px; margin-top: 44px; }
+    .footer-actions button:first-child { color: #4b596b; background: #fff; border: 1px solid #cfd8e3; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="breadcrumb">首页　»　填写/修改申请信息　<strong>已完成2步（共13步）</strong></div>
+
+    <h2>基本信息</h2>
+    <div class="basic-grid">
+      <label for="studentName">姓名</label><input id="studentName" required />
+      <label for="mobile">手机号</label><input id="mobile" required />
+    </div>
+
+    <section id="familySection">
+      <h2>家庭主要成员</h2>
+      <div class="family-layout">
+        <div class="family-note">家庭主要成员及主要社会关系（至少填写一行）<span>（内容中不得含有 |、#）</span></div>
+        <div>
+          <table id="familyTable">
+            <thead>
+              <tr><th>姓名</th><th>关系</th><th>在何单位工作，任何职务</th><th>联系电话</th></tr>
+            </thead>
+            <tbody id="familyBody">
+              <tr class="family-row">
+                <td><input name="familyName[]" required /></td>
+                <td><input name="familyRelation[]" required /></td>
+                <td><input name="familyWork[]" /></td>
+                <td><input name="familyPhone[]" /></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="table-actions"><button type="button" id="addFamilyRow">新增一行</button></div>
+        </div>
+      </div>
+    </section>
+
+    <h2>本人确认项目</h2>
+    <div class="risk-grid">
+      <label for="advisor">志愿导师</label><input id="advisor" role="combobox" />
+      <label for="captcha">验证码</label><input id="captcha" />
+      <label for="agreement">本人承诺书</label><input id="agreement" type="checkbox" value="agree" />
+      <label for="attachment">上传证明材料</label><input id="attachment" type="file" />
+    </div>
+
+    <div class="footer-actions"><button type="button">上一步</button><button type="submit">下一步</button></div>
+  </main>
+  <script>
+    document.getElementById('addFamilyRow').addEventListener('click', () => {
+      const row = document.querySelector('.family-row').cloneNode(true);
+      row.querySelectorAll('input').forEach(input => input.value = '');
+      document.getElementById('familyBody').appendChild(row);
+    });
+  </script>
+</body>
+</html>

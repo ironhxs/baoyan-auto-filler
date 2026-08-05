@@ -1,5 +1,5 @@
 {
-  description = "秒填鸭 - LLM-powered Chrome extension for automatic form filling";
+  description = "保填 - LLM-powered Chrome extension for automatic form filling";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -59,7 +59,7 @@
             ''
             + ''
               echo ""
-              echo "秒填鸭 (Auto Filler) dev environment"
+              echo "保填 dev environment"
               echo "----------------------------------------"
               echo "node:   $(node --version)"
               echo "npm:    $(npm --version)"

@@ -12,6 +12,8 @@ export interface BlockCategory {
   id?: number;
   title: string;
   items: BlockItem[];
+  sectionId?: string;
+  templateFields?: string[];
 }
 
 export interface FileRecord {
@@ -266,6 +268,35 @@ export async function deleteBlockCategory(id: number): Promise<void> {
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
+}
+
+export async function ensureProfileBlocksSeeded(): Promise<BlockCategory[]> {
+  const { DEFAULT_REPEAT_SECTIONS } = await import('./profile-schema');
+  const blocks = await getAllBlockCategories();
+
+  for (const section of DEFAULT_REPEAT_SECTIONS) {
+    const existing = blocks.find((block) => block.sectionId === section.id || block.title === section.title);
+    if (existing) {
+      const needsUpdate = existing.sectionId !== section.id || !existing.templateFields?.length;
+      if (needsUpdate) {
+        existing.sectionId = section.id;
+        existing.templateFields = [...section.fieldKeys];
+        await saveBlockCategory(existing);
+      }
+      continue;
+    }
+
+    const block: BlockCategory = {
+      title: section.title,
+      sectionId: section.id,
+      templateFields: [...section.fieldKeys],
+      items: [],
+    };
+    block.id = await saveBlockCategory(block);
+    blocks.push(block);
+  }
+
+  return blocks;
 }
 
 // ── Categories ──
