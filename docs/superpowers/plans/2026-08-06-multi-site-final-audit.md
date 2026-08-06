@@ -387,30 +387,43 @@ git commit -m "feat: audit sampled material pages"
 - Create: `entrypoints/audit/index.html`
 - Create: `entrypoints/audit/main.ts`
 - Create: `entrypoints/audit/style.css`
+- Create: `utils/audit-view-model.ts`
+- Create: `scripts/test-audit-view-model.ts`
 - Modify: `entrypoints/background.ts`
 
 **Interfaces:**
 - Audit page consumes runtime messages `listApplicationTasks`, `getAuditPreflight`, `runFinalAudit`, `archiveApplicationTask`, and `focusApplicationTask`.
 - `getAuditPreflight` returns exact selected task/page/field/material/sample counts and degradation notices without calling the API.
 - `runFinalAudit` requires `confirmed: true` and rejects direct calls without confirmation.
+- `buildAuditViewModel` produces current-first task rows, selected IDs, preflight confirmation state, and severity-grouped report rows for the real UI.
 
-- [ ] **Step 1: Add a failing static UI contract test**
+- [ ] **Step 1: Add a failing audit view-model behavior test**
 
-Create `scripts/test-audit-ui.mjs` asserting the source includes stable IDs:
+Create `scripts/test-audit-view-model.ts` and assert observable UI state from real task/report inputs:
 
-```js
-for (const id of ['taskList', 'auditSummary', 'auditRunBtn', 'auditConfirmDialog', 'auditReport']) {
-  assert.match(htmlAndTs, new RegExp(id));
-}
-assert.match(htmlAndTs, /当前网站/);
-assert.match(htmlAndTs, /发送前确认/);
+```ts
+const model = buildAuditViewModel([otherTask, currentTask], {
+  currentTaskId: currentTask.id,
+  batchId: currentTask.batchId,
+  selectedTaskIds: new Set([otherTask.id, currentTask.id]),
+  preflight: { taskCount: 2, pageCount: 9, fieldCount: 80, materialCount: 7, sampledPageCount: 12, notices: [] },
+  confirmed: false,
+});
+assert.equal(model.tasks[0].id, currentTask.id);
+assert.equal(model.tasks[0].isCurrent, true);
+assert.equal(model.runDisabled, true);
+assert.equal(model.preflightLabel, '2 所学校 · 9 个页面 · 7 份材料 · 12 个抽样页');
+
+const grouped = groupAuditIssues(report);
+assert.equal(grouped.critical[0].severity, 'critical');
+assert.equal(grouped.warning[0].severity, 'warning');
 ```
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `node scripts/test-audit-ui.mjs`
+Run: `npx tsx scripts/test-audit-view-model.ts`
 
-Expected: FAIL because `entrypoints/audit/` does not exist.
+Expected: FAIL because `utils/audit-view-model.ts` does not exist.
 
 - [ ] **Step 3: Implement the audit page**
 
@@ -427,7 +440,7 @@ Do not use cards inside cards, large hero typography, decorative gradients, or m
 
 - [ ] **Step 4: Verify UI contract and compile GREEN**
 
-Run: `npm run test:audit-ui`
+Run: `npm run test:audit-view-model`
 
 Run: `npm run compile`
 
@@ -436,7 +449,7 @@ Expected: both pass.
 - [ ] **Step 5: Commit audit center**
 
 ```bash
-git add entrypoints/audit entrypoints/background.ts scripts/test-audit-ui.mjs package.json
+git add entrypoints/audit entrypoints/background.ts utils/audit-view-model.ts scripts/test-audit-view-model.ts package.json
 git commit -m "feat: add unified audit center"
 ```
 
@@ -447,25 +460,28 @@ git commit -m "feat: add unified audit center"
 **Files:**
 - Modify: `entrypoints/popup/main.ts`
 - Modify: `entrypoints/popup/style.css`
-- Modify: `scripts/test-audit-ui.mjs`
+- Modify: `utils/audit-view-model.ts`
+- Modify: `scripts/test-audit-view-model.ts`
 
 **Interfaces:**
 - Popup loads `getCurrentApplicationTask` and `listApplicationTasks` during initialization.
 - Current task status and history occupy the main auto-run area.
 - Batch summary remains one compact footer band with `openAuditCenter`.
+- `buildPopupTaskSummary` derives current-site counts and batch totals consumed by popup rendering.
 
-- [ ] **Step 1: Extend the UI contract test and verify RED**
+- [ ] **Step 1: Extend the view-model behavior test and verify RED**
 
-```js
-assert.match(popupSource, /currentSiteTask/);
-assert.match(popupSource, /当前网站/);
-assert.match(popupSource, /打开统一审核/);
-assert.match(popupSource, /openAuditCenter/);
+```ts
+const popup = buildPopupTaskSummary([otherTask, currentTask], currentTask.id);
+assert.equal(popup.current?.id, currentTask.id);
+assert.equal(popup.current?.conflicts, 2);
+assert.equal(popup.batch.total, 2);
+assert.equal(popup.batch.needsReview, 1);
 ```
 
-Run: `npm run test:audit-ui`
+Run: `npm run test:audit-view-model`
 
-Expected: FAIL because the popup does not expose the new current-site section.
+Expected: FAIL because `buildPopupTaskSummary` does not exist.
 
 - [ ] **Step 2: Implement current-site-first rendering**
 
@@ -479,7 +495,7 @@ Keep existing scan, manual fill, material review, and auto-run controls. Add:
 
 - [ ] **Step 3: Verify popup contract, compile, and existing tests GREEN**
 
-Run: `npm run test:audit-ui`
+Run: `npm run test:audit-view-model`
 
 Run: `npm run compile`
 
@@ -490,7 +506,7 @@ Expected: all pass.
 - [ ] **Step 4: Commit popup integration**
 
 ```bash
-git add entrypoints/popup/main.ts entrypoints/popup/style.css scripts/test-audit-ui.mjs
+git add entrypoints/popup/main.ts entrypoints/popup/style.css utils/audit-view-model.ts scripts/test-audit-view-model.ts
 git commit -m "feat: prioritize current site in popup"
 ```
 
@@ -526,7 +542,7 @@ npm run test:tasks
 npm run test:audit
 npm run test:ai-queue
 npm run test:material-audit
-npm run test:audit-ui
+npm run test:audit-view-model
 npm run build
 git diff --check
 ```
