@@ -1,6 +1,7 @@
 import type { BlockCategory, TextField } from './db';
 import type { FormFieldInfo, MatchResult } from './matcher';
 import { getBlockSection, inferLanguageItems } from './profile-schema';
+import { getFieldItemBinding, planRepeatableRecords, type RepeatableRecordPlan } from './repeatable-records';
 
 const ALIAS_GROUPS: string[][] = [
   ['姓名', '成员姓名', '家庭成员姓名', '真实姓名'],
@@ -209,14 +210,17 @@ function findStructuredMatch(
   field: FormFieldInfo,
   blocks: BlockCategory[],
   textFields: TextField[],
+  plan: RepeatableRecordPlan,
 ): MatchResult | undefined {
   if (field.rowIndex == null || !field.groupLabel) return undefined;
+  const itemIndex = getFieldItemBinding(field, plan);
+  if (itemIndex == null) return undefined;
   const block = blocks.find((candidate) => {
     const section = getBlockSection(candidate);
     return section?.title === field.groupLabel || normalize(candidate.title) === normalize(field.groupLabel ?? '');
   });
   const inferredLanguageItems = field.groupLabel === '外语水平' ? inferLanguageItems(textFields) : [];
-  const item = block?.items[field.rowIndex] ?? inferredLanguageItems[field.rowIndex];
+  const item = block?.items[itemIndex] ?? inferredLanguageItems[itemIndex];
   if (!item) return undefined;
   const blockTitle = block?.title ?? field.groupLabel;
 
@@ -230,7 +234,7 @@ function findStructuredMatch(
 
   return makeMatch(
     field,
-    `${blockTitle}[${field.rowIndex + 1}].${best.source.key}`,
+    `${blockTitle}[${itemIndex + 1}].${best.source.key}`,
     best.source.key,
     best.source.value,
     best.score,
@@ -335,10 +339,11 @@ export function matchFieldsLocally(
   textFields: TextField[],
   blocks: BlockCategory[],
 ): MatchResult[] {
+  const plan = planRepeatableRecords(fields, blocks, textFields);
   return fields.flatMap((field) => {
     const isReadOnlyAudit = isMeaningfullyFilled(field) && /只读|锁定/.test(field.protectionReason ?? '');
     if (field.kind === 'file' || (field.protected && !isReadOnlyAudit)) return [];
-    const structured = findStructuredMatch(field, blocks, textFields);
+    const structured = findStructuredMatch(field, blocks, textFields, plan);
     if (structured) return [structured];
     const aggregate = findAggregateBlockMatch(field, blocks);
     if (aggregate) return [aggregate];

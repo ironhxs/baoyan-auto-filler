@@ -117,6 +117,14 @@ const fields = [
 
 const matches = matchFieldsLocally(fields, textFields, blocks);
 const byIndex = new Map(matches.map((match) => [match.index, match]));
+const reversed = matchFieldsLocally([
+  field(0, { groupLabel: '外语水平', rowIndex: 0, columnLabel: '考试名称', value: 'CET-6' }),
+  field(1, { groupLabel: '外语水平', rowIndex: 0, columnLabel: '成绩', value: '489' }),
+  field(2, { groupLabel: '外语水平', rowIndex: 1, columnLabel: '考试名称', value: 'CET-4' }),
+  field(3, { groupLabel: '外语水平', rowIndex: 1, columnLabel: '成绩', value: '536' }),
+], textFields, blocks);
+assert.equal(reversed.find((match) => match.index === 1)?.value, '489');
+assert.match(reversed.find((match) => match.index === 1)?.fieldKey ?? '', /外语水平\[2\]/);
 assert.equal(byIndex.get(0)?.value, '测试学生');
 assert.equal(byIndex.get(1)?.value, '测试父亲');
 assert.equal(byIndex.get(2)?.value, '父亲');
