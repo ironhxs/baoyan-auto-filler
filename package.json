@@ -15,6 +15,7 @@
     "test:llm-api": "node scripts/test-llm-api.mjs",
     "test:profile": "node scripts/test-profile-data.mjs",
     "test:local-matcher": "tsx scripts/test-local-matcher.ts",
+    "test:repeatable-records": "tsx scripts/test-repeatable-records.ts",
     "test:tasks": "tsx scripts/test-application-tasks.ts",
     "test:audit": "tsx scripts/test-final-audit.ts",
     "test:ai-queue": "tsx scripts/test-ai-request-queue.ts",
