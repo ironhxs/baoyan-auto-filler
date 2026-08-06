@@ -2,16 +2,20 @@ import assert from 'node:assert/strict';
 import {
   bindTaskToTab,
   createApplicationTask,
+  getTaskPageAnalysis,
   selectDefaultAuditTaskIds,
   sortTasksForCurrentSite,
   unbindTaskFromTab,
   updateTaskFromAutoRun,
+  updateTaskRunnerCheckpoint,
+  upsertTaskPageAnalysis,
   upsertTaskPage,
 } from '../utils/application-tasks';
 import type {
   ApplicationPageSnapshot,
   ApplicationTask,
 } from '../utils/application-tasks';
+import type { ApplicationPageAnalysis, ApplicationRunnerCheckpoint } from '../utils/page-analysis';
 
 const firstPage: ApplicationPageSnapshot = {
   id: 'page-basic',
@@ -32,6 +36,42 @@ const task = createApplicationTask({
   page: firstPage,
   now: 100,
 });
+
+const analysisA: ApplicationPageAnalysis = {
+  pageKey: firstPage.key,
+  pageLabel: firstPage.label,
+  pageUrl: firstPage.url,
+  pageSignature: firstPage.signature,
+  fields: [],
+  matches: [],
+  markers: [],
+  checkedIndexes: [],
+  repeatPlan: { groups: {} },
+  ai: {
+    configured: false,
+    mode: 'fallback',
+    attempted: false,
+    cached: false,
+    reviewed: 0,
+    error: '',
+  },
+  capturedAt: 150,
+};
+const analysisB: ApplicationPageAnalysis = { ...analysisA, pageKey: 'https://a.example/app/materials', capturedAt: 160 };
+const withAnalysis = upsertTaskPageAnalysis(task, analysisA);
+assert.equal(getTaskPageAnalysis(withAnalysis, analysisA.pageKey)?.pageKey, analysisA.pageKey);
+assert.equal(getTaskPageAnalysis(withAnalysis, analysisB.pageKey), null);
+assert.equal(task.pageAnalyses, undefined, 'analysis update must not mutate the input task');
+
+const checkpoint: ApplicationRunnerCheckpoint = {
+  status: 'running',
+  lastPageKey: analysisA.pageKey,
+  history: [],
+  updatedAt: 180,
+};
+const withRunner = updateTaskRunnerCheckpoint(withAnalysis, checkpoint);
+assert.equal(withRunner.runner?.status, 'running');
+assert.equal(task.runner, undefined, 'immutable update must not mutate the input task');
 
 assert.equal(task.status, 'stopped');
 assert.equal(task.displayName, 'A 大学');

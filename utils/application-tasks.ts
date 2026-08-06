@@ -1,3 +1,8 @@
+import type {
+  ApplicationPageAnalysis,
+  ApplicationRunnerCheckpoint,
+} from './page-analysis';
+
 export const APPLICATION_TASKS_KEY = 'applicationTasks:v1';
 export const APPLICATION_TASK_BINDINGS_KEY = 'applicationTaskBindings:v1';
 
@@ -90,10 +95,87 @@ export interface ApplicationTask {
   pageOrder: string[];
   pages: Record<string, ApplicationPageSnapshot>;
   materials: ApplicationMaterialSnapshot[];
+  pageAnalyses?: Record<string, ApplicationPageAnalysis>;
+  runner?: ApplicationRunnerCheckpoint;
   audit?: TaskAuditState;
   createdAt: number;
   updatedAt: number;
   lastOpenedAt: number;
+}
+
+function clonePageAnalysis(analysis: ApplicationPageAnalysis): ApplicationPageAnalysis {
+  return {
+    ...analysis,
+    fields: analysis.fields.map((field) => ({
+      ...field,
+      ...(field.options ? { options: [...field.options] } : {}),
+    })),
+    matches: analysis.matches.map((match) => ({
+      ...match,
+      ...(match.fileCandidates
+        ? { fileCandidates: match.fileCandidates.map((candidate) => ({ ...candidate })) }
+        : {}),
+    })),
+    markers: analysis.markers.map((marker) => ({ ...marker })),
+    checkedIndexes: [...analysis.checkedIndexes],
+    repeatPlan: {
+      groups: Object.fromEntries(Object.entries(analysis.repeatPlan.groups).map(([key, group]) => [key, {
+        ...group,
+        rowBindings: [...group.rowBindings],
+        missingItemIndexes: [...group.missingItemIndexes],
+        unmatchedRowIndexes: [...group.unmatchedRowIndexes],
+      }])),
+    },
+    ai: { ...analysis.ai },
+  };
+}
+
+function cloneRunnerCheckpoint(checkpoint: ApplicationRunnerCheckpoint): ApplicationRunnerCheckpoint {
+  return {
+    ...checkpoint,
+    history: checkpoint.history.map((entry) => ({ ...entry })),
+  };
+}
+
+export function upsertTaskPageAnalysis(
+  task: ApplicationTask,
+  analysis: ApplicationPageAnalysis,
+): ApplicationTask {
+  const allAnalyses = {
+    ...Object.fromEntries(Object.entries(task.pageAnalyses ?? {}).map(([key, value]) => [key, clonePageAnalysis(value)])),
+    [analysis.pageKey]: clonePageAnalysis(analysis),
+  };
+  const pageAnalyses = Object.fromEntries(
+    Object.entries(allAnalyses)
+      .sort(([, left], [, right]) => right.capturedAt - left.capturedAt || left.pageKey.localeCompare(right.pageKey))
+      .slice(0, 30),
+  );
+  return {
+    ...task,
+    pageAnalyses,
+    updatedAt: Math.max(task.updatedAt, analysis.capturedAt),
+    lastOpenedAt: Math.max(task.lastOpenedAt, analysis.capturedAt),
+  };
+}
+
+export function getTaskPageAnalysis(
+  task: ApplicationTask,
+  pageKey: string,
+): ApplicationPageAnalysis | null {
+  const analysis = task.pageAnalyses?.[pageKey];
+  return analysis ? clonePageAnalysis(analysis) : null;
+}
+
+export function updateTaskRunnerCheckpoint(
+  task: ApplicationTask,
+  checkpoint: ApplicationRunnerCheckpoint,
+): ApplicationTask {
+  return {
+    ...task,
+    runner: cloneRunnerCheckpoint(checkpoint),
+    updatedAt: Math.max(task.updatedAt, checkpoint.updatedAt),
+    lastOpenedAt: Math.max(task.lastOpenedAt, checkpoint.updatedAt),
+  };
 }
 
 export interface CreateApplicationTaskInput {
@@ -272,4 +354,3 @@ export async function archiveApplicationTask(taskId: string, now = Date.now()): 
     updatedAt: now,
   }));
 }
-
