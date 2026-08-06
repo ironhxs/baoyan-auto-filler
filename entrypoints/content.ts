@@ -69,7 +69,14 @@ interface FillTypeChunkMessage { type: 'fillTypeChunk'; index: number; chunk: st
 interface FillTypeCommitMessage { type: 'fillTypeCommit'; index: number }
 interface FillStreamCompleteMessage { type: 'fillStreamComplete' }
 interface ManualFillMessage { type: 'manualFill'; value: string }
-interface PrepareRepeatRowsMessage { type: 'prepareRepeatRows'; targets: Array<{ groupLabel: string; count: number }> }
+interface PrepareRepeatRowsMessage {
+  type: 'prepareRepeatRows';
+  targets: Array<{ groupLabel: string; requiredRows: number; missingItemIndexes: number[] }>;
+}
+interface PrepareRepeatRowsResult {
+  added: number;
+  failures: Array<{ groupLabel: string; reason: string }>;
+}
 interface AdvanceToNextStepMessage { type: 'advanceToNextStep' }
 interface MarkPreviewMessage {
   type: 'markPreview';
@@ -493,16 +500,52 @@ function repeatDataRows(table: HTMLTableElement): HTMLTableRowElement[] {
 }
 
 function findRepeatTable(groupLabel: string): HTMLTableElement | undefined {
-  return Array.from(document.querySelectorAll<HTMLTableElement>('table')).find((table) => (
-    detectProfileGroup(findGroupText(table, table)) === groupLabel
-  ));
+  return Array.from(document.querySelectorAll<HTMLTableElement>('table')).find((table) => {
+    const detectedGroup = inferProfileGroupFromTable(table) || detectProfileGroup(findGroupText(table, table));
+    return detectedGroup === groupLabel;
+  });
 }
 
-function findAddRowControl(table: HTMLTableElement): HTMLElement | undefined {
+function findAddRowControl(table: HTMLTableElement, groupLabel: string): HTMLElement | undefined {
   let container: HTMLElement | null = table.parentElement;
   for (let depth = 0; container && container !== document.body && depth < 5; depth++, container = container.parentElement) {
-    const control = Array.from(container.querySelectorAll<HTMLElement>('button,a,[role="button"]')).find((candidate) => {
+    const control = Array.from(container.querySelectorAll<HTMLElement>('button,a,[role="button"],span')).find((candidate) => {
       if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+      const candidateTable = candidate.closest<HTMLTableElement>('table');
+      if (candidateTable && candidateTable !== table) return false;
+      if (!candidateTable) {
+        const precedingTable = Array.from(document.querySelectorAll<HTMLTableElement>('table'))
+          .filter((candidateTable) => Boolean(
+            candidateTable.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING,
+          ))
+          .at(-1);
+        if (precedingTable !== table) return false;
+      }
+      if (candidate instanceof HTMLSpanElement) {
+        const style = (candidate.ownerDocument.defaultView ?? window).getComputedStyle(candidate);
+        const clickable = candidate.getAttribute('role') === 'button'
+          || candidate.hasAttribute('onclick')
+          || candidate.tabIndex >= 0
+          || style.cursor === 'pointer';
+        if (!clickable) return false;
+      }
+      const allowedLabels = new Set([
+        '\u65b0\u589e',
+        '\u6dfb\u52a0',
+        '\u65b0\u589e\u4e00\u884c',
+        '\u6dfb\u52a0\u4e00\u6761',
+      ]);
+      const visibleText = normalizeText(candidate.textContent ?? '').replace(/\s+/g, '');
+      const accessibleLabel = normalizeText([
+        candidate.getAttribute('aria-label') ?? '',
+        candidate.getAttribute('title') ?? '',
+      ].join(' ')).replace(/\s+/g, '').toLowerCase();
+      if (
+        allowedLabels.has(visibleText)
+        || allowedLabels.has(accessibleLabel)
+        || /^(addrow|additem|addrecord|addaward|addexperience|addmember)$/.test(accessibleLabel)
+        || /^(?:\u65b0\u589e|\u6dfb\u52a0)(?:\u4e00\u884c|\u4e00\u6761|\u6210\u5458|\u7ecf\u5386|\u8bb0\u5f55|\u5956\u52b1|\u83b7\u5956|\u6210\u679c|\u8003\u8bd5)?$/.test(accessibleLabel)
+      ) return true;
       const text = normalizeText(candidate.textContent ?? '').replace(/\s+/g, '');
       return /^(新增|添加)(一行|行|一条|成员|经历|记录)$/.test(text);
     });
@@ -519,22 +562,43 @@ async function waitForRowIncrease(table: HTMLTableElement, previousCount: number
   return false;
 }
 
-async function prepareRepeatRows(targets: Array<{ groupLabel: string; count: number }>): Promise<number> {
+async function prepareRepeatRows(
+  targets: PrepareRepeatRowsMessage['targets'],
+): Promise<PrepareRepeatRowsResult> {
   let added = 0;
+  const failures: PrepareRepeatRowsResult['failures'] = [];
   for (const target of targets) {
     const table = findRepeatTable(target.groupLabel);
-    if (!table) continue;
-    const safeTarget = Math.min(Math.max(Math.floor(target.count), 0), 10);
+    if (!table) {
+      failures.push({ groupLabel: target.groupLabel, reason: 'Repeatable group table not found' });
+      continue;
+    }
+    const requestedRows = Math.max(Math.floor(target.requiredRows), 0);
+    const safeTarget = Math.min(requestedRows, 10);
+    if (requestedRows > safeTarget) {
+      failures.push({ groupLabel: target.groupLabel, reason: 'Requested row count exceeds the safe limit of 10' });
+    }
     while (repeatDataRows(table).length < safeTarget) {
       const previousCount = repeatDataRows(table).length;
-      const control = findAddRowControl(table);
-      if (!control) break;
-      control.click();
-      if (!await waitForRowIncrease(table, previousCount)) break;
+      const control = findAddRowControl(table, target.groupLabel);
+      if (!control) {
+        failures.push({ groupLabel: target.groupLabel, reason: 'No visible add-row control found' });
+        break;
+      }
+      try {
+        control.click();
+      } catch {
+        failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control click failed' });
+        break;
+      }
+      if (!await waitForRowIncrease(table, previousCount)) {
+        failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control did not create a field row' });
+        break;
+      }
       added++;
     }
   }
-  return added;
+  return { added, failures };
 }
 
 function nextPageSignature(): string {
@@ -1270,8 +1334,14 @@ export default defineContentScript({
           sendResponse(getAuditPageSnapshot());
         } else if (message.type === 'prepareRepeatRows') {
           prepareRepeatRows(message.targets)
-            .then((added) => sendResponse({ ok: true, added }))
-            .catch(() => sendResponse({ ok: false, added: 0 }));
+            .then(sendResponse)
+            .catch(() => sendResponse({
+              added: 0,
+              failures: message.targets.map((target) => ({
+                groupLabel: target.groupLabel,
+                reason: 'Unexpected repeatable row preparation failure',
+              })),
+            }));
         } else if (message.type === 'advanceToNextStep') {
           advanceToNextStep()
             .then(sendResponse)

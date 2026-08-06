@@ -22,6 +22,16 @@ export interface RepeatRowTarget {
   missingItemIndexes: number[];
 }
 
+export interface PrepareRepeatRowsResult {
+  added: number;
+  failures: Array<{ groupLabel: string; reason: string }>;
+}
+
+export interface RepeatableRowScanResult<T> {
+  scanResults: T[];
+  preparation: PrepareRepeatRowsResult;
+}
+
 interface RepeatableSourceGroup {
   label: string;
   items: BlockItem[];
@@ -168,4 +178,27 @@ export function buildRepeatRowTargets(plan: RepeatableRecordPlan): RepeatRowTarg
       requiredRows: group.existingRowCount + group.rowsToAdd,
       missingItemIndexes: [...group.missingItemIndexes],
     }));
+}
+
+export async function prepareRepeatableRowScan<T extends { index: number; field: FormFieldInfo }>(
+  scan: () => Promise<T[]>,
+  prepareRows: (targets: RepeatRowTarget[]) => Promise<PrepareRepeatRowsResult>,
+  blocks: BlockCategory[],
+  textFields: TextField[],
+): Promise<RepeatableRowScanResult<T>> {
+  const initialScan = await scan();
+  const initialFields = initialScan.map((result) => ({ ...result.field, index: result.index }));
+  const targets = buildRepeatRowTargets(planRepeatableRecords(initialFields, blocks, textFields));
+  if (targets.length === 0) {
+    return {
+      scanResults: initialScan,
+      preparation: { added: 0, failures: [] },
+    };
+  }
+
+  const preparation = await prepareRows(targets);
+  return {
+    scanResults: await scan(),
+    preparation,
+  };
 }

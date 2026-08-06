@@ -9,7 +9,7 @@ import {
 import { matchFields, requestModelText } from '@/utils/matcher';
 import type { Category, FileRecord } from '@/utils/db';
 import type { MatchResult, FormFieldInfo, MaterialRole } from '@/utils/matcher';
-import { flattenProfileValues, getBlockSection, inferLanguageItems } from '@/utils/profile-schema';
+import { flattenProfileValues } from '@/utils/profile-schema';
 import { adaptValueToField, getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
 import { fieldFingerprint } from '@/utils/field-fingerprint';
@@ -39,6 +39,10 @@ import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
 import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
 import { canonicalPageUrl, semanticPageKey } from '@/utils/page-identity';
+import {
+  prepareRepeatableRowScan,
+  type PrepareRepeatRowsResult,
+} from '@/utils/repeatable-records';
 
 type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 interface PageMarkerItem {
@@ -94,6 +98,7 @@ interface ScanSuccessResponse {
   pageLabel: string;
   pageUrl: string;
   pageSignature: string;
+  repeatRowPreparation: PrepareRepeatRowsResult;
   ai: {
     configured: boolean;
     mode: 'enhanced' | 'fallback';
@@ -345,19 +350,6 @@ const ROLE_KEYWORDS: Record<MaterialRole, { exact: string[]; alias: string[] }> 
 
 function errorResponse(error: string): ErrorResponse {
   return { ok: false, error };
-}
-
-function getRepeatRowTargets(
-  blocks: Awaited<ReturnType<typeof getAllBlockCategories>>,
-  textFields: Awaited<ReturnType<typeof getAllTextFields>>,
-) {
-  return blocks.flatMap((block) => {
-    const section = getBlockSection(block);
-    if (!section || section.kind !== 'repeat') return [];
-    const inferredCount = section.id === 'language' ? inferLanguageItems(textFields).length : 0;
-    const count = Math.max(block.items.length, inferredCount);
-    return count > 0 ? [{ groupLabel: section.title, count }] : [];
-  });
 }
 
 async function getCurrentTab(): Promise<chrome.tabs.Tab | undefined> {
@@ -1224,15 +1216,16 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     getAllCategories(),
   ]);
   const readableFileRecords = await filterReadableFileRecords(fileRecords);
-  await sendToContentScript(tabId, {
-    type: 'prepareRepeatRows',
-    targets: getRepeatRowTargets(blocks, textFields),
-  });
-
-  const [scanResults, pageMeta] = await Promise.all([
-    sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
-    sendToContentScript<{ label: string; url: string; signature: string }>(tabId, { type: 'getPageMeta' }),
-  ]);
+  const { scanResults, preparation: repeatRowPreparation } = await prepareRepeatableRowScan(
+    () => sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
+    (targets) => sendToContentScript<PrepareRepeatRowsResult>(tabId, { type: 'prepareRepeatRows', targets }),
+    blocks,
+    textFields,
+  );
+  const pageMeta = await sendToContentScript<{ label: string; url: string; signature: string }>(
+    tabId,
+    { type: 'getPageMeta' },
+  );
   if (!scanResults?.length) {
     return {
       ok: true,
@@ -1244,6 +1237,7 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
       pageLabel: pageMeta?.label || '当前页面',
       pageUrl: pageMeta?.url || '',
       pageSignature: pageMeta?.signature || pageMeta?.url || '',
+      repeatRowPreparation,
       ai: {
         configured: textApiReady,
         mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
@@ -1336,6 +1330,7 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     pageLabel: fieldInfos.find((field) => field.groupLabel)?.groupLabel || pageMeta?.label || fieldInfos[0]?.label || '当前页面',
     pageUrl: pageMeta?.url || '',
     pageSignature: pageMeta?.signature || pageMeta?.url || '',
+    repeatRowPreparation,
     ai: {
       configured: textApiReady,
       mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
@@ -1540,6 +1535,18 @@ async function processAutoRun(tabId: number): Promise<void> {
       updatedAt: Date.now(),
     });
     await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
+    if (scan.repeatRowPreparation.failures.length > 0) {
+      state.status = 'paused';
+      state.pauseReason = 'required';
+      state.message = `Repeatable rows need attention: ${scan.repeatRowPreparation.failures
+        .map((failure) => `${failure.groupLabel}: ${failure.reason}`)
+        .join('; ')}`;
+      historyEntry.status = 'paused';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
+      await saveAutoRunState(state);
+      return;
+    }
     const scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
     const fileFields = scan.fields.filter((field) => field.kind === 'file');
     const currentMaterialPageKey = semanticPageKey({
