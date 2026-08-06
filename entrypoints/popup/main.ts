@@ -9,6 +9,8 @@ import { isMeaningfullyFilled } from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import type { ApplicationTask } from '@/utils/application-tasks';
+import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
+import type { RepeatableRecordPlan } from '@/utils/repeatable-records';
 import { buildPopupTaskSummary } from '@/utils/audit-view-model';
 
 const app = document.getElementById('app')!;
@@ -20,13 +22,26 @@ interface ScanResponse {
   matched: number;
   matches: MatchResult[];
   fields: FormFieldInfo[];
+  pageLabel: string;
+  pageUrl: string;
+  pageSignature: string;
+  repeatPlan: RepeatableRecordPlan;
+  checkedIndexes?: number[];
   ai: {
     configured: boolean;
     mode: 'enhanced' | 'fallback';
     attempted: boolean;
+    cached?: boolean;
     reviewed: number;
     error: string;
   };
+}
+
+interface CurrentPageAnalysisResponse {
+  ok: true;
+  type: 'pageAnalysis';
+  analysis: ApplicationPageAnalysis | null;
+  currentPageKey: string;
 }
 
 interface ErrorResponse {
@@ -114,6 +129,7 @@ const previewedMaterialByField = new Map<number, number>();
 let lastFillIncludedFiles = false;
 let applicationTasks: ApplicationTask[] = [];
 let currentTaskId: string | undefined;
+let currentScan: ScanResponse | null = null;
 
 function sendRuntimeMessage<T>(message: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -137,11 +153,13 @@ async function init() {
 
   renderHeader();
 
+  let restoredScan: ScanResponse | null = null;
   try {
-    const [inspected, autoStatus, taskListResponse] = await Promise.all([
-      sendRuntimeMessage<InspectResponse | ErrorResponse>({ type: 'inspectPage' }),
+    const inspected = await sendRuntimeMessage<InspectResponse | ErrorResponse>({ type: 'inspectPage' });
+    const [autoStatus, taskListResponse, pageAnalysisResponse] = await Promise.all([
       sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'getAutoRunStatus' }),
       sendRuntimeMessage<ApplicationTaskListResponse | ErrorResponse>({ type: 'listApplicationTasks' }),
+      sendRuntimeMessage<CurrentPageAnalysisResponse | ErrorResponse>({ type: 'getCurrentPageAnalysis' }),
     ]);
     pageStatus = inspected.ok ? inspected as InspectResponse : null;
     autoRunStatus = autoStatus.ok ? autoStatus as AutoRunResponse : null;
@@ -149,12 +167,35 @@ async function init() {
       applicationTasks = taskListResponse.tasks;
       currentTaskId = taskListResponse.currentTaskId;
     }
+    if (pageAnalysisResponse.ok && pageAnalysisResponse.analysis &&
+        pageAnalysisResponse.currentPageKey === pageAnalysisResponse.analysis.pageKey) {
+      const analysis = pageAnalysisResponse.analysis;
+      restoredScan = {
+        ok: true,
+        type: 'scan',
+        total: analysis.fields.length,
+        matched: analysis.matches.length,
+        fields: analysis.fields,
+        matches: analysis.matches,
+        pageLabel: analysis.pageLabel,
+        pageUrl: analysis.pageUrl,
+        pageSignature: analysis.pageSignature,
+        repeatPlan: analysis.repeatPlan,
+        checkedIndexes: analysis.checkedIndexes,
+        ai: analysis.ai,
+      };
+    }
   } catch {
     pageStatus = null;
     autoRunStatus = null;
   }
 
   const hasMaterials = fileRecords.length > 0;
+  if (restoredScan) {
+    renderResult(restoredScan);
+    return;
+  }
+
   if (profileValues.length === 0 && !hasMaterials) {
     renderNotConfigured(true);
     return;
@@ -471,6 +512,9 @@ function buildDisplayItems(scanResp: ScanResponse): DisplayItem[] {
   }
 
   const fieldByIndex = new Map(scanResp.fields.map((f) => [f.index, f]));
+  const restoredCheckedIndexes = scanResp.checkedIndexes == null
+    ? null
+    : new Set(scanResp.checkedIndexes);
   const items: DisplayItem[] = [];
 
   for (const m of scanResp.matches) {
@@ -498,7 +542,11 @@ function buildDisplayItems(scanResp: ScanResponse): DisplayItem[] {
         : (isFile ? 'pending' : (isLong ? 'matched' : (m.confidence === 'high' ? 'matched' : 'pending'))),
       confidence: isLong ? undefined : m.confidence,
       fillMode,
-      checked: pageFilled ? false : (isFile ? false : (isLong ? true : (m.confidence !== 'low'))),
+      checked: pageFilled
+        ? false
+        : restoredCheckedIndexes
+          ? restoredCheckedIndexes.has(m.index)
+          : (isFile ? false : (isLong ? true : (m.confidence !== 'low'))),
       match: m,
     });
   }
@@ -558,12 +606,30 @@ function markerForItem(item: DisplayItem): { index: number; fingerprint?: string
   return null;
 }
 
-function syncPageMarkers(): void {
-  const items = displayItems.flatMap((item) => {
+function getDisplayMarkers(): Array<{ index: number; fingerprint?: string; status: 'verified' | 'review' | 'mismatch'; message: string }> {
+  return displayItems.flatMap((item) => {
     const marker = markerForItem(item);
     return marker ? [marker] : [];
   });
+}
+
+function persistCurrentPageAnalysis(): void {
+  if (!currentScan) return;
+  void sendRuntimeMessage({
+    type: 'savePageAnalysis',
+    payload: {
+      scan: currentScan,
+      markers: getDisplayMarkers(),
+      checkedIndexes: displayItems.filter((item) => item.checked).map((item) => item.index),
+      repeatPlan: currentScan.repeatPlan,
+    },
+  }).catch(() => undefined);
+}
+
+function syncPageMarkers(): void {
+  const items = getDisplayMarkers();
   void sendRuntimeMessage({ type: 'markPageFields', payload: { items } }).catch(() => undefined);
+  persistCurrentPageAnalysis();
 }
 
 function locatePageField(index: number): void {
@@ -649,6 +715,7 @@ function previewMaterial(
 
 function renderResult(scanResp: ScanResponse) {
   viewState = 'result';
+  currentScan = scanResp;
   fields = scanResp.fields;
   displayItems = buildDisplayItems(scanResp);
 
@@ -779,6 +846,7 @@ function renderResult(scanResp: ScanResponse) {
       const item = displayItems.find((i) => i.index === idx);
       if (item) item.checked = cb.checked;
       updateFooterButton();
+      persistCurrentPageAnalysis();
     });
   });
 
@@ -798,6 +866,7 @@ function renderResult(scanResp: ScanResponse) {
       const preview = select.closest('.material-match-value')?.querySelector<HTMLButtonElement>('.material-preview-btn');
       if (preview) preview.dataset.fileId = String(candidate.fileRecordId);
       refreshMaterialRow(item.index);
+      persistCurrentPageAnalysis();
     });
   });
 
@@ -883,6 +952,7 @@ function applyFillPolicy(policy: string): void {
     if (checkbox) checkbox.checked = item.checked;
   });
   updateFooterButton();
+  persistCurrentPageAnalysis();
 }
 
 function escapeHtml(text: string): string {

@@ -28,6 +28,7 @@ import {
   updateApplicationTask,
   updateTaskFromAutoRun,
   upsertTaskPage,
+  upsertTaskPageAnalysis,
 } from '@/utils/application-tasks';
 import type {
   ApplicationTask,
@@ -39,8 +40,12 @@ import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
 import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
 import { canonicalPageUrl, semanticPageKey } from '@/utils/page-identity';
+import { shouldReusePageAnalysis } from '@/utils/page-analysis';
+import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
 import {
+  planRepeatableRecords,
   prepareRepeatableRowScan,
+  type RepeatableRecordPlan,
   type PrepareRepeatRowsResult,
 } from '@/utils/repeatable-records';
 
@@ -66,6 +71,13 @@ interface MessageMap {
   stopAutoRun: undefined;
   confirmMaterialsAndResume: undefined;
   getCurrentApplicationTask: undefined;
+  getCurrentPageAnalysis: undefined;
+  savePageAnalysis: {
+    scan: ScanSuccessResponse;
+    markers: PageMarkerItem[];
+    checkedIndexes: number[];
+    repeatPlan: RepeatableRecordPlan;
+  };
   listApplicationTasks: undefined;
   archiveApplicationTask: { taskId: string };
   openAuditCenter: undefined;
@@ -99,6 +111,7 @@ interface ScanSuccessResponse {
   pageUrl: string;
   pageSignature: string;
   repeatRowPreparation: PrepareRepeatRowsResult;
+  repeatPlan: RepeatableRecordPlan;
   ai: {
     configured: boolean;
     mode: 'enhanced' | 'fallback';
@@ -175,6 +188,13 @@ interface ApplicationTaskSuccessResponse {
   task: ApplicationTask | null;
 }
 
+interface PageAnalysisSuccessResponse {
+  ok: true;
+  type: 'pageAnalysis';
+  analysis: ApplicationPageAnalysis | null;
+  currentPageKey: string;
+}
+
 interface ApplicationTaskListSuccessResponse {
   ok: true;
   type: 'applicationTasks';
@@ -200,7 +220,7 @@ interface FinalAuditSuccessResponse {
   degradedReason?: string;
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | PageAnalysisSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
   | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
@@ -469,6 +489,112 @@ async function persistScanSnapshot(state: AutoRunState, scan: ScanSuccessRespons
     websiteMaterials: auditSnapshot?.websiteMaterials ?? [],
   });
   await updateApplicationTask(state.taskId, (task) => upsertTaskPage(task, snapshot));
+}
+
+async function savePageAnalysis(
+  taskId: string,
+  scan: ScanSuccessResponse,
+  markers: PageMarkerItem[],
+  checkedIndexes: number[],
+  repeatPlan: RepeatableRecordPlan,
+): Promise<void> {
+  const pageKey = semanticPageKey({
+    url: scan.pageUrl,
+    label: scan.pageLabel,
+    signature: scan.pageSignature,
+  });
+  if (!pageKey) return;
+  await updateApplicationTask(taskId, (task) => upsertTaskPageAnalysis(task, {
+    pageKey,
+    pageLabel: scan.pageLabel,
+    pageUrl: scan.pageUrl,
+    pageSignature: scan.pageSignature,
+    fields: scan.fields,
+    matches: scan.matches,
+    markers,
+    checkedIndexes,
+    repeatPlan,
+    ai: scan.ai,
+    capturedAt: Date.now(),
+  }));
+}
+
+async function restoreAnalysisToTab(tabId: number, analysis: ApplicationPageAnalysis): Promise<boolean> {
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
+    tabId,
+    { type: 'getPageMeta' },
+  );
+  if (semanticPageKey(meta) !== analysis.pageKey) return false;
+  await sendToContentScript(tabId, { type: 'markPreview', items: analysis.markers });
+  return true;
+}
+
+async function restoreCachedAnalysisForTab(tabId: number): Promise<boolean> {
+  const taskId = await getBoundTaskId(tabId);
+  if (!taskId) return false;
+  const task = await getApplicationTask(taskId);
+  if (!task) return false;
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
+    tabId,
+    { type: 'getPageMeta' },
+  );
+  const analysis = task.pageAnalyses?.[semanticPageKey(meta)];
+  if (!analysis || !shouldReusePageAnalysis(analysis, meta)) return false;
+  return restoreAnalysisToTab(tabId, analysis);
+}
+
+function defaultCheckedIndexes(scan: ScanSuccessResponse): number[] {
+  const fieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
+  return scan.matches.flatMap((match) => {
+    const field = fieldByIndex.get(match.index);
+    if (!field || match.kind === 'file' || isMeaningfullyFilled(field)) return [];
+    return match.confidence === 'low' && (match.fillMode ?? field.fillMode) !== 'long' ? [] : [match.index];
+  });
+}
+
+async function refreshAnalysisFromTab(
+  tabId: number,
+  analysis: ApplicationPageAnalysis,
+): Promise<ApplicationPageAnalysis> {
+  const scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
+    tabId,
+    { type: 'scan' },
+  ).catch(() => []);
+  const currentFields = scanResults.map((result) => ({ ...result.field, index: result.index }));
+  if (currentFields.length === 0) return analysis;
+
+  const currentByFingerprint = new Map<string, FormFieldInfo[]>();
+  for (const field of currentFields) {
+    const fingerprint = fieldFingerprint(field);
+    const candidates = currentByFingerprint.get(fingerprint) ?? [];
+    candidates.push(field);
+    currentByFingerprint.set(fingerprint, candidates);
+  }
+  const indexMap = new Map<number, number>();
+  for (const savedField of analysis.fields) {
+    const candidates = currentByFingerprint.get(fieldFingerprint(savedField)) ?? [];
+    const sameIndex = candidates.findIndex((candidate) => candidate.index === savedField.index);
+    const current = sameIndex >= 0 ? candidates.splice(sameIndex, 1)[0] : candidates.shift();
+    if (current) indexMap.set(savedField.index, current.index);
+  }
+  const matches = analysis.matches.flatMap((match) => {
+    const index = indexMap.get(match.index);
+    return index == null ? [] : [{ ...match, index }];
+  });
+  const markers = analysis.markers.flatMap((marker) => {
+    const index = indexMap.get(marker.index);
+    return index == null ? [] : [{ ...marker, index }];
+  });
+  return {
+    ...analysis,
+    fields: currentFields,
+    matches,
+    markers,
+    checkedIndexes: analysis.checkedIndexes.flatMap((index) => {
+      const currentIndex = indexMap.get(index);
+      return currentIndex == null ? [] : [currentIndex];
+    }),
+  };
 }
 
 function autoRunResponse(state: AutoRunState): AutoRunSuccessResponse {
@@ -900,7 +1026,12 @@ export default defineBackground(() => {
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.status !== 'complete' && !changeInfo.url) return;
-    setTimeout(() => { void restorePageMarkers(tabId, changeInfo.url ?? tab.url); }, 300);
+    setTimeout(() => {
+      void Promise.all([
+        restorePageMarkers(tabId, changeInfo.url ?? tab.url),
+        restoreCachedAnalysisForTab(tabId).catch(() => false),
+      ]);
+    }, 300);
     void getAutoRunState(tabId).then((state) => {
       if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);
     });
@@ -990,6 +1121,12 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'getCurrentApplicationTask') {
     return handleGetCurrentApplicationTask();
   }
+  if (request.type === 'getCurrentPageAnalysis') {
+    return handleGetCurrentPageAnalysis();
+  }
+  if (request.type === 'savePageAnalysis') {
+    return handleSavePageAnalysis(request.payload!);
+  }
   if (request.type === 'listApplicationTasks') {
     return handleListApplicationTasks();
   }
@@ -1021,6 +1158,46 @@ async function handleGetCurrentApplicationTask(): Promise<Response> {
     currentTaskId,
     task: currentTaskId ? await getApplicationTask(currentTaskId) : null,
   };
+}
+
+async function handleGetCurrentPageAnalysis(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
+    tab.id,
+    { type: 'getPageMeta' },
+  );
+  const currentPageKey = semanticPageKey(meta);
+  const taskId = await getBoundTaskId(tab.id);
+  const task = taskId ? await getApplicationTask(taskId) : null;
+  const cached = task?.pageAnalyses?.[currentPageKey] ?? null;
+  if (!cached || !shouldReusePageAnalysis(cached, meta)) {
+    return { ok: true, type: 'pageAnalysis', analysis: null, currentPageKey };
+  }
+  const analysis = await refreshAnalysisFromTab(tab.id, cached);
+  await restoreAnalysisToTab(tab.id, analysis).catch(() => false);
+  return { ok: true, type: 'pageAnalysis', analysis, currentPageKey };
+}
+
+async function handleSavePageAnalysis(
+  payload: MessageMap['savePageAnalysis'],
+): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
+    tab.id,
+    { type: 'getPageMeta' },
+  );
+  if (semanticPageKey(meta) !== semanticPageKey({
+    url: payload.scan.pageUrl,
+    label: payload.scan.pageLabel,
+    signature: payload.scan.pageSignature,
+  })) {
+    return errorResponse('The page changed before its analysis could be saved');
+  }
+  const task = await ensureTaskForTab(tab);
+  await savePageAnalysis(task.id, payload.scan, payload.markers, payload.checkedIndexes, payload.repeatPlan);
+  return { ok: true, type: 'pageAction' };
 }
 
 async function handleListApplicationTasks(): Promise<Response> {
@@ -1227,6 +1404,7 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     { type: 'getPageMeta' },
   );
   if (!scanResults?.length) {
+    const repeatPlan = planRepeatableRecords([], blocks, textFields);
     return {
       ok: true,
       type: 'scan',
@@ -1238,6 +1416,7 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
       pageUrl: pageMeta?.url || '',
       pageSignature: pageMeta?.signature || pageMeta?.url || '',
       repeatRowPreparation,
+      repeatPlan,
       ai: {
         configured: textApiReady,
         mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
@@ -1250,6 +1429,7 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
   }
 
   const fieldInfos = scanResults.map((result) => ({ ...result.field, index: result.index }));
+  const repeatPlan = planRepeatableRecords(fieldInfos, blocks, textFields);
   const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
   const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
   const aiFields = apiConfig.aiEnhanced
@@ -1331,6 +1511,7 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     pageUrl: pageMeta?.url || '',
     pageSignature: pageMeta?.signature || pageMeta?.url || '',
     repeatRowPreparation,
+    repeatPlan,
     ai: {
       configured: textApiReady,
       mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
@@ -1345,7 +1526,16 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
 async function handleScan(): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
-  return collectTabScan(tab.id);
+  const scan = await collectTabScan(tab.id);
+  const task = await ensureTaskForTab(tab);
+  await savePageAnalysis(
+    task.id,
+    scan,
+    buildPageMarkers(scan),
+    defaultCheckedIndexes(scan),
+    scan.repeatPlan,
+  );
+  return scan;
 }
 
 async function resolveContentFillItems(matches: MatchResult[]): Promise<ContentFillItem[]> {
@@ -1534,7 +1724,13 @@ async function processAutoRun(tabId: number): Promise<void> {
       message: '页面已扫描并标色',
       updatedAt: Date.now(),
     });
-    await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
+    await Promise.all([
+      saveAutoRunState(state),
+      persistScanSnapshot(state, scan),
+      state.taskId
+        ? savePageAnalysis(state.taskId, scan, markers, defaultCheckedIndexes(scan), scan.repeatPlan)
+        : Promise.resolve(),
+    ]);
     if (scan.repeatRowPreparation.failures.length > 0) {
       state.status = 'paused';
       state.pauseReason = 'required';
@@ -1621,6 +1817,15 @@ async function processAutoRun(tabId: number): Promise<void> {
       }, afterMarkers),
       sendToContentScript(tabId, { type: 'markPreview', items: afterMarkers }).catch(() => undefined),
       persistScanSnapshot(state, { ...scan, fields: afterFields }),
+      state.taskId
+        ? savePageAnalysis(
+            state.taskId,
+            { ...scan, fields: afterFields },
+            afterMarkers,
+            defaultCheckedIndexes({ ...scan, fields: afterFields }),
+            scan.repeatPlan,
+          )
+        : Promise.resolve(),
     ]);
     historyEntry.verified = afterMarkers.filter((marker) => marker.status === 'verified').length;
     historyEntry.conflicts = afterMarkers.filter((marker) => marker.status === 'mismatch').length;

@@ -4,6 +4,7 @@ import type {
   ApplicationTaskHistoryEntry,
   ApplicationTaskPauseReason,
 } from './application-tasks';
+import { semanticPageKey } from './page-identity';
 
 export type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 
@@ -45,4 +46,12 @@ export interface ApplicationRunnerCheckpoint {
   confirmedMaterialPageKey?: string;
   resumeAfter?: number;
   updatedAt: number;
+}
+
+export function shouldReusePageAnalysis(
+  analysis: ApplicationPageAnalysis | null | undefined,
+  current: { url?: string; label?: string; signature?: string },
+): boolean {
+  if (!analysis) return false;
+  return semanticPageKey(current) === analysis.pageKey;
 }

@@ -4,7 +4,9 @@ import {
   getTaskPageAnalysis,
   upsertTaskPageAnalysis,
 } from '../utils/application-tasks';
+import { shouldReusePageAnalysis } from '../utils/page-analysis';
 import type { ApplicationPageAnalysis } from '../utils/page-analysis';
+import { semanticPageKey } from '../utils/page-identity';
 
 const analysis = (pageKey: string, capturedAt: number): ApplicationPageAnalysis => ({
   pageKey,
@@ -58,5 +60,25 @@ const previous = task;
 const updated = upsertTaskPageAnalysis(task, analysis('page-30', 40));
 assert.equal(updated.pageAnalyses?.['page-30'].capturedAt, 40);
 assert.equal(previous.pageAnalyses?.['page-30'].capturedAt, 30, 'upsert must not mutate the prior analysis');
+
+const cachedDraft = analysis('page-cache', 50);
+const cached = {
+  ...cachedDraft,
+  pageKey: semanticPageKey({
+    url: cachedDraft.pageUrl,
+    label: cachedDraft.pageLabel,
+    signature: cachedDraft.pageSignature,
+  }),
+};
+assert.equal(shouldReusePageAnalysis(cached, {
+  url: cached.pageUrl,
+  label: cached.pageLabel,
+  signature: cached.pageSignature,
+}), true);
+assert.equal(shouldReusePageAnalysis(cached, {
+  url: cached.pageUrl,
+  label: cached.pageLabel,
+  signature: 'different-dom-signature',
+}), false);
 
 console.log('page analysis recovery tests passed');
