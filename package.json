@@ -16,6 +16,7 @@
     "test:profile": "node scripts/test-profile-data.mjs",
     "test:local-matcher": "tsx scripts/test-local-matcher.ts",
     "test:tasks": "tsx scripts/test-application-tasks.ts",
+    "test:audit": "tsx scripts/test-final-audit.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {
