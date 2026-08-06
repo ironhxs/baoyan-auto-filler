@@ -55,6 +55,11 @@ const snapshot = buildPageSnapshot({
   capturedAt: 500,
   fields,
   matches,
+  websiteMaterials: [{
+    url: 'https://a.example/files/transcript.pdf',
+    filename: '已上传成绩单.pdf',
+    label: '本科成绩单',
+  }],
 });
 assert.equal(snapshot.fields.length, 3, 'hidden security and password fields must be removed');
 assert.deepEqual(snapshot.fields.map((item) => item.label), ['姓名', '联系电话', '备注']);
@@ -63,6 +68,10 @@ assert.equal(snapshot.fields[1].status, 'mismatch');
 assert.equal(snapshot.fields[2].status, 'protected');
 assert.equal(snapshot.fields[1].expectedValue, '13800000000');
 assert.equal(JSON.stringify(snapshot).includes('secret-token'), false);
+assert.equal(snapshot.materials.length, 1);
+assert.equal(snapshot.materials[0].source, 'website');
+assert.equal(snapshot.materials[0].downloadUrl, 'https://a.example/files/transcript.pdf');
+assert.equal(snapshot.materials[0].fieldLabel, '本科成绩单');
 
 const task: ApplicationTask = {
   id: 'task-a',

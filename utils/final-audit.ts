@@ -69,6 +69,13 @@ export interface BuildPageSnapshotInput {
   capturedAt: number;
   fields: FormFieldInfo[];
   matches: MatchResult[];
+  websiteMaterials?: WebsiteMaterialCandidate[];
+}
+
+export interface WebsiteMaterialCandidate {
+  url: string;
+  filename: string;
+  label: string;
 }
 
 const SENSITIVE_FIELD_PATTERN = /(?:password|passwd|pwd|captcha|验证码|校验码|csrf|xsrf|auth(?:orization)?|access[_-]?token|refresh[_-]?token|session|cookie|会话)/i;
@@ -156,7 +163,7 @@ export function buildPageSnapshot(input: BuildPageSnapshotInput): ApplicationPag
   const safeFields = input.fields.filter((field) => !isSensitiveAuditField(field));
   const fieldSnapshots = safeFields.map((field) => buildFieldSnapshot(field, matchByIndex.get(field.index)));
   const fieldByIndex = new Map(safeFields.map((field) => [field.index, field]));
-  const materials = input.matches.flatMap((match) => {
+  const matchedMaterials = input.matches.flatMap((match) => {
     const field = fieldByIndex.get(match.index);
     if (!field || (match.kind !== 'file' && field.kind !== 'file')) return [];
     const fingerprint = fieldFingerprint(field);
@@ -173,6 +180,28 @@ export function buildPageSnapshot(input: BuildPageSnapshotInput): ApplicationPag
       status: field.hasExistingFile || Boolean(field.value) ? 'existing' as const : 'selected' as const,
     }];
   });
+  const websiteMaterials = (input.websiteMaterials ?? []).flatMap((candidate) => {
+    let url: URL;
+    try {
+      url = new URL(candidate.url, input.pageUrl);
+      if (url.origin !== new URL(input.pageUrl).origin || !/^https?:$/.test(url.protocol)) return [];
+    } catch {
+      return [];
+    }
+    const filename = candidate.filename.trim() || decodeURIComponent(url.pathname.split('/').pop() || '') || candidate.label;
+    const label = candidate.label.trim() || filename || '网站材料';
+    return [{
+      id: `material-${stableHash(`website:${url.href}:${label}`)}`,
+      fieldFingerprint: `website:${stableHash(label)}`,
+      fieldLabel: label,
+      source: 'website' as const,
+      filename,
+      downloadUrl: url.href,
+      websiteDisplay: filename,
+      status: 'existing' as const,
+    }];
+  });
+  const materialById = new Map([...matchedMaterials, ...websiteMaterials].map((material) => [material.id, material]));
   return {
     id: `page-${stableHash(input.pageKey)}`,
     key: input.pageKey,
@@ -181,7 +210,7 @@ export function buildPageSnapshot(input: BuildPageSnapshotInput): ApplicationPag
     signature: input.pageSignature,
     capturedAt: input.capturedAt,
     fields: fieldSnapshots,
-    materials,
+    materials: [...materialById.values()],
   };
 }
 
@@ -299,4 +328,3 @@ export function parseFinalAuditReport(raw: string): FinalAuditReport {
     confirmed,
   };
 }
-

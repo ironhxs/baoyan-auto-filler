@@ -26,6 +26,15 @@
         <input class="hidden-file" id="languageProof" type="file" accept="application/pdf,.pdf" required />
       </label>
     </div>
+    <div class="field">
+      <span>已上传本科成绩单</span>
+      <a href="./fixtures/transcript.pdf" download>下载已上传成绩单</a>
+    </div>
+    <a href="https://cross-origin.example/private.pdf">跨域材料不得采集</a>
+    <a href="./fixtures/hidden.pdf" style="display: none">隐藏材料不得采集</a>
+    <input type="hidden" name="_csrf" value="fixture-secret" />
+    <input type="text" name="captchaToken" value="fixture-captcha" />
+    <input type="password" name="password" value="fixture-password" />
   </main>
 </body>
 </html>

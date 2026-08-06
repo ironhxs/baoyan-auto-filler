@@ -1,4 +1,6 @@
 import { fieldFingerprint } from '@/utils/field-fingerprint';
+import { isSensitiveAuditField } from '@/utils/final-audit';
+import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 
 interface FormField {
   kind: 'text' | 'file';
@@ -75,7 +77,8 @@ interface MarkPreviewMessage {
 }
 interface FocusFieldMessage { type: 'focusField'; index: number }
 interface GetPageMetaMessage { type: 'getPageMeta' }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | GetPageMetaMessage;
+interface GetAuditPageSnapshotMessage { type: 'getAuditPageSnapshot' }
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -144,6 +147,41 @@ function isVisible(el: HTMLElement): boolean {
     return false;
   }
   return el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0;
+}
+
+function discoverVisibleWebsiteMaterials(): WebsiteMaterialCandidate[] {
+  const currentOrigin = location.origin;
+  const candidates = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]')).flatMap((link) => {
+    if (!isVisible(link)) return [];
+    let url: URL;
+    try {
+      url = new URL(link.href, location.href);
+    } catch {
+      return [];
+    }
+    if (url.origin !== currentOrigin || !/^https?:$/.test(url.protocol)) return [];
+    const text = normalizeText([link.textContent, link.title, link.getAttribute('aria-label')].filter(Boolean).join(' '));
+    const filename = decodeURIComponent(url.pathname.split('/').pop() || '');
+    const looksLikeFile = Boolean(link.download)
+      || /\.(?:pdf|png|jpe?g|webp|docx?|xlsx?)(?:$|[?#])/i.test(url.href)
+      || /下载|预览|查看|附件|材料|证明|证书|成绩单|申请表/i.test(`${text} ${filename}`);
+    if (!looksLikeFile) return [];
+    return [{
+      url: url.href,
+      filename: link.download || filename || text,
+      label: text || filename || '网站材料',
+    }];
+  });
+  return [...new Map(candidates.map((candidate) => [candidate.url, candidate])).values()];
+}
+
+function getAuditPageSnapshot() {
+  const meta = getPageMeta();
+  return {
+    ...meta,
+    fields: scanFields().filter((result) => !isSensitiveAuditField(result.field)),
+    websiteMaterials: discoverVisibleWebsiteMaterials(),
+  };
 }
 
 function hasVisibleFileTrigger(input: HTMLInputElement): boolean {
@@ -1228,6 +1266,8 @@ export default defineContentScript({
           sendResponse(results);
         } else if (message.type === 'getPageMeta') {
           sendResponse(getPageMeta());
+        } else if (message.type === 'getAuditPageSnapshot') {
+          sendResponse(getAuditPageSnapshot());
         } else if (message.type === 'prepareRepeatRows') {
           prepareRepeatRows(message.targets)
             .then((added) => sendResponse({ ok: true, added }))

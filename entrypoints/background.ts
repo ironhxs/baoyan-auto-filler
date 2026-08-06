@@ -13,6 +13,29 @@ import { flattenProfileValues, getBlockSection, inferLanguageItems } from '@/uti
 import { adaptValueToField, getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
 import { fieldFingerprint } from '@/utils/field-fingerprint';
+import { aiRequestQueue } from '@/utils/ai-request-queue';
+import {
+  APPLICATION_TASK_BINDINGS_KEY,
+  archiveApplicationTask,
+  bindTaskToTab,
+  createApplicationBatchId,
+  createApplicationTask,
+  createApplicationTaskId,
+  getApplicationTask,
+  getApplicationTasks,
+  saveApplicationTask,
+  unbindTaskFromTab,
+  updateApplicationTask,
+  updateTaskFromAutoRun,
+  upsertTaskPage,
+} from '@/utils/application-tasks';
+import type {
+  ApplicationTask,
+  ApplicationTaskBindings,
+  ApplicationTaskPauseReason,
+} from '@/utils/application-tasks';
+import { buildPageSnapshot } from '@/utils/final-audit';
+import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 
 type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 interface PageMarkerItem {
@@ -35,6 +58,10 @@ interface MessageMap {
   getAutoRunStatus: undefined;
   stopAutoRun: undefined;
   confirmMaterialsAndResume: undefined;
+  getCurrentApplicationTask: undefined;
+  listApplicationTasks: undefined;
+  archiveApplicationTask: { taskId: string };
+  openAuditCenter: undefined;
 }
 
 type MessageType = keyof MessageMap;
@@ -113,6 +140,8 @@ interface AutoRunHistoryEntry {
 
 interface AutoRunState {
   tabId: number;
+  taskId?: string;
+  batchId?: string;
   status: AutoRunStatus;
   pageCount: number;
   filledCount: number;
@@ -128,7 +157,21 @@ interface AutoRunSuccessResponse extends AutoRunState {
   type: 'autoRun';
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ErrorResponse;
+interface ApplicationTaskSuccessResponse {
+  ok: true;
+  type: 'applicationTask';
+  currentTaskId?: string;
+  task: ApplicationTask | null;
+}
+
+interface ApplicationTaskListSuccessResponse {
+  ok: true;
+  type: 'applicationTasks';
+  currentTaskId?: string;
+  tasks: ApplicationTask[];
+}
+
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | ApplicationTaskListSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
   | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
@@ -298,6 +341,67 @@ async function getCurrentTab(): Promise<chrome.tabs.Tab | undefined> {
   return tab;
 }
 
+async function getTaskBindings(): Promise<ApplicationTaskBindings> {
+  const result = await chrome.storage.session.get(APPLICATION_TASK_BINDINGS_KEY);
+  const stored = result[APPLICATION_TASK_BINDINGS_KEY];
+  return stored && typeof stored === 'object' ? stored as ApplicationTaskBindings : {};
+}
+
+async function getBoundTaskId(tabId: number): Promise<string | undefined> {
+  return (await getTaskBindings())[String(tabId)];
+}
+
+async function setTaskBinding(tabId: number, taskId: string): Promise<void> {
+  const next = bindTaskToTab(await getTaskBindings(), tabId, taskId);
+  await chrome.storage.session.set({ [APPLICATION_TASK_BINDINGS_KEY]: next });
+}
+
+async function removeTaskBinding(tabId: number): Promise<void> {
+  const next = unbindTaskFromTab(await getTaskBindings(), tabId);
+  await chrome.storage.session.set({ [APPLICATION_TASK_BINDINGS_KEY]: next });
+}
+
+function siteIdentity(tab: chrome.tabs.Tab): { origin: string; title: string; url: string } {
+  const url = tab.url ?? '';
+  try {
+    const parsed = new URL(url);
+    return {
+      origin: parsed.origin,
+      title: tab.title?.trim() || parsed.hostname,
+      url,
+    };
+  } catch {
+    return { origin: url || 'unknown-site', title: tab.title?.trim() || '当前网站', url };
+  }
+}
+
+async function ensureTaskForTab(tab: chrome.tabs.Tab, preferredTaskId?: string): Promise<ApplicationTask> {
+  if (tab.id == null) throw new Error('No active tab found');
+  const boundTaskId = await getBoundTaskId(tab.id);
+  const existingTaskId = preferredTaskId || boundTaskId;
+  if (existingTaskId) {
+    const existing = await getApplicationTask(existingTaskId);
+    if (existing && existing.status !== 'archived') {
+      const now = Date.now();
+      const refreshed = { ...existing, lastOpenedAt: now, updatedAt: Math.max(existing.updatedAt, now) };
+      await Promise.all([saveApplicationTask(refreshed), setTaskBinding(tab.id, refreshed.id)]);
+      return refreshed;
+    }
+  }
+  const identity = siteIdentity(tab);
+  const now = Date.now();
+  const created = createApplicationTask({
+    id: createApplicationTaskId(),
+    batchId: createApplicationBatchId(new Date(now)),
+    siteOrigin: identity.origin,
+    siteTitle: identity.title,
+    initialUrl: identity.url,
+    now,
+  });
+  await Promise.all([saveApplicationTask(created), setTaskBinding(tab.id, created.id)]);
+  return created;
+}
+
 function autoRunKey(tabId: number): string {
   return `autoRun:${tabId}`;
 }
@@ -325,10 +429,40 @@ async function getAutoRunState(tabId: number): Promise<AutoRunState | null> {
 async function saveAutoRunState(state: AutoRunState): Promise<void> {
   state.updatedAt = Date.now();
   await chrome.storage.session.set({ [autoRunKey(state.tabId)]: state });
+  if (state.taskId) {
+    await updateApplicationTask(state.taskId, (task) => updateTaskFromAutoRun(task, {
+      status: state.status,
+      pauseReason: state.pauseReason as ApplicationTaskPauseReason | undefined,
+      pageCount: state.pageCount,
+      filledCount: state.filledCount,
+      message: state.message,
+      history: state.history,
+      updatedAt: state.updatedAt,
+    }));
+  }
   const badge = state.status === 'running' ? '…' : state.status === 'paused' ? '!' : state.status === 'complete' ? '✓' : '';
   const color = state.status === 'paused' ? '#f59e0b' : state.status === 'complete' ? '#22c55e' : '#257ffd';
   await chrome.action.setBadgeBackgroundColor({ tabId: state.tabId, color }).catch(() => undefined);
   await chrome.action.setBadgeText({ tabId: state.tabId, text: badge }).catch(() => undefined);
+}
+
+async function persistScanSnapshot(state: AutoRunState, scan: ScanSuccessResponse): Promise<void> {
+  if (!state.taskId) return;
+  const auditSnapshot = await sendToContentScript<{
+    fields: Array<{ index: number; field: FormFieldInfo }>;
+    websiteMaterials: WebsiteMaterialCandidate[];
+  }>(state.tabId, { type: 'getAuditPageSnapshot' }).catch(() => null);
+  const snapshot = buildPageSnapshot({
+    pageKey: pageKey(scan.pageUrl),
+    pageLabel: scan.pageLabel,
+    pageUrl: scan.pageUrl,
+    pageSignature: scan.pageSignature,
+    capturedAt: Date.now(),
+    fields: auditSnapshot?.fields.map((result) => ({ ...result.field, index: result.index })) ?? scan.fields,
+    matches: scan.matches,
+    websiteMaterials: auditSnapshot?.websiteMaterials ?? [],
+  });
+  await updateApplicationTask(state.taskId, (task) => upsertTaskPage(task, snapshot));
 }
 
 function autoRunResponse(state: AutoRunState): AutoRunSuccessResponse {
@@ -696,7 +830,7 @@ ${localMatches.map((match) => {
   }).join('\n')}`;
 
   try {
-    const content = await requestModelText(apiConfig, prompt);
+    const content = await aiRequestQueue.run(() => requestModelText(apiConfig, prompt));
     const json = content.match(/\[[\s\S]*\]/)?.[0];
     if (!json) throw new Error('材料匹配响应不是有效 JSON 数组');
     const choices = JSON.parse(json) as Array<{ index?: unknown; fileRecordId?: unknown; confidence?: unknown }>;
@@ -756,7 +890,23 @@ export default defineBackground(() => {
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     autoRunInFlight.delete(tabId);
-    void chrome.storage.session.remove([autoRunKey(tabId), markerStoreKey(tabId)]);
+    void getAutoRunState(tabId).then(async (state) => {
+      if (state?.taskId && state.status === 'running') {
+        await updateApplicationTask(state.taskId, (task) => updateTaskFromAutoRun(task, {
+          status: 'paused',
+          pauseReason: 'page',
+          pageCount: state.pageCount,
+          filledCount: state.filledCount,
+          message: '网站标签页已关闭，任务记录已保留',
+          history: state.history,
+          updatedAt: Date.now(),
+        }));
+      }
+      await Promise.all([
+        removeTaskBinding(tabId),
+        chrome.storage.session.remove([autoRunKey(tabId), markerStoreKey(tabId)]),
+      ]);
+    });
   });
 
 });
@@ -819,7 +969,52 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'confirmMaterialsAndResume') {
     return handleConfirmMaterialsAndResume();
   }
+  if (request.type === 'getCurrentApplicationTask') {
+    return handleGetCurrentApplicationTask();
+  }
+  if (request.type === 'listApplicationTasks') {
+    return handleListApplicationTasks();
+  }
+  if (request.type === 'archiveApplicationTask') {
+    return handleArchiveApplicationTask(request.payload!.taskId);
+  }
+  if (request.type === 'openAuditCenter') {
+    return handleOpenAuditCenter();
+  }
   return errorResponse('Unknown message type');
+}
+
+async function handleGetCurrentApplicationTask(): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const currentTaskId = await getBoundTaskId(tab.id);
+  return {
+    ok: true,
+    type: 'applicationTask',
+    currentTaskId,
+    task: currentTaskId ? await getApplicationTask(currentTaskId) : null,
+  };
+}
+
+async function handleListApplicationTasks(): Promise<Response> {
+  const tab = await getCurrentTab();
+  const currentTaskId = tab?.id == null ? undefined : await getBoundTaskId(tab.id);
+  return {
+    ok: true,
+    type: 'applicationTasks',
+    currentTaskId,
+    tasks: await getApplicationTasks(),
+  };
+}
+
+async function handleArchiveApplicationTask(taskId: string): Promise<Response> {
+  const task = await archiveApplicationTask(taskId);
+  return { ok: true, type: 'applicationTask', task };
+}
+
+async function handleOpenAuditCenter(): Promise<Response> {
+  await chrome.tabs.create({ url: chrome.runtime.getURL('/audit.html') });
+  return { ok: true, type: 'pageAction' };
 }
 
 async function handleInspectPage(): Promise<Response> {
@@ -870,14 +1065,18 @@ async function handleGetAutoRunStatus(): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
   const state = await getAutoRunState(tab.id);
+  const taskId = state?.taskId ?? await getBoundTaskId(tab.id);
+  const task = taskId ? await getApplicationTask(taskId) : null;
   return autoRunResponse(state ?? {
     tabId: tab.id,
+    taskId: task?.id,
+    batchId: task?.batchId,
     status: 'stopped',
-    pageCount: 0,
-    filledCount: 0,
-    message: '尚未开始连续填写',
+    pageCount: task?.pageCount ?? 0,
+    filledCount: task?.filledCount ?? 0,
+    message: task?.message ?? '尚未开始连续填写',
     updatedAt: Date.now(),
-    history: [],
+    history: task?.history ?? [],
   });
 }
 
@@ -885,8 +1084,11 @@ async function handleStartAutoRun(): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
   const previous = await getAutoRunState(tab.id);
+  const task = await ensureTaskForTab(tab, previous?.taskId);
   const state: AutoRunState = {
     tabId: tab.id,
+    taskId: task.id,
+    batchId: task.batchId,
     status: 'running',
     pageCount: previous?.status === 'paused' ? previous.pageCount : 0,
     filledCount: previous?.status === 'paused' ? previous.filledCount : 0,
@@ -906,6 +1108,8 @@ async function handleStopAutoRun(): Promise<Response> {
   const previous = await getAutoRunState(tab.id);
   const state: AutoRunState = {
     tabId: tab.id,
+    taskId: previous?.taskId ?? await getBoundTaskId(tab.id),
+    batchId: previous?.batchId,
     status: 'stopped',
     pageCount: previous?.pageCount ?? 0,
     filledCount: previous?.filledCount ?? 0,
@@ -1005,7 +1209,11 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
       aiCached = true;
     } else {
       try {
-        aiMatches = (await matchFields(aiFields, apiConfig, profileValues.map(({ key, value }) => ({ key, value }))))
+        aiMatches = (await aiRequestQueue.run(() => matchFields(
+          aiFields,
+          apiConfig,
+          profileValues.map(({ key, value }) => ({ key, value })),
+        )))
           .map((match) => {
             const field = fieldByIndex.get(match.index);
             return field ? { ...match, value: adaptValueToField(match.value, field) } : match;
@@ -1253,7 +1461,7 @@ async function processAutoRun(tabId: number): Promise<void> {
       message: '页面已扫描并标色',
       updatedAt: Date.now(),
     });
-    await saveAutoRunState(state);
+    await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
     const scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
     const fileFields = scan.fields.filter((field) => field.kind === 'file');
     const currentMaterialPageKey = pageKey(scan.pageUrl);
@@ -1279,7 +1487,7 @@ async function processAutoRun(tabId: number): Promise<void> {
       historyEntry.status = 'paused';
       historyEntry.message = state.message;
       historyEntry.updatedAt = Date.now();
-      await saveAutoRunState(state);
+      await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
       return;
     }
     const selectedMatches = scan.matches.filter((match) => (
@@ -1319,6 +1527,7 @@ async function processAutoRun(tabId: number): Promise<void> {
     await Promise.all([
       rememberPageMarkers(tabId, scan.pageUrl, afterMarkers),
       sendToContentScript(tabId, { type: 'markPreview', items: afterMarkers }).catch(() => undefined),
+      persistScanSnapshot(state, { ...scan, fields: afterFields }),
     ]);
     historyEntry.verified = afterMarkers.filter((marker) => marker.status === 'verified').length;
     historyEntry.conflicts = afterMarkers.filter((marker) => marker.status === 'mismatch').length;
