@@ -38,6 +38,7 @@ import { buildPageSnapshot } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
 import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
+import { canonicalPageUrl, semanticPageKey } from '@/utils/page-identity';
 
 type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 interface PageMarkerItem {
@@ -433,16 +434,6 @@ function markerStoreKey(tabId: number): string {
   return `autoRunMarkers:${tabId}`;
 }
 
-function pageKey(url: string | undefined): string {
-  if (!url) return '';
-  try {
-    const parsed = new URL(url);
-    return `${parsed.origin}${parsed.pathname}${parsed.search}`;
-  } catch {
-    return url;
-  }
-}
-
 async function getAutoRunState(tabId: number): Promise<AutoRunState | null> {
   const result = await chrome.storage.session.get(autoRunKey(tabId));
   const state = (result[autoRunKey(tabId)] as AutoRunState | undefined) ?? null;
@@ -476,7 +467,7 @@ async function persistScanSnapshot(state: AutoRunState, scan: ScanSuccessRespons
     websiteMaterials: WebsiteMaterialCandidate[];
   }>(state.tabId, { type: 'getAuditPageSnapshot' }).catch(() => null);
   const snapshot = buildPageSnapshot({
-    pageKey: pageKey(scan.pageUrl),
+    pageKey: semanticPageKey({ url: scan.pageUrl, label: scan.pageLabel, signature: scan.pageSignature }),
     pageLabel: scan.pageLabel,
     pageUrl: scan.pageUrl,
     pageSignature: scan.pageSignature,
@@ -492,8 +483,12 @@ function autoRunResponse(state: AutoRunState): AutoRunSuccessResponse {
   return { ok: true, type: 'autoRun', ...state };
 }
 
-async function rememberPageMarkers(tabId: number, url: string | undefined, items: PageMarkerItem[]): Promise<void> {
-  const key = pageKey(url);
+async function rememberPageMarkers(
+  tabId: number,
+  identity: { url?: string; label?: string; signature?: string },
+  items: PageMarkerItem[],
+): Promise<void> {
+  const key = semanticPageKey(identity);
   if (!key) return;
   const storageKey = markerStoreKey(tabId);
   const stored = await chrome.storage.session.get(storageKey);
@@ -506,16 +501,24 @@ async function rememberPageMarkers(tabId: number, url: string | undefined, items
 }
 
 async function restorePageMarkers(tabId: number, url: string | undefined): Promise<void> {
-  const key = pageKey(url);
-  if (!key) return;
+  const legacyKey = canonicalPageUrl(url);
+  if (!legacyKey) return;
   const storageKey = markerStoreKey(tabId);
   const stored = await chrome.storage.session.get(storageKey);
-  const page = (stored[storageKey] as Record<string, { items: PageMarkerItem[] }> | undefined)?.[key];
-  if (!page) return;
+  const pages = stored[storageKey] as Record<string, { items: PageMarkerItem[] }> | undefined;
+  if (!pages) return;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
     const current = await chrome.tabs.get(tabId).catch(() => undefined);
-    if (!current || pageKey(current.url) !== key) return;
+    if (!current || canonicalPageUrl(current.url) !== legacyKey) return;
+    const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
+      tabId,
+      { type: 'getPageMeta' },
+      false,
+    ).catch(() => undefined);
+    const key = meta ? semanticPageKey(meta) : legacyKey;
+    const page = pages[key] ?? pages[legacyKey];
+    if (!page) continue;
     const result = await sendToContentScript<{ marked?: number }>(
       tabId,
       { type: 'markPreview', items: page.items },
@@ -1119,7 +1122,8 @@ async function handleMarkPageFields(
 ): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
-  await rememberPageMarkers(tab.id, tab.url, items);
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(tab.id, { type: 'getPageMeta' });
+  await rememberPageMarkers(tab.id, meta, items);
   await sendToContentScript(tab.id, { type: 'markPreview', items });
   return { ok: true, type: 'pageAction' };
 }
@@ -1199,10 +1203,10 @@ async function handleConfirmMaterialsAndResume(): Promise<Response> {
   if (!previous || previous.status !== 'paused' || previous.pauseReason !== 'materials') {
     return errorResponse('当前页面没有等待确认的上传材料');
   }
-  const meta = await sendToContentScript<{ url: string }>(tab.id, { type: 'getPageMeta' });
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(tab.id, { type: 'getPageMeta' });
   previous.status = 'running';
   previous.pauseReason = undefined;
-  previous.confirmedMaterialPageKey = pageKey(meta.url);
+  previous.confirmedMaterialPageKey = semanticPageKey(meta);
   previous.message = '材料已由本人确认，正在核对必填项并进入下一步';
   previous.updatedAt = Date.now();
   await saveAutoRunState(previous);
@@ -1510,14 +1514,18 @@ async function processAutoRun(tabId: number): Promise<void> {
     }
     const markers = buildPageMarkers(scan);
     await Promise.all([
-      rememberPageMarkers(tabId, scan.pageUrl, markers),
+      rememberPageMarkers(tabId, {
+        url: scan.pageUrl,
+        label: scan.pageLabel,
+        signature: scan.pageSignature,
+      }, markers),
       sendToContentScript(tabId, { type: 'markPreview', items: markers }).catch(() => undefined),
     ]);
     const verifiedCount = markers.filter((marker) => marker.status === 'verified').length;
     const conflictCount = markers.filter((marker) => marker.status === 'mismatch').length;
     const historyEntry = upsertAutoRunHistory(state, {
       page: state.pageCount + 1,
-      pageKey: pageKey(scan.pageUrl),
+      pageKey: semanticPageKey({ url: scan.pageUrl, label: scan.pageLabel, signature: scan.pageSignature }),
       label: scan.pageLabel,
       recognized: scan.total,
       matched: scan.matched,
@@ -1534,7 +1542,11 @@ async function processAutoRun(tabId: number): Promise<void> {
     await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
     const scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
     const fileFields = scan.fields.filter((field) => field.kind === 'file');
-    const currentMaterialPageKey = pageKey(scan.pageUrl);
+    const currentMaterialPageKey = semanticPageKey({
+      url: scan.pageUrl,
+      label: scan.pageLabel,
+      signature: scan.pageSignature,
+    });
     if (fileFields.length > 0 && state.confirmedMaterialPageKey !== currentMaterialPageKey) {
       const safeFileMatches = scan.matches.filter((match) => {
         const field = scannedFieldByIndex.get(match.index);
@@ -1595,7 +1607,11 @@ async function processAutoRun(tabId: number): Promise<void> {
     const afterFields = (afterResults ?? []).map((resultItem) => ({ ...resultItem.field, index: resultItem.index }));
     const afterMarkers = buildPageMarkers({ ...scan, fields: afterFields });
     await Promise.all([
-      rememberPageMarkers(tabId, scan.pageUrl, afterMarkers),
+      rememberPageMarkers(tabId, {
+        url: scan.pageUrl,
+        label: scan.pageLabel,
+        signature: scan.pageSignature,
+      }, afterMarkers),
       sendToContentScript(tabId, { type: 'markPreview', items: afterMarkers }).catch(() => undefined),
       persistScanSnapshot(state, { ...scan, fields: afterFields }),
     ]);
