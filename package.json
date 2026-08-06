@@ -19,6 +19,7 @@
     "test:audit": "tsx scripts/test-final-audit.ts",
     "test:ai-queue": "tsx scripts/test-ai-request-queue.ts",
     "test:material-audit": "tsx scripts/test-material-audit.ts",
+    "test:audit-view-model": "tsx scripts/test-audit-view-model.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {

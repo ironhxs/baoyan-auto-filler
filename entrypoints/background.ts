@@ -36,6 +36,8 @@ import type {
 } from '@/utils/application-tasks';
 import { buildPageSnapshot } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
+import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
+import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
 
 type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 interface PageMarkerItem {
@@ -62,6 +64,9 @@ interface MessageMap {
   listApplicationTasks: undefined;
   archiveApplicationTask: { taskId: string };
   openAuditCenter: undefined;
+  getAuditPreflight: { taskIds: string[] };
+  runFinalAudit: { taskIds: string[]; force: boolean; confirmed: boolean };
+  focusApplicationTask: { taskId: string };
 }
 
 type MessageType = keyof MessageMap;
@@ -171,7 +176,25 @@ interface ApplicationTaskListSuccessResponse {
   tasks: ApplicationTask[];
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | ApplicationTaskListSuccessResponse | ErrorResponse;
+interface AuditPreflightSuccessResponse {
+  ok: true;
+  type: 'auditPreflight';
+  preflight: AuditPreflight;
+  fingerprint: string;
+}
+
+interface FinalAuditSuccessResponse {
+  ok: true;
+  type: 'finalAudit';
+  report: FinalAuditReport;
+  preflight: AuditPreflight;
+  fingerprint: string;
+  cached: boolean;
+  degraded: boolean;
+  degradedReason?: string;
+}
+
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
   | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
@@ -981,6 +1004,15 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'openAuditCenter') {
     return handleOpenAuditCenter();
   }
+  if (request.type === 'getAuditPreflight') {
+    return handleGetAuditPreflight(request.payload!.taskIds);
+  }
+  if (request.type === 'runFinalAudit') {
+    return handleRunFinalAudit(request.payload!);
+  }
+  if (request.type === 'focusApplicationTask') {
+    return handleFocusApplicationTask(request.payload!.taskId);
+  }
   return errorResponse('Unknown message type');
 }
 
@@ -1013,7 +1045,45 @@ async function handleArchiveApplicationTask(taskId: string): Promise<Response> {
 }
 
 async function handleOpenAuditCenter(): Promise<Response> {
-  await chrome.tabs.create({ url: chrome.runtime.getURL('/audit.html') });
+  const tab = await getCurrentTab();
+  const currentTaskId = tab?.id == null ? undefined : await getBoundTaskId(tab.id);
+  const url = new URL(chrome.runtime.getURL('/audit.html'));
+  if (currentTaskId) url.searchParams.set('currentTaskId', currentTaskId);
+  await chrome.tabs.create({ url: url.href });
+  return { ok: true, type: 'pageAction' };
+}
+
+async function handleGetAuditPreflight(taskIds: string[]): Promise<Response> {
+  const prepared = await prepareFinalAudit(taskIds);
+  return {
+    ok: true,
+    type: 'auditPreflight',
+    preflight: prepared.preflight,
+    fingerprint: prepared.fingerprint,
+  };
+}
+
+async function handleRunFinalAudit(payload: MessageMap['runFinalAudit']): Promise<Response> {
+  if (payload.confirmed !== true) return errorResponse('最终检查需要在预检清单中再次确认');
+  const result = await runFinalAudit(payload.taskIds, Boolean(payload.force));
+  return { ok: true, type: 'finalAudit', ...result };
+}
+
+async function handleFocusApplicationTask(taskId: string): Promise<Response> {
+  const bindings = await getTaskBindings();
+  const openTabId = Object.entries(bindings).find(([, boundTaskId]) => boundTaskId === taskId)?.[0];
+  if (openTabId) {
+    const tabId = Number(openTabId);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) {
+      await chrome.tabs.update(tabId, { active: true });
+      if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+      return { ok: true, type: 'pageAction' };
+    }
+  }
+  const task = await getApplicationTask(taskId);
+  if (!task) return errorResponse('申请任务不存在或已删除');
+  await chrome.tabs.create({ url: task.initialUrl });
   return { ok: true, type: 'pageAction' };
 }
 

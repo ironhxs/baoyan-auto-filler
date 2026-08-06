@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>保填 - 统一审核中心</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/logo.png" alt="" />
+      <div>
+        <strong>保填</strong>
+        <span>统一审核中心</span>
+      </div>
+    </div>
+    <div class="batch-summary" id="batchSummary">正在读取本地任务</div>
+  </header>
+
+  <main class="workspace">
+    <aside class="task-rail" aria-label="申请任务">
+      <div class="rail-heading">
+        <div>
+          <h1>申请网站</h1>
+          <p>选择本次需要一起检查的任务</p>
+        </div>
+        <button class="icon-button" id="refreshButton" type="button" title="刷新任务" aria-label="刷新任务">↻</button>
+      </div>
+      <div class="task-list" id="taskList"></div>
+    </aside>
+
+    <section class="audit-surface">
+      <div class="surface-toolbar">
+        <div>
+          <h2>最终检查</h2>
+          <p id="scopeSummary">先选择任务，再生成预检清单</p>
+        </div>
+        <div class="toolbar-actions">
+          <button class="button secondary" id="preflightButton" type="button">生成预检清单</button>
+          <button class="button primary" id="auditButton" type="button" disabled>开始最终检查</button>
+        </div>
+      </div>
+
+      <div class="notice" id="statusNotice" hidden></div>
+      <section class="task-detail" id="taskDetail" aria-live="polite"></section>
+      <section class="report" id="report" aria-live="polite"></section>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="preflightModal" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-header">
+        <div>
+          <h2 id="modalTitle">确认最终检查范围</h2>
+          <p>确认后才会向你配置的模型服务商发送以下内容。</p>
+        </div>
+        <button class="icon-button" id="closeModalButton" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="scope-counts" id="modalScope"></div>
+      <div class="modal-notices" id="modalNotices"></div>
+      <label class="confirm-row">
+        <input id="confirmCheckbox" type="checkbox" />
+        <span>我确认将以上字段、材料名称及抽样页内容发送给已配置的模型服务商</span>
+      </label>
+      <div class="modal-actions">
+        <label class="force-row"><input id="forceCheckbox" type="checkbox" /> 重新检查，不使用相同内容的缓存报告</label>
+        <div>
+          <button class="button secondary" id="cancelModalButton" type="button">取消</button>
+          <button class="button primary" id="confirmAuditButton" type="button" disabled>开始最终检查</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>
