@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { buildAuditViewModel, groupAuditIssues } from '../utils/audit-view-model';
+import { buildAuditViewModel, buildPopupTaskSummary, groupAuditIssues } from '../utils/audit-view-model';
 import type { ApplicationTask } from '../utils/application-tasks';
 import type { FinalAuditReport } from '../utils/final-audit';
 
@@ -56,6 +56,13 @@ assert.equal(model.tasks[0].materialNeedsReview, 1);
 assert.equal(model.runDisabled, true);
 assert.equal(model.preflightLabel, '2 所学校 · 9 个页面 · 80 个字段 · 7 份材料 · 12 个抽样页');
 assert.deepEqual(model.batch, { total: 2, needsReview: 1, selected: 2 });
+
+const popup = buildPopupTaskSummary([otherTask, currentTask], currentTask.id);
+assert.equal(popup.current?.id, currentTask.id);
+assert.equal(popup.current?.name, '东南大学');
+assert.equal(popup.current?.conflictCount, 0);
+assert.equal(popup.current?.materialNeedsReview, 1);
+assert.deepEqual(popup.batch, { total: 2, needsReview: 1 });
 
 const report: FinalAuditReport = {
   summary: { critical: 1, warning: 1, info: 1 },

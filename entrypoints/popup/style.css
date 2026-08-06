@@ -657,6 +657,106 @@ body {
   background: #F8FBFF;
 }
 
+.current-task-summary {
+  margin-bottom: 10px;
+  padding: 12px 13px;
+  border: 1px solid #cfe0ff;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.current-task-summary.empty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-color: #e2e8f0;
+  color: #475569;
+  font-size: 12px;
+}
+
+.current-task-summary.empty span { color: #7a8798; font-size: 11px; }
+
+.current-task-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.current-task-head > div { min-width: 0; }
+.current-task-head span, .current-task-head strong { display: block; }
+.current-task-head span { margin-bottom: 2px; color: #7a8798; font-size: 10px; }
+.current-task-head strong { overflow: hidden; color: #1f2937; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.current-task-head em { flex: none; color: #475569; font-size: 10px; font-style: normal; font-weight: 600; }
+.current-task-head .task-state-running { color: #1769e6; }
+.current-task-head .task-state-paused { color: #b45309; }
+.current-task-head .task-state-complete { color: #15803d; }
+
+.current-page-name {
+  margin-top: 7px;
+  overflow: hidden;
+  color: #52657b;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.current-task-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  margin-top: 9px;
+  overflow: hidden;
+  border: 1px solid #e5eaf2;
+  border-radius: 6px;
+}
+
+.current-task-metrics span {
+  padding: 7px 3px;
+  border-right: 1px solid #eef2f7;
+  color: #7a8798;
+  font-size: 9px;
+  text-align: center;
+}
+
+.current-task-metrics span:last-child { border-right: 0; }
+.current-task-metrics b { display: block; margin-bottom: 1px; color: #25364b; font-size: 13px; }
+.current-task-metrics .danger b { color: #d92d20; }
+.current-task-metrics .warning b { color: #b54708; }
+
+.last-audit-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+  color: #7a8798;
+  font-size: 10px;
+}
+
+.last-audit-summary strong { color: #52657b; font-size: 10px; font-weight: 600; }
+
+.batch-audit-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 1px 10px;
+  color: #667085;
+  font-size: 10px;
+}
+
+.batch-audit-summary button {
+  padding: 0;
+  border: 0;
+  color: #257ffd;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.batch-audit-summary button:hover { text-decoration: underline; }
+
 .site-status-card.unavailable {
   color: #64748B;
   font-size: 12px;

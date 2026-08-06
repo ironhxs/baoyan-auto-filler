@@ -8,6 +8,8 @@ import type { ProfileSourceValue } from '@/utils/profile-schema';
 import { isMeaningfullyFilled } from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
 import { fieldFingerprint } from '@/utils/field-fingerprint';
+import type { ApplicationTask } from '@/utils/application-tasks';
+import { buildPopupTaskSummary } from '@/utils/audit-view-model';
 
 const app = document.getElementById('app')!;
 
@@ -52,6 +54,8 @@ interface AutoRunResponse {
   ok: true;
   type: 'autoRun';
   tabId: number;
+  taskId?: string;
+  batchId?: string;
   status: 'running' | 'paused' | 'complete' | 'stopped';
   pageCount: number;
   filledCount: number;
@@ -73,6 +77,13 @@ interface AutoRunResponse {
     message: string;
     updatedAt: number;
   }>;
+}
+
+interface ApplicationTaskListResponse {
+  ok: true;
+  type: 'applicationTasks';
+  currentTaskId?: string;
+  tasks: ApplicationTask[];
 }
 
 type ViewState = 'idle' | 'scanning' | 'result' | 'filling' | 'filled';
@@ -101,6 +112,8 @@ let autoRunStatus: AutoRunResponse | null = null;
 let materialFileRecords: FileRecord[] = [];
 const previewedMaterialByField = new Map<number, number>();
 let lastFillIncludedFiles = false;
+let applicationTasks: ApplicationTask[] = [];
+let currentTaskId: string | undefined;
 
 function sendRuntimeMessage<T>(message: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -125,12 +138,17 @@ async function init() {
   renderHeader();
 
   try {
-    const [inspected, autoStatus] = await Promise.all([
+    const [inspected, autoStatus, taskListResponse] = await Promise.all([
       sendRuntimeMessage<InspectResponse | ErrorResponse>({ type: 'inspectPage' }),
       sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'getAutoRunStatus' }),
+      sendRuntimeMessage<ApplicationTaskListResponse | ErrorResponse>({ type: 'listApplicationTasks' }),
     ]);
     pageStatus = inspected.ok ? inspected as InspectResponse : null;
     autoRunStatus = autoStatus.ok ? autoStatus as AutoRunResponse : null;
+    if (taskListResponse.ok) {
+      applicationTasks = taskListResponse.tasks;
+      currentTaskId = taskListResponse.currentTaskId;
+    }
   } catch {
     pageStatus = null;
     autoRunStatus = null;
@@ -147,6 +165,13 @@ async function init() {
     return;
   }
   renderIdle(apiReady);
+}
+
+async function refreshApplicationTasks(): Promise<void> {
+  const response = await sendRuntimeMessage<ApplicationTaskListResponse | ErrorResponse>({ type: 'listApplicationTasks' });
+  if (!response.ok) return;
+  applicationTasks = response.tasks;
+  currentTaskId = response.currentTaskId;
 }
 
 function isMaterialReviewPause(status: AutoRunResponse | null): boolean {
@@ -238,6 +263,50 @@ function renderAutoRunHistory(status: AutoRunResponse): string {
   return `<details class="auto-history" open><summary class="auto-history-title">本次逐页记录（${history.length} 页）</summary><div class="auto-history-list">${rows}</div></details>`;
 }
 
+function auditSummary(task: ApplicationTask | undefined): string {
+  const summary = task?.audit?.report && typeof task.audit.report === 'object'
+    ? (task.audit.report as { summary?: { critical?: unknown; warning?: unknown } }).summary
+    : undefined;
+  if (!summary) return '尚未执行最终检查';
+  const critical = typeof summary.critical === 'number' ? summary.critical : 0;
+  const warning = typeof summary.warning === 'number' ? summary.warning : 0;
+  return `${critical} 个严重问题 · ${warning} 个需确认问题`;
+}
+
+function renderCurrentTaskSummary(): string {
+  const summary = buildPopupTaskSummary(applicationTasks, currentTaskId);
+  const current = summary.current;
+  const task = applicationTasks.find((item) => item.id === current?.id);
+  const latestPageId = task?.pageOrder.at(-1);
+  const latestPage = latestPageId ? task?.pages[latestPageId] : undefined;
+  const statusLabel = current ? ({
+    running: '填写中', paused: '待处理', complete: '已到审核页', stopped: '已停止', archived: '已归档',
+  })[current.status] : '';
+  const currentHtml = current ? `
+    <section class="current-task-summary">
+      <div class="current-task-head">
+        <div><span>当前网站</span><strong>${escapeHtml(current.name)}</strong></div>
+        <em class="task-state-${current.status}">${statusLabel}</em>
+      </div>
+      <div class="current-page-name">${escapeHtml(latestPage?.label || task?.history.at(-1)?.label || '当前页面')}</div>
+      <div class="current-task-metrics">
+        <span><b>${current.pageCount}</b>页面</span>
+        <span><b>${current.verifiedCount}</b>一致</span>
+        <span class="${current.conflictCount ? 'danger' : ''}"><b>${current.conflictCount}</b>冲突</span>
+        <span class="${current.missingCount ? 'warning' : ''}"><b>${current.missingCount}</b>缺项</span>
+        <span class="${current.materialNeedsReview ? 'warning' : ''}"><b>${current.materialNeedsReview}</b>材料待核</span>
+      </div>
+      <div class="last-audit-summary"><span>上次最终检查</span><strong>${escapeHtml(auditSummary(task))}</strong></div>
+    </section>
+  ` : '<section class="current-task-summary empty"><strong>当前网站尚未建立连续填写任务</strong><span>单页识别和快速填充仍可直接使用</span></section>';
+  if (summary.batch.total === 0) return currentHtml;
+  return `${currentHtml}
+    <div class="batch-audit-summary">
+      <span>本批次 ${summary.batch.total} 所学校 · ${summary.batch.needsReview} 所待审核</span>
+      <button type="button" id="openAuditCenterBtn">打开统一审核</button>
+    </div>`;
+}
+
 function renderIdle(apiReady = true) {
   viewState = 'idle';
   removeFooter();
@@ -272,6 +341,7 @@ function renderIdle(apiReady = true) {
   ` : '';
   main.innerHTML = `
     ${renderModeTabs('smart')}
+    ${renderCurrentTaskSummary()}
     ${statusHtml}
     ${autoHtml}
     <div class="scan-card">
@@ -288,6 +358,10 @@ function renderIdle(apiReady = true) {
   document.getElementById('resumeAutoRunBtn')?.addEventListener('click', startAutoRun);
   document.getElementById('reviewMaterialsBtn')?.addEventListener('click', startScan);
   document.getElementById('stopAutoRunBtn')?.addEventListener('click', stopAutoRun);
+  document.getElementById('openAuditCenterBtn')?.addEventListener('click', async () => {
+    const response = await sendRuntimeMessage<{ ok: boolean } | ErrorResponse>({ type: 'openAuditCenter' });
+    if (response.ok) window.close();
+  });
 }
 
 async function startAutoRun() {
@@ -295,6 +369,7 @@ async function startAutoRun() {
     const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'startAutoRun' });
     if (!response.ok) throw new Error(response.error);
     autoRunStatus = response as AutoRunResponse;
+    await refreshApplicationTasks();
     renderIdle(apiAvailable);
   } catch {
     showError('无法启动后台连续填写，请刷新页面后重试');
@@ -304,7 +379,10 @@ async function startAutoRun() {
 async function stopAutoRun() {
   try {
     const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'stopAutoRun' });
-    if (response.ok) autoRunStatus = response as AutoRunResponse;
+    if (response.ok) {
+      autoRunStatus = response as AutoRunResponse;
+      await refreshApplicationTasks();
+    }
     renderIdle(apiAvailable);
   } catch {
     showError('无法停止连续填写，请刷新页面后重试');
@@ -870,6 +948,7 @@ async function confirmMaterialsAndResume(): Promise<void> {
     const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({ type: 'confirmMaterialsAndResume' });
     if (!response.ok) throw new Error(response.error);
     autoRunStatus = response as AutoRunResponse;
+    await refreshApplicationTasks();
     renderIdle(apiAvailable);
   } catch (error) {
     showError(error instanceof Error ? error.message : '无法确认材料，请刷新页面后重试');
