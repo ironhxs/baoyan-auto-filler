@@ -31,6 +31,7 @@
 | `scripts/test-application-tasks.ts` | Verify independent project state and analysis updates. |
 | `entrypoints/background.ts` | Persist/restore analyses, plan row additions, use task checkpoints and durable resume alarms. |
 | `entrypoints/popup/main.ts` | Restore cached scan results and show repeat-row plan summary. |
+| `wxt.config.ts` | Declare the Manifest V3 `alarms` permission required for durable resume scheduling. |
 | `scripts/test-page-analysis-recovery.ts` | Validate semantic cache reuse vs invalidation and runner resume rules. |
 | `package.json` | Add test script(s) and release version. |
 | `README.md` | Explain automatic repeat-row addition, task recovery and non-submit guarantee. |
@@ -248,7 +249,7 @@ git commit -m "feat: add missing repeatable rows before filling"
 - Modify: `package.json`
 
 **Interfaces:**
-- Produces `ApplicationPageAnalysis` with fields, matches, marker items, checked indexes, repeat plan and AI metadata.
+- Produces `ApplicationPageAnalysis` with fields, matches, marker items, checked indexes, repeat plan and AI metadata. Keep serializable page-analysis types in `utils/page-analysis.ts`; do not import background-only message types into `utils`.
 - Produces `ApplicationRunnerCheckpoint` with status, last page key, history, pause reason, material confirmation and next-resume timestamp.
 - Produces immutable helpers `upsertTaskPageAnalysis`, `getTaskPageAnalysis`, `updateTaskRunnerCheckpoint`.
 
@@ -273,6 +274,15 @@ Expected: FAIL because page analyses and runner checkpoints are not represented 
 - [ ] **Step 3: Add types and immutable helpers**
 
 ```ts
+export interface PageAnalysisAiState {
+  configured: boolean;
+  mode: 'enhanced' | 'fallback';
+  attempted: boolean;
+  cached: boolean;
+  reviewed: number;
+  error: string;
+}
+
 export interface ApplicationPageAnalysis {
   pageKey: string;
   pageLabel: string;
@@ -283,7 +293,7 @@ export interface ApplicationPageAnalysis {
   markers: PageMarkerItem[];
   checkedIndexes: number[];
   repeatPlan: RepeatableRecordPlan;
-  ai: ScanSuccessResponse['ai'];
+  ai: PageAnalysisAiState;
   capturedAt: number;
 }
 
@@ -379,6 +389,7 @@ git commit -m "feat: restore cached page analyses and markers"
 - Modify: `utils/application-tasks.ts`
 - Modify: `scripts/test-application-tasks.ts`
 - Modify: `scripts/test-page-analysis-recovery.ts`
+- Modify: `wxt.config.ts`
 
 **Interfaces:**
 - Add `scheduleTaskResume(taskId, tabId, delayMs): Promise<void>` using `chrome.alarms`.
@@ -413,6 +424,8 @@ function canResumeRunner(checkpoint: ApplicationRunnerCheckpoint | undefined): b
 ```
 
 After every state transition, mirror the auto-run state into `task.runner`. Replace page-transition `setTimeout` calls with `chrome.alarms.create(resumeAlarmName(taskId), { when: Date.now() + delayMs })`. The alarm handler must resolve an open tab through task bindings, confirm the task is still `running`, fetch current page metadata, then call the existing `processAutoRun(tabId)` path. Register both `chrome.tabs.onUpdated` and `chrome.tabs.onActivated` to restore markers/analysis and schedule a resume only for an active `running` checkpoint. Do not resume `paused`, `complete`, `stopped` or archived tasks.
+
+Add `alarms` to the WXT manifest permissions before using `chrome.alarms`; the production service worker must not depend on a TypeScript declaration alone.
 
 - [ ] **Step 4: Run checkpoint tests and compile to verify they pass**
 
@@ -488,4 +501,3 @@ git commit -m "feat: release baotian <version>"
 git tag v<version>
 git push origin main --follow-tags
 ```
-
