@@ -3,8 +3,10 @@ import {
   extractResponseText,
   extractStreamError,
   extractStreamText,
+  getAuditRequestBody,
   getRequestBody,
   getRequestUrl,
+  requestAuditModel,
   isSemanticallyCompatibleMatch,
   matchFields,
 } from '../utils/matcher.ts';
@@ -53,6 +55,31 @@ assert.deepEqual(getRequestBody({ ...responsesConfig, fastMode: true }, 'fast re
   store: false,
 });
 
+const auditImage = {
+  filename: 'transcript-page-1.jpg',
+  mimeType: 'image/jpeg',
+  dataUrl: 'data:image/jpeg;base64,aW1hZ2U=',
+  pageNumber: 1,
+};
+assert.deepEqual(getAuditRequestBody(responsesConfig, 'audit prompt', [auditImage]), {
+  model: 'test-model',
+  stream: false,
+  input: [{
+    role: 'user',
+    content: [
+      { type: 'input_text', text: 'audit prompt' },
+      { type: 'input_image', image_url: auditImage.dataUrl },
+    ],
+  }],
+  store: false,
+});
+assert.deepEqual(getAuditRequestBody(chatConfig, 'audit prompt', [auditImage]), {
+  model: 'test-model',
+  stream: false,
+  messages: [{ role: 'user', content: 'audit prompt' }],
+  temperature: 0,
+});
+
 assert.equal(extractResponseText({
   choices: [{ message: { content: '[{"index":1}]' } }],
 }, 'chat_completions'), '[{"index":1}]');
@@ -77,6 +104,32 @@ assert.equal(extractStreamError({
 }), 'upstream failed');
 
 const originalFetch = globalThis.fetch;
+const auditBodies = [];
+let auditAttempt = 0;
+globalThis.fetch = async (_url, init) => {
+  auditBodies.push(JSON.parse(init.body));
+  auditAttempt++;
+  if (auditAttempt === 1) {
+    return new Response(JSON.stringify({ error: { message: 'input_image is not supported' } }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  return new Response(JSON.stringify({ output_text: '{"summary":{}}' }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+};
+const degradedAudit = await requestAuditModel(responsesConfig, 'audit prompt', [auditImage]);
+assert.deepEqual(degradedAudit, {
+  text: '{"summary":{}}',
+  usedVisuals: false,
+  degradedReason: '当前模型线路不支持材料图像，已改用文本与元数据审核',
+});
+assert.equal(auditBodies.length, 2);
+assert.equal(Array.isArray(auditBodies[0].input), true);
+assert.equal(auditBodies[1].input, 'audit prompt');
+
 globalThis.fetch = async () => new Response(JSON.stringify({
   choices: [{ message: { content: JSON.stringify([
     {

@@ -73,6 +73,19 @@ export interface MatchResult {
   source?: 'local' | 'ai' | 'ai_reviewed' | 'material';
 }
 
+export interface AuditVisualInput {
+  filename: string;
+  mimeType: string;
+  dataUrl: string;
+  pageNumber: number;
+}
+
+export interface AuditModelResult {
+  text: string;
+  usedVisuals: boolean;
+  degradedReason?: string;
+}
+
 function sourceLeafKey(fieldKey: string): string {
   return fieldKey.split('.').at(-1) ?? fieldKey;
 }
@@ -219,6 +232,29 @@ export function getRequestBody(apiConfig: ApiConfig, prompt: string, stream: boo
   };
 }
 
+export function getAuditRequestBody(
+  apiConfig: ApiConfig,
+  prompt: string,
+  visuals: AuditVisualInput[],
+): Record<string, unknown> {
+  if (getApiMode(apiConfig) !== 'responses' || visuals.length === 0) {
+    return getRequestBody(apiConfig, prompt, false);
+  }
+  return {
+    model: apiConfig.model,
+    stream: false,
+    ...(apiConfig.fastMode ? { service_tier: 'fast' } : {}),
+    input: [{
+      role: 'user',
+      content: [
+        { type: 'input_text', text: prompt },
+        ...visuals.map((visual) => ({ type: 'input_image', image_url: visual.dataUrl })),
+      ],
+    }],
+    store: false,
+  };
+}
+
 export function extractResponseText(data: unknown, apiMode: ApiMode): string {
   if (!data || typeof data !== 'object') return '';
   const record = data as Record<string, unknown>;
@@ -289,23 +325,79 @@ async function throwApiError(response: Response): Promise<never> {
   throw new Error(`LLM API error ${response.status}: ${detail}`);
 }
 
-export async function requestModelText(apiConfig: ApiConfig, prompt: string): Promise<string> {
-  if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
-  const apiMode = getApiMode(apiConfig);
-  const response = await fetch(getRequestUrl(apiConfig), {
+export function isUnsupportedMultimodalError(status: number, raw: string): boolean {
+  if (![400, 404, 415, 422].includes(status)) return false;
+  return /input[_ -]?(?:image|file)|image[_ -]?(?:url|input)|multimodal|vision|unsupported|not supported|unknown (?:content|input) type/i.test(raw);
+}
+
+async function postModelRequest(apiConfig: ApiConfig, body: Record<string, unknown>): Promise<Response> {
+  return fetch(getRequestUrl(apiConfig), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiConfig.apiKey}`,
     },
-    body: JSON.stringify(getRequestBody(apiConfig, prompt, false)),
+    body: JSON.stringify(body),
   });
-  if (!response.ok) await throwApiError(response);
+}
 
+async function extractModelResponse(response: Response, apiMode: ApiMode): Promise<string> {
+  if (!response.ok) await throwApiError(response);
   const data = await response.json();
   const content = extractResponseText(data, apiMode);
   if (!content) throw new Error('模型返回了空内容');
   return content;
+}
+
+export async function requestAuditModel(
+  apiConfig: ApiConfig,
+  prompt: string,
+  visuals: AuditVisualInput[],
+): Promise<AuditModelResult> {
+  if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
+  const apiMode = getApiMode(apiConfig);
+  if (apiMode !== 'responses' || visuals.length === 0) {
+    const text = await extractModelResponse(
+      await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, false)),
+      apiMode,
+    );
+    return {
+      text,
+      usedVisuals: false,
+      ...(visuals.length > 0 ? { degradedReason: '当前 API 模式不支持材料图像，已改用文本与元数据审核' } : {}),
+    };
+  }
+
+  const response = await postModelRequest(apiConfig, getAuditRequestBody(apiConfig, prompt, visuals));
+  if (response.ok) {
+    return { text: await extractModelResponse(response, apiMode), usedVisuals: true };
+  }
+
+  const raw = await response.text();
+  if (!isUnsupportedMultimodalError(response.status, raw)) {
+    const contentType = response.headers.get('content-type') ?? '';
+    const isHtml = contentType.includes('text/html') || /^\s*<!doctype html/i.test(raw);
+    const detail = isHtml
+      ? '上游网关返回了 HTML 错误页，请检查中转线路或稍后重试'
+      : raw.slice(0, 1200);
+    throw new Error(`LLM API error ${response.status}: ${detail}`);
+  }
+
+  const textResponse = await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, false));
+  return {
+    text: await extractModelResponse(textResponse, apiMode),
+    usedVisuals: false,
+    degradedReason: '当前模型线路不支持材料图像，已改用文本与元数据审核',
+  };
+}
+
+export async function requestModelText(apiConfig: ApiConfig, prompt: string): Promise<string> {
+  if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
+  const apiMode = getApiMode(apiConfig);
+  return extractModelResponse(
+    await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, false)),
+    apiMode,
+  );
 }
 
 export async function matchFields(

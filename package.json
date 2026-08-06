@@ -17,6 +17,7 @@
     "test:local-matcher": "tsx scripts/test-local-matcher.ts",
     "test:tasks": "tsx scripts/test-application-tasks.ts",
     "test:audit": "tsx scripts/test-final-audit.ts",
+    "test:ai-queue": "tsx scripts/test-ai-request-queue.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {
