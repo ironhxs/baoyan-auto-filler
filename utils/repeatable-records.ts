@@ -37,6 +37,14 @@ interface RepeatableSourceGroup {
   items: BlockItem[];
 }
 
+const ADD_ROW_LABEL_PATTERN = /^(?:\u65b0\u589e|\u6dfb\u52a0)(?:\u4e00\u884c|\u884c|\u4e00\u6761|\u6210\u5458|\u7ecf\u5386|\u8bb0\u5f55|\u5956\u52b1|\u83b7\u5956|\u6210\u679c|\u8003\u8bd5)?$/;
+const ENGLISH_ADD_ROW_LABEL_PATTERN = /^(?:addrow|additem|addrecord|addaward|addexperience|addmember)$/;
+
+export function isAddRowLabel(value: string | undefined): boolean {
+  const normalized = (value ?? '').replace(/\s+/g, '').toLowerCase();
+  return ADD_ROW_LABEL_PATTERN.test(normalized) || ENGLISH_ADD_ROW_LABEL_PATTERN.test(normalized);
+}
+
 const IDENTITY_KEYS: Record<string, string[]> = {
   外语水平: ['考试名称', '外语考试', '外语水平', '外语等级', '考试类型'],
   家庭成员: ['姓名', '成员姓名', '家庭成员姓名'],

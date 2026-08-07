@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRepeatRowTargets,
+  isAddRowLabel,
   prepareRepeatableRowScan,
 } from '../utils/repeatable-records';
 import type { BlockCategory } from '../utils/db';
@@ -8,6 +9,10 @@ import type { FormFieldInfo } from '../utils/matcher';
 
 const AWARDS = '\u5956\u52b1\u60c5\u51b5';
 const AWARD_NAME = '\u5956\u52b1\u540d\u79f0';
+
+assert.equal(isAddRowLabel('\u65b0\u589e\u5956\u52b1'), true);
+assert.equal(isAddRowLabel(' addAward '), true);
+assert.equal(isAddRowLabel('\u63d0\u4ea4'), false, 'protected final actions must never look like add-row controls');
 
 assert.deepEqual(buildRepeatRowTargets({ groups: {
   [AWARDS]: {

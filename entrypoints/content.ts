@@ -1,6 +1,7 @@
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
+import { isAddRowLabel } from '@/utils/repeatable-records';
 
 interface FormField {
   kind: 'text' | 'file';
@@ -506,7 +507,7 @@ function findRepeatTable(groupLabel: string): HTMLTableElement | undefined {
   });
 }
 
-function findAddRowControl(table: HTMLTableElement, groupLabel: string): HTMLElement | undefined {
+function findAddRowControl(table: HTMLTableElement): HTMLElement | undefined {
   let container: HTMLElement | null = table.parentElement;
   for (let depth = 0; container && container !== document.body && depth < 5; depth++, container = container.parentElement) {
     const control = Array.from(container.querySelectorAll<HTMLElement>('button,a,[role="button"],span')).find((candidate) => {
@@ -529,25 +530,16 @@ function findAddRowControl(table: HTMLTableElement, groupLabel: string): HTMLEle
           || style.cursor === 'pointer';
         if (!clickable) return false;
       }
-      const allowedLabels = new Set([
-        '\u65b0\u589e',
-        '\u6dfb\u52a0',
-        '\u65b0\u589e\u4e00\u884c',
-        '\u6dfb\u52a0\u4e00\u6761',
-      ]);
       const visibleText = normalizeText(candidate.textContent ?? '').replace(/\s+/g, '');
       const accessibleLabel = normalizeText([
         candidate.getAttribute('aria-label') ?? '',
         candidate.getAttribute('title') ?? '',
       ].join(' ')).replace(/\s+/g, '').toLowerCase();
       if (
-        allowedLabels.has(visibleText)
-        || allowedLabels.has(accessibleLabel)
-        || /^(addrow|additem|addrecord|addaward|addexperience|addmember)$/.test(accessibleLabel)
-        || /^(?:\u65b0\u589e|\u6dfb\u52a0)(?:\u4e00\u884c|\u4e00\u6761|\u6210\u5458|\u7ecf\u5386|\u8bb0\u5f55|\u5956\u52b1|\u83b7\u5956|\u6210\u679c|\u8003\u8bd5)?$/.test(accessibleLabel)
+        isAddRowLabel(visibleText)
+        || isAddRowLabel(accessibleLabel)
       ) return true;
-      const text = normalizeText(candidate.textContent ?? '').replace(/\s+/g, '');
-      return /^(新增|添加)(一行|行|一条|成员|经历|记录)$/.test(text);
+      return false;
     });
     if (control) return control;
   }
@@ -580,7 +572,7 @@ async function prepareRepeatRows(
     }
     while (repeatDataRows(table).length < safeTarget) {
       const previousCount = repeatDataRows(table).length;
-      const control = findAddRowControl(table, target.groupLabel);
+      const control = findAddRowControl(table);
       if (!control) {
         failures.push({ groupLabel: target.groupLabel, reason: 'No visible add-row control found' });
         break;
