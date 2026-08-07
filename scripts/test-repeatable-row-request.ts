@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRepeatRowTargets,
+  buildRepeatDialogTargets,
   isAddRowLabel,
   prepareRepeatableRowScan,
 } from '../utils/repeatable-records';
@@ -34,6 +35,25 @@ const blocks: BlockCategory[] = [{
     { fields: [{ key: AWARD_NAME, value: 'Second award' }] },
   ],
 }];
+
+const dialogTargets = buildRepeatDialogTargets({ groups: {
+  [AWARDS]: {
+    groupLabel: AWARDS,
+    itemCount: 2,
+    existingRowCount: 0,
+    rowBindings: [],
+    missingItemIndexes: [0, 1],
+    rowsToAdd: 2,
+    unmatchedRowIndexes: [],
+  },
+} }, blocks);
+assert.deepEqual(dialogTargets, [{
+  groupLabel: AWARDS,
+  records: [
+    { itemIndex: 0, fields: [{ key: AWARD_NAME, value: 'First award' }] },
+    { itemIndex: 1, fields: [{ key: AWARD_NAME, value: 'Second award' }] },
+  ],
+}]);
 
 let scanCount = 0;
 let visibleFields: FormFieldInfo[] = [];

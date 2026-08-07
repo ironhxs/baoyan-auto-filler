@@ -20,9 +20,10 @@ A Chrome / Edge form-filling assistant for graduate recommendation applications.
 - Manages seven profile groups: basic info, family, education, languages, experience, academic work, and awards
 - AI Enhanced Review (enabled by default) sends all safe fields on the current page to the configured API, as version 1.0 did, while deterministic stored values prevent factual rewrites
 - AI Enhanced Review can be disabled to use the API only for fields that local rules cannot match
-- Adds and fills repeatable rows for family members, language scores, experience, academic work, and awards
+- Adds and fills repeatable rows for family members, language scores, experience, academic work, and awards; also handles record editors opened in a modal or drawer after an Add action
 - Matches repeatable rows by group, row number, and subfield semantics, so different web-column ordering does not change the saved item mapping; optional AI fallback is grounded to the same stored row
-- Aggregates repeatable data into a single textarea when required, following the subfield order stated by the page and removing forbidden `|` / `#` characters
+- Fills modal/drawer record editors by subfield semantics rather than visual ordering, reads values back, and only clicks a record-level Save / Confirm / Add control inside that editor
+- Aggregates one repeatable record into a single textarea when the page exposes only one field; ambiguous required fields, unreadable values, and protected controls pause for review instead of being guessed
 - Supports exact-match school and major selection dialogs
 - Works with React and other framework pages (uses native setters to trigger updates)
 - Uses green, orange, and red readback states to show verified, review-needed, and mismatched values

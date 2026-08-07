@@ -58,8 +58,10 @@ import {
 } from '@/utils/page-analysis';
 import type { ApplicationPageAnalysis, CachedAnalysisRestoreResult } from '@/utils/page-analysis';
 import {
+  buildRepeatDialogTargets,
   planRepeatableRecords,
   prepareRepeatableRowScan,
+  type PrepareRepeatRecordsResult,
   type RepeatableRecordPlan,
   type PrepareRepeatRowsResult,
 } from '@/utils/repeatable-records';
@@ -1554,12 +1556,44 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     getAllCategories(),
   ]);
   const readableFileRecords = await filterReadableFileRecords(fileRecords);
-  const { scanResults, preparation: repeatRowPreparation } = await prepareRepeatableRowScan(
+  const preparedRows = await prepareRepeatableRowScan(
     () => sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
     (targets) => sendToContentScript<PrepareRepeatRowsResult>(tabId, { type: 'prepareRepeatRows', targets }),
     blocks,
     textFields,
   );
+  let scanResults = preparedRows.scanResults;
+  let repeatRowPreparation = preparedRows.preparation;
+  const dialogGroups = new Set(repeatRowPreparation.dialogGroups ?? []);
+  if (dialogGroups.size > 0) {
+    const dialogPlan = planRepeatableRecords(
+      scanResults.map((result) => ({ ...result.field, index: result.index })),
+      blocks,
+      textFields,
+    );
+    const dialogTargets = buildRepeatDialogTargets(dialogPlan, blocks)
+      .filter((target) => dialogGroups.has(target.groupLabel));
+    const uncoveredGroups = [...dialogGroups]
+      .filter((groupLabel) => !dialogTargets.some((target) => target.groupLabel === groupLabel));
+    const dialogPreparation = dialogTargets.length > 0
+      ? await sendToContentScript<PrepareRepeatRecordsResult>(tabId, { type: 'prepareRepeatRecords', targets: dialogTargets })
+      : { added: 0, processed: 0, failures: [] };
+    repeatRowPreparation = {
+      added: repeatRowPreparation.added + dialogPreparation.added,
+      failures: [
+        ...repeatRowPreparation.failures,
+        ...dialogPreparation.failures.map((failure) => ({
+          groupLabel: failure.groupLabel,
+          reason: `${failure.presentation} record ${failure.itemIndex == null ? '' : `${failure.itemIndex + 1} `}${failure.reason}`.trim(),
+        })),
+        ...uncoveredGroups.map((groupLabel) => ({
+          groupLabel,
+          reason: 'Saved repeatable records are unavailable for the opened dialog',
+        })),
+      ],
+    };
+    scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' });
+  }
   const pageMeta = await sendToContentScript<{ label: string; url: string; signature: string }>(
     tabId,
     { type: 'getPageMeta' },

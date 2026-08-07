@@ -1,7 +1,7 @@
 {
   "name": "baotian",
   "description": "保填",
-  "version": "1.3.4",
+  "version": "1.4.0",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -17,6 +17,7 @@
     "test:local-matcher": "tsx scripts/test-local-matcher.ts",
     "test:repeatable-records": "tsx scripts/test-repeatable-records.ts",
     "test:repeatable-row-request": "tsx scripts/test-repeatable-row-request.ts",
+    "test:repeatable-dialog": "tsx scripts/test-repeatable-dialog.ts",
     "test:tasks": "tsx scripts/test-application-tasks.ts",
     "test:page-analysis-recovery": "tsx scripts/test-page-analysis-recovery.ts",
     "test:audit": "tsx scripts/test-final-audit.ts",

@@ -22,9 +22,31 @@ export interface RepeatRowTarget {
   missingItemIndexes: number[];
 }
 
+export interface RepeatDialogRecordTarget {
+  itemIndex: number;
+  fields: Array<{ key: string; value: string }>;
+}
+
+export interface RepeatDialogTarget {
+  groupLabel: string;
+  records: RepeatDialogRecordTarget[];
+}
+
 export interface PrepareRepeatRowsResult {
   added: number;
   failures: Array<{ groupLabel: string; reason: string }>;
+  dialogGroups?: string[];
+}
+
+export interface PrepareRepeatRecordsResult {
+  added: number;
+  processed: number;
+  failures: Array<{
+    groupLabel: string;
+    itemIndex?: number;
+    presentation: 'inline' | 'dialog';
+    reason: string;
+  }>;
 }
 
 export interface RepeatableRowScanResult<T> {
@@ -186,6 +208,30 @@ export function buildRepeatRowTargets(plan: RepeatableRecordPlan): RepeatRowTarg
       requiredRows: group.existingRowCount + group.rowsToAdd,
       missingItemIndexes: [...group.missingItemIndexes],
     }));
+}
+
+export function buildRepeatDialogTargets(
+  plan: RepeatableRecordPlan,
+  blocks: BlockCategory[],
+): RepeatDialogTarget[] {
+  const sources = sourceGroups(blocks, []);
+  return Object.values(plan.groups)
+    .filter((group) => group.missingItemIndexes.length > 0)
+    .flatMap((group) => {
+      const source = sources.find((candidate) => sameText(candidate.label, group.groupLabel));
+      if (!source) return [];
+      const records = group.missingItemIndexes
+        .map((itemIndex) => ({ itemIndex, item: source.items[itemIndex] }))
+        .filter((candidate): candidate is { itemIndex: number; item: BlockItem } => Boolean(candidate.item))
+        .map(({ itemIndex, item }) => ({
+          itemIndex,
+          fields: item.fields
+            .filter((field) => field.key.trim() && field.value.trim())
+            .map((field) => ({ key: field.key, value: field.value })),
+        }))
+        .filter((record) => record.fields.length > 0);
+      return records.length > 0 ? [{ groupLabel: group.groupLabel, records }] : [];
+    });
 }
 
 export async function prepareRepeatableRowScan<T extends { index: number; field: FormFieldInfo }>(
