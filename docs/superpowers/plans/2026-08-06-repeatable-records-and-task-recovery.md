@@ -501,3 +501,96 @@ git commit -m "feat: release baotian <version>"
 git tag v<version>
 git push origin main --follow-tags
 ```
+
+## Task 8: Automate repeatable record dialogs and drawers
+
+**Files:**
+- Create: `utils/repeatable-dialog.ts`
+- Create: `scripts/test-repeatable-dialog.ts`
+- Modify: `entrypoints/content.ts:70-610, 986-1140, 1318-1404`
+- Modify: `entrypoints/background.ts:1547-1685`
+- Modify: `utils/repeatable-records.ts`
+- Modify: `package.json`
+
+**Interfaces:**
+- Consumes: `RepeatableRecordPlan.missingItemIndexes`, `BlockCategory`, `TextField`, and the existing `FormField` extraction/fill routines.
+- Produces: pure dialog field and save-control classifiers; a content message `prepareRepeatRecords` that reports `{ added, processed, failures }` without exposing field values; the existing `collectTabScan` receives a post-addition scan.
+
+- [ ] **Step 1: Write the failing pure dialog tests**
+
+```ts
+import assert from 'node:assert/strict';
+import {
+  classifyRepeatDialogFields,
+  classifyRepeatDialogSaveControl,
+  isProtectedRepeatDialogControl,
+} from '../utils/repeatable-dialog';
+
+const fields = classifyRepeatDialogFields([
+  { label: '获奖时间', value: '', required: true, kind: 'text', protected: false },
+  { label: '获奖名称', value: '', required: true, kind: 'text', protected: false },
+  { label: '获奖等级', value: '', required: false, kind: 'text', protected: false },
+]);
+assert.deepEqual(fields.map((field) => field.semanticKey), ['time', 'name', 'level']);
+assert.equal(classifyRepeatDialogSaveControl('保存').safe, true);
+assert.equal(classifyRepeatDialogSaveControl('提交报名').safe, false);
+assert.equal(isProtectedRepeatDialogControl('选择导师'), true);
+```
+
+- [ ] **Step 2: Run the new test to verify it fails**
+
+Run: `npm run test:repeatable-dialog`
+
+Expected: FAIL because no dialog classifier module exists.
+
+- [ ] **Step 3: Implement the pure classifiers**
+
+Add semantic aliases for name/title, type/category, level/rank, date/time, organization/unit, relation, phone/contact, status and description. Normalize punctuation and common date labels. Map each field to one semantic key, preserve the original field index, and reject ambiguous duplicate keys unless one field is clearly an identity field.
+
+Implement save-control classification with an allow-list for record-level labels (`保存`, `确定`, `添加`, `新增`) and a deny-list for final application, confirmation, volunteer, mentor, commitment, captcha and payment labels. A control is safe only when it is inside a dialog root and its normalized label does not contain a denied token.
+
+- [ ] **Step 4: Run the pure test to verify it passes**
+
+Run: `npm run test:repeatable-dialog`
+
+Expected: PASS and output `repeatable dialog tests passed`.
+
+- [ ] **Step 5: Add content-side dialog preparation tests and message types**
+
+Extend the content message union with `prepareRepeatRecords` carrying `{ targets: Array<{ groupLabel: string; itemIndexes: number[] }> }`. Return a bounded result with group label, item index, presentation mode, processed field count, and a short failure reason. Do not include profile values in the result or logs.
+
+- [ ] **Step 6: Implement dialog detection and semantic filling**
+
+After clicking a repeat-group add control, wait for either a new inline row or a visible dialog/drawer. For dialogs, identify the root by visible title/context matching the current repeat group and require at least two editable controls. Extract fields using existing `extractField`, classify them with the pure semantic helper, fill the current saved item by semantic key independent of display order, and verify every required field with `valueMatches`.
+
+Do not fill file inputs, protected fields, captcha controls, or final-application fields. If any required field is ambiguous or cannot be read back, leave the dialog open and return a pause reason.
+
+- [ ] **Step 7: Implement guarded record save and post-save verification**
+
+Find buttons only inside the identified dialog root. Click a save/confirm/add label only when `classifyRepeatDialogSaveControl(label).safe` is true. Wait for the dialog to close or for the repeatable list/table fingerprint to change. If neither happens within the bounded wait, return an unverifiable failure and do not retry blindly. Process missing items sequentially and stop on the first unsafe or unverifiable result.
+
+- [ ] **Step 8: Integrate dialog preparation into `collectTabScan`**
+
+Keep the existing inline `prepareRepeatableRowScan` path. When an add control opens a repeat-group dialog, invoke `prepareRepeatRecords` with the current group's missing item indexes, then rescan. Preserve identity-first bindings and the rule that AI may review but never rebind an identified repeatable row. Treat dialog failures as a page pause with a clear group-specific reason.
+
+- [ ] **Step 9: Run the full regression suite and compile**
+
+Run:
+
+```bash
+npm run test:repeatable-dialog
+npm run test:repeatable-records
+npm run test:repeatable-row-request
+npm run test:local-matcher
+npm run test:tasks
+npm run test:page-analysis-recovery
+npm run compile
+npm run build
+git diff --check
+```
+
+Expected: all commands exit 0; no high-risk control is included in the generated dialog action list.
+
+- [ ] **Step 10: Bump version and update release notes**
+
+Increase the extension version from `1.3.4` to `1.4.0`, add the dialog/drawer repeatable-record behavior and its safety boundary to `README.md`, then rebuild the Edge unpacked extension. Real-browser QA may scan, fill, add records, and verify read-back only; it must stop before any final submit/confirmation action.
