@@ -1204,15 +1204,6 @@ export default defineBackground(() => {
         state.pauseReason = 'page';
         state.message = '缃戠珯鏍囩椤靛凡鍏抽棴锛屼换鍔¤褰曞凡淇濈暀';
         await saveAutoRunState(state);
-        /*
-          status: 'paused',
-          pauseReason: 'page',
-          pageCount: state.pageCount,
-          filledCount: state.filledCount,
-          message: '网站标签页已关闭，任务记录已保留',
-          history: state.history,
-          updatedAt: Date.now(),
-        })); */
       }
       await Promise.all([
         removeTaskBinding(tabId),
