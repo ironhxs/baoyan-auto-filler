@@ -40,7 +40,7 @@ import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
 import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
 import { canonicalPageUrl, semanticPageKey } from '@/utils/page-identity';
-import { shouldReusePageAnalysis } from '@/utils/page-analysis';
+import { derivePageMarkers, shouldReusePageAnalysis } from '@/utils/page-analysis';
 import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
 import {
   planRepeatableRecords,
@@ -540,7 +540,9 @@ async function restoreCachedAnalysisForTab(tabId: number): Promise<boolean> {
   );
   const analysis = task.pageAnalyses?.[semanticPageKey(meta)];
   if (!analysis || !shouldReusePageAnalysis(analysis, meta)) return false;
-  return restoreAnalysisToTab(tabId, analysis);
+  const refreshed = await refreshAnalysisFromTab(tabId, analysis);
+  if (!refreshed) return false;
+  return restoreAnalysisToTab(tabId, refreshed);
 }
 
 function defaultCheckedIndexes(scan: ScanSuccessResponse): number[] {
@@ -555,13 +557,13 @@ function defaultCheckedIndexes(scan: ScanSuccessResponse): number[] {
 async function refreshAnalysisFromTab(
   tabId: number,
   analysis: ApplicationPageAnalysis,
-): Promise<ApplicationPageAnalysis> {
+): Promise<ApplicationPageAnalysis | null> {
   const scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
     tabId,
     { type: 'scan' },
   ).catch(() => []);
   const currentFields = scanResults.map((result) => ({ ...result.field, index: result.index }));
-  if (currentFields.length === 0) return analysis;
+  if (currentFields.length === 0) return null;
 
   const currentByFingerprint = new Map<string, FormFieldInfo[]>();
   for (const field of currentFields) {
@@ -581,10 +583,7 @@ async function refreshAnalysisFromTab(
     const index = indexMap.get(match.index);
     return index == null ? [] : [{ ...match, index }];
   });
-  const markers = analysis.markers.flatMap((marker) => {
-    const index = indexMap.get(marker.index);
-    return index == null ? [] : [{ ...marker, index }];
-  });
+  const markers = derivePageMarkers(currentFields, matches);
   return {
     ...analysis,
     fields: currentFields,
@@ -1027,10 +1026,10 @@ export default defineBackground(() => {
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.status !== 'complete' && !changeInfo.url) return;
     setTimeout(() => {
-      void Promise.all([
-        restorePageMarkers(tabId, changeInfo.url ?? tab.url),
-        restoreCachedAnalysisForTab(tabId).catch(() => false),
-      ]);
+      void (async () => {
+        await restorePageMarkers(tabId, changeInfo.url ?? tab.url).catch(() => undefined);
+        await restoreCachedAnalysisForTab(tabId).catch(() => false);
+      })();
     }, 300);
     void getAutoRunState(tabId).then((state) => {
       if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);
@@ -1175,6 +1174,7 @@ async function handleGetCurrentPageAnalysis(): Promise<Response> {
     return { ok: true, type: 'pageAnalysis', analysis: null, currentPageKey };
   }
   const analysis = await refreshAnalysisFromTab(tab.id, cached);
+  if (!analysis) return { ok: true, type: 'pageAnalysis', analysis: null, currentPageKey };
   await restoreAnalysisToTab(tab.id, analysis).catch(() => false);
   return { ok: true, type: 'pageAnalysis', analysis, currentPageKey };
 }

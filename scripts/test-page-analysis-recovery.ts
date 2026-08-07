@@ -4,7 +4,8 @@ import {
   getTaskPageAnalysis,
   upsertTaskPageAnalysis,
 } from '../utils/application-tasks';
-import { shouldReusePageAnalysis } from '../utils/page-analysis';
+import { derivePageMarkers, shouldReusePageAnalysis } from '../utils/page-analysis';
+import type { FormFieldInfo, MatchResult } from '../utils/matcher';
 import type { ApplicationPageAnalysis } from '../utils/page-analysis';
 import { semanticPageKey } from '../utils/page-identity';
 
@@ -80,5 +81,31 @@ assert.equal(shouldReusePageAnalysis(cached, {
   label: cached.pageLabel,
   signature: 'different-dom-signature',
 }), false);
+
+const changedField: FormFieldInfo = {
+  index: 0,
+  tag: 'input',
+  type: 'text',
+  name: 'name',
+  id: 'name',
+  label: 'Name',
+  placeholder: '',
+  ariaLabel: '',
+  context: '',
+  value: 'Live value',
+  required: false,
+  protected: false,
+};
+const cachedMatch: MatchResult = {
+  index: 0,
+  kind: 'text',
+  fieldKey: 'name',
+  value: 'Cached value',
+  shortLabel: 'Name',
+  confidence: 'high',
+  source: 'local',
+};
+const refreshedMarkers = derivePageMarkers([changedField], [cachedMatch]);
+assert.equal(refreshedMarkers[0]?.status, 'mismatch', 'live field changes must restamp cached markers');
 
 console.log('page analysis recovery tests passed');
