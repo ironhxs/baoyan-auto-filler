@@ -5,6 +5,7 @@ import {
   upsertTaskPageAnalysis,
 } from '../utils/application-tasks';
 import {
+  enqueueSerializedRestore,
   isCurrentRestoreGeneration,
   shouldRestoreLegacyMarkers,
   derivePageMarkers,
@@ -129,5 +130,22 @@ assert.equal(
   'an older restore generation cannot paint after a newer generation supersedes it',
 );
 assert.equal(isCurrentRestoreGeneration(2, 2), true);
+
+const restoreTails = new Map<number, Promise<void>>();
+const restoreEvents: string[] = [];
+let releaseFirstRestore!: () => void;
+const firstRestore = enqueueSerializedRestore(restoreTails, 7, async () => {
+  restoreEvents.push('first-start');
+  await new Promise<void>((resolve) => { releaseFirstRestore = resolve; });
+  restoreEvents.push('first-end');
+});
+const secondRestore = enqueueSerializedRestore(restoreTails, 7, async () => {
+  restoreEvents.push('second');
+});
+await new Promise<void>((resolve) => setTimeout(resolve, 0));
+assert.deepEqual(restoreEvents, ['first-start'], 'the second restore must wait for the first restore to settle');
+releaseFirstRestore();
+await Promise.all([firstRestore, secondRestore]);
+assert.deepEqual(restoreEvents, ['first-start', 'first-end', 'second'], 'same-tab restores complete in dispatch order');
 
 console.log('page analysis recovery tests passed');

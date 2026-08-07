@@ -42,6 +42,7 @@ import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
 import { canonicalPageUrl, semanticPageKey } from '@/utils/page-identity';
 import {
   derivePageMarkers,
+  enqueueSerializedRestore,
   isCurrentRestoreGeneration,
   shouldRestoreLegacyMarkers,
   shouldReusePageAnalysis,
@@ -239,6 +240,7 @@ interface RoleScore {
 
 const autoRunInFlight = new Set<number>();
 const pageRestoreGenerations = new Map<number, number>();
+const pageRestoreTails = new Map<number, Promise<void>>();
 const AI_MATCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const AI_MATCH_CACHE_LIMIT = 40;
 const aiMatchCache = new Map<string, { expiresAt: number; matches: MatchResult[] }>();
@@ -1074,7 +1076,10 @@ export default defineBackground(() => {
     const generation = (pageRestoreGenerations.get(tabId) ?? 0) + 1;
     pageRestoreGenerations.set(tabId, generation);
     setTimeout(() => {
-      void restoreMarkersAfterNavigation(tabId, changeInfo.url ?? tab.url, generation);
+      void enqueueSerializedRestore(pageRestoreTails, tabId, async () => {
+        if (!isCurrentPageRestore(tabId, generation)) return;
+        await restoreMarkersAfterNavigation(tabId, changeInfo.url ?? tab.url, generation);
+      }).catch(() => undefined);
     }, 300);
     void getAutoRunState(tabId).then((state) => {
       if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);

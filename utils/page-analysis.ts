@@ -53,6 +53,22 @@ export function isCurrentRestoreGeneration(activeGeneration: number | undefined,
   return activeGeneration === generation;
 }
 
+/** Queue restore jobs per tab and remove only the exact tail when it settles. */
+export function enqueueSerializedRestore<T>(
+  tails: Map<number, Promise<void>>,
+  tabId: number,
+  job: () => Promise<T> | T,
+): Promise<T> {
+  const previous = tails.get(tabId) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(job);
+  const tail = run.then(() => undefined, () => undefined);
+  tails.set(tabId, tail);
+  void tail.then(() => {
+    if (tails.get(tabId) === tail) tails.delete(tabId);
+  });
+  return run;
+}
+
 /** Derive marker state from the current DOM fields and their cached matches. */
 export function derivePageMarkers(fields: FormFieldInfo[], matches: MatchResult[]): PageMarkerItem[] {
   const matchByIndex = new Map(matches.map((match) => [match.index, match]));
