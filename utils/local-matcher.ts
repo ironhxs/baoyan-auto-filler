@@ -352,6 +352,31 @@ export function matchFieldsLocally(
   });
 }
 
+export function mergeLocalAndAiMatches(
+  localMatches: MatchResult[],
+  aiMatches: MatchResult[],
+  fields: FormFieldInfo[],
+  aiEnhanced: boolean,
+): MatchResult[] {
+  const aiByIndex = new Map(aiMatches.map((match) => [match.index, match]));
+  const localByIndex = new Map(localMatches.map((match) => [match.index, match]));
+  const fieldByIndex = new Map(fields.map((field) => [field.index, field]));
+  const reviewedMatches = localMatches.map((localMatch) => {
+    const aiMatch = aiByIndex.get(localMatch.index);
+    if (!aiMatch) return localMatch;
+    const field = fieldByIndex.get(localMatch.index);
+    const identityBoundRepeatField = field?.rowIndex != null
+      && Boolean(field.groupLabel)
+      && /\[\d+\]\./.test(localMatch.fieldKey);
+    if (identityBoundRepeatField) return { ...localMatch, source: 'ai_reviewed' as const };
+    if (aiEnhanced && aiMatch.confidence === 'high') return aiMatch;
+    if (localMatch.confidence === 'medium' && aiMatch.confidence === 'high') return aiMatch;
+    return { ...localMatch, source: 'ai_reviewed' as const };
+  });
+  const aiOnlyMatches = aiMatches.filter((match) => !localByIndex.has(match.index));
+  return [...reviewedMatches, ...aiOnlyMatches];
+}
+
 export function getAiEligibleFields(fields: FormFieldInfo[], localMatches: MatchResult[]): FormFieldInfo[] {
   const locallyMatched = new Set(localMatches.map((match) => match.index));
   return fields.filter((field) => (

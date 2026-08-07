@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
-import { getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '../utils/local-matcher';
+import {
+  getAiEligibleFields,
+  isMeaningfullyFilled,
+  matchFieldsLocally,
+  mergeLocalAndAiMatches,
+} from '../utils/local-matcher';
 import { flattenProfileValues } from '../utils/profile-schema';
 import { isPageValueConsistent } from '../utils/value-compare';
 import { fieldFingerprint } from '../utils/field-fingerprint';
-import type { FormFieldInfo } from '../utils/matcher';
+import type { FormFieldInfo, MatchResult } from '../utils/matcher';
 import type { BlockCategory, TextField } from '../utils/db';
 
 function field(index: number, overrides: Partial<FormFieldInfo>): FormFieldInfo {
@@ -124,6 +129,39 @@ const reversed = matchFieldsLocally([
   field(3, { groupLabel: '外语水平', rowIndex: 1, columnLabel: '成绩', value: '536' }),
 ], textFields, blocks);
 assert.equal(reversed.find((match) => match.index === 1)?.value, '489');
+const identityBoundField = field(30, {
+  groupLabel: 'repeat-group',
+  rowIndex: 0,
+  columnLabel: 'date',
+});
+const identityBoundLocal: MatchResult = {
+  kind: 'text',
+  index: 30,
+  fieldKey: 'repeat-group[1].date',
+  value: '2023-12',
+  shortLabel: 'date',
+  confidence: 'high',
+  fillMode: 'short',
+  source: 'local',
+};
+const wrongAiMatch: MatchResult = {
+  ...identityBoundLocal,
+  fieldKey: 'repeat-group[2].date',
+  value: '2025-06',
+  source: 'ai',
+};
+assert.equal(
+  mergeLocalAndAiMatches([identityBoundLocal], [wrongAiMatch], [identityBoundField], true)[0]?.value,
+  '2023-12',
+  'AI must not rebind a repeatable field after row identity is known',
+);
+const flatLocal = { ...identityBoundLocal, index: 31, fieldKey: 'email', value: 'local', confidence: 'medium' as const };
+const flatAi = { ...flatLocal, value: 'ai', confidence: 'high' as const, source: 'ai' as const };
+assert.equal(
+  mergeLocalAndAiMatches([flatLocal], [flatAi], [field(31, { label: 'email' })], true)[0]?.value,
+  'ai',
+  'AI enhancement must remain available for non-repeatable ambiguous fields',
+);
 assert.match(reversed.find((match) => match.index === 1)?.fieldKey ?? '', /外语水平\[2\]/);
 assert.equal(byIndex.get(0)?.value, '测试学生');
 assert.equal(byIndex.get(1)?.value, '测试父亲');

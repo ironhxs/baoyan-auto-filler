@@ -10,7 +10,13 @@ import { matchFields, requestModelText } from '@/utils/matcher';
 import type { Category, FileRecord } from '@/utils/db';
 import type { MatchResult, FormFieldInfo, MaterialRole } from '@/utils/matcher';
 import { flattenProfileValues } from '@/utils/profile-schema';
-import { adaptValueToField, getAiEligibleFields, isMeaningfullyFilled, matchFieldsLocally } from '@/utils/local-matcher';
+import {
+  adaptValueToField,
+  getAiEligibleFields,
+  isMeaningfullyFilled,
+  matchFieldsLocally,
+  mergeLocalAndAiMatches,
+} from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import { aiRequestQueue } from '@/utils/ai-request-queue';
@@ -1642,19 +1648,10 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
     if (materialReview.error) aiError = [aiError, materialReview.error].filter(Boolean).join('；');
     materialAiReviewed = materialReview.reviewed;
   }
-  const aiByIndex = new Map(aiMatches.map((match) => [match.index, match]));
-  const localByIndex = new Map(localMatches.map((match) => [match.index, match]));
-  const reviewedMatches = localMatches.map((localMatch) => {
-    const aiMatch = aiByIndex.get(localMatch.index);
-    if (!aiMatch) return localMatch;
-    if (apiConfig.aiEnhanced && aiMatch.confidence === 'high') {
-      return aiMatch;
-    }
-    if (localMatch.confidence === 'medium' && aiMatch.confidence === 'high') return aiMatch;
-    return { ...localMatch, source: 'ai_reviewed' as const };
-  });
-  const aiOnlyMatches = aiMatches.filter((match) => !localByIndex.has(match.index));
-  const matches = [...reviewedMatches, ...aiOnlyMatches, ...fileMatches];
+  const matches = [
+    ...mergeLocalAndAiMatches(localMatches, aiMatches, textFieldInfos, apiConfig.aiEnhanced),
+    ...fileMatches,
+  ];
   return {
     ok: true,
     type: 'scan',
