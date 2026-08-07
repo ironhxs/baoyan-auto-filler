@@ -8,6 +8,7 @@ import {
   unbindTaskFromTab,
   updateTaskFromAutoRun,
   updateTaskRunnerCheckpoint,
+  canResumeRunner,
   upsertTaskPageAnalysis,
   upsertTaskPage,
 } from '../utils/application-tasks';
@@ -72,6 +73,34 @@ const checkpoint: ApplicationRunnerCheckpoint = {
 const withRunner = updateTaskRunnerCheckpoint(withAnalysis, checkpoint);
 assert.equal(withRunner.runner?.status, 'running');
 assert.equal(task.runner, undefined, 'immutable update must not mutate the input task');
+
+const taskA = createApplicationTask({
+  id: 'independent-a',
+  batchId: 'batch-a',
+  siteOrigin: 'https://a.example',
+  siteTitle: 'Project A',
+  now: 300,
+});
+const taskB = createApplicationTask({
+  id: 'independent-b',
+  batchId: 'batch-b',
+  siteOrigin: 'https://b.example',
+  siteTitle: 'Project B',
+  now: 300,
+});
+const first = updateTaskRunnerCheckpoint(taskA, {
+  ...checkpoint,
+  lastPageKey: 'project-a-page',
+  status: 'running',
+});
+const second = updateTaskRunnerCheckpoint(taskB, {
+  ...checkpoint,
+  lastPageKey: 'project-b-page',
+  status: 'paused',
+});
+assert.equal(canResumeRunner(first.runner), true);
+assert.equal(canResumeRunner(second.runner), false);
+assert.notEqual(first.runner?.lastPageKey, second.runner?.lastPageKey);
 
 assert.equal(task.status, 'stopped');
 assert.equal(task.displayName, 'A 大学');

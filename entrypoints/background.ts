@@ -18,6 +18,7 @@ import {
   APPLICATION_TASK_BINDINGS_KEY,
   archiveApplicationTask,
   bindTaskToTab,
+  canResumeRunner,
   createApplicationBatchId,
   createApplicationTask,
   createApplicationTaskId,
@@ -26,6 +27,7 @@ import {
   saveApplicationTask,
   unbindTaskFromTab,
   updateApplicationTask,
+  updateTaskRunnerCheckpoint,
   updateTaskFromAutoRun,
   upsertTaskPage,
   upsertTaskPageAnalysis,
@@ -35,6 +37,7 @@ import type {
   ApplicationTaskBindings,
   ApplicationTaskPauseReason,
 } from '@/utils/application-tasks';
+import type { ApplicationRunnerCheckpoint } from '@/utils/page-analysis';
 import { buildPageSnapshot } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
@@ -178,8 +181,9 @@ interface AutoRunState {
   message: string;
   updatedAt: number;
   history: AutoRunHistoryEntry[];
-  pauseReason?: 'materials' | 'required' | 'navigation' | 'error';
+  pauseReason?: 'materials' | 'required' | 'navigation' | 'page' | 'error';
   confirmedMaterialPageKey?: string;
+  lastPageKey?: string;
 }
 
 interface AutoRunSuccessResponse extends AutoRunState {
@@ -464,20 +468,88 @@ async function saveAutoRunState(state: AutoRunState): Promise<void> {
   state.updatedAt = Date.now();
   await chrome.storage.session.set({ [autoRunKey(state.tabId)]: state });
   if (state.taskId) {
-    await updateApplicationTask(state.taskId, (task) => updateTaskFromAutoRun(task, {
-      status: state.status,
-      pauseReason: state.pauseReason as ApplicationTaskPauseReason | undefined,
-      pageCount: state.pageCount,
-      filledCount: state.filledCount,
-      message: state.message,
-      history: state.history,
-      updatedAt: state.updatedAt,
-    }));
+    await updateApplicationTask(state.taskId, (task) => {
+      const nextTask = updateTaskFromAutoRun(task, {
+        status: state.status,
+        pauseReason: state.pauseReason as ApplicationTaskPauseReason | undefined,
+        pageCount: state.pageCount,
+        filledCount: state.filledCount,
+        message: state.message,
+        history: state.history,
+        updatedAt: state.updatedAt,
+      });
+      const checkpoint: ApplicationRunnerCheckpoint = {
+        status: state.status,
+        lastPageKey: state.lastPageKey,
+        history: state.history,
+        pauseReason: state.pauseReason as ApplicationTaskPauseReason | undefined,
+        confirmedMaterialPageKey: state.confirmedMaterialPageKey,
+        updatedAt: state.updatedAt,
+      };
+      return updateTaskRunnerCheckpoint(nextTask, checkpoint);
+    });
   }
   const badge = state.status === 'running' ? '…' : state.status === 'paused' ? '!' : state.status === 'complete' ? '✓' : '';
   const color = state.status === 'paused' ? '#f59e0b' : state.status === 'complete' ? '#22c55e' : '#257ffd';
   await chrome.action.setBadgeBackgroundColor({ tabId: state.tabId, color }).catch(() => undefined);
   await chrome.action.setBadgeText({ tabId: state.tabId, text: badge }).catch(() => undefined);
+}
+
+export function resumeAlarmName(taskId: string): string {
+  return `baotian:resume:${taskId}`;
+}
+
+export async function scheduleTaskResume(taskId: string, tabId: number, delayMs: number): Promise<void> {
+  if (await getBoundTaskId(tabId) !== taskId) return;
+  const task = await getApplicationTask(taskId);
+  if (!task || task.status === 'archived' || !canResumeRunner(task.runner)) return;
+  const when = Date.now() + Math.max(0, delayMs);
+  const alarmName = resumeAlarmName(taskId);
+  await chrome.alarms.clear(alarmName).catch(() => false);
+  await chrome.alarms.create(alarmName, { when });
+  await updateApplicationTask(taskId, (current) => {
+    if (current.status === 'archived' || !canResumeRunner(current.runner)) return current;
+    return updateTaskRunnerCheckpoint(current, {
+      ...current.runner!,
+      resumeAfter: when,
+      updatedAt: Math.max(current.updatedAt, Date.now()),
+    });
+  });
+}
+
+export async function resumeTaskForTab(tabId: number): Promise<void> {
+  const taskId = await getBoundTaskId(tabId);
+  if (!taskId) return;
+  const task = await getApplicationTask(taskId);
+  if (!task || task.status === 'archived' || !canResumeRunner(task.runner)) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  if (!tab) return;
+  const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
+    tabId,
+    { type: 'getPageMeta' },
+    false,
+  ).catch(() => null);
+  if (!meta) return;
+  const existing = await getAutoRunState(tabId);
+  const runner = task.runner!;
+  const state: AutoRunState = existing?.taskId === task.id && existing.status === 'running'
+    ? existing
+    : {
+        tabId,
+        taskId: task.id,
+        batchId: task.batchId,
+        status: 'running',
+        pageCount: task.pageCount,
+        filledCount: task.filledCount,
+        message: task.message,
+        updatedAt: Date.now(),
+        history: runner.history,
+        confirmedMaterialPageKey: runner.confirmedMaterialPageKey,
+        lastPageKey: semanticPageKey(meta),
+      };
+  state.lastPageKey = semanticPageKey(meta);
+  await saveAutoRunState(state);
+  await processAutoRun(tabId);
 }
 
 async function persistScanSnapshot(state: AutoRunState, scan: ScanSuccessResponse): Promise<void> {
@@ -1081,9 +1153,46 @@ export default defineBackground(() => {
         await restoreMarkersAfterNavigation(tabId, changeInfo.url ?? tab.url, generation);
       }).catch(() => undefined);
     }, 300);
-    void getAutoRunState(tabId).then((state) => {
-      if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);
-    });
+    if (tab.active) {
+      void getBoundTaskId(tabId).then(async (taskId) => {
+        if (!taskId) return;
+        const task = await getApplicationTask(taskId);
+        if (task && task.status !== 'archived' && canResumeRunner(task.runner)) {
+          await scheduleTaskResume(task.id, tabId, 600);
+        }
+      });
+    }
+  });
+
+  chrome.tabs.onActivated.addListener(({ tabId }) => {
+    const generation = (pageRestoreGenerations.get(tabId) ?? 0) + 1;
+    pageRestoreGenerations.set(tabId, generation);
+    void chrome.tabs.get(tabId).then(async (tab) => {
+      await enqueueSerializedRestore(pageRestoreTails, tabId, async () => {
+        if (!isCurrentPageRestore(tabId, generation)) return;
+        await restoreMarkersAfterNavigation(tabId, tab.url, generation);
+      }).catch(() => undefined);
+      const taskId = await getBoundTaskId(tabId);
+      if (!taskId) return;
+      const task = await getApplicationTask(taskId);
+      if (task && task.status !== 'archived' && canResumeRunner(task.runner)) {
+        await scheduleTaskResume(task.id, tabId, 600);
+      }
+    }).catch(() => undefined);
+  });
+
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    const prefix = 'baotian:resume:';
+    if (!alarm.name.startsWith(prefix)) return;
+    const taskId = alarm.name.slice(prefix.length);
+    void getTaskBindings().then(async (bindings) => {
+      const entry = Object.entries(bindings).find(([, boundTaskId]) => boundTaskId === taskId);
+      if (!entry) return;
+      const tabId = Number(entry[0]);
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+      if (!tab) return;
+      await resumeTaskForTab(tabId);
+    }).catch(() => undefined);
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
@@ -1091,7 +1200,11 @@ export default defineBackground(() => {
     pageRestoreGenerations.delete(tabId);
     void getAutoRunState(tabId).then(async (state) => {
       if (state?.taskId && state.status === 'running') {
-        await updateApplicationTask(state.taskId, (task) => updateTaskFromAutoRun(task, {
+        state.status = 'paused';
+        state.pauseReason = 'page';
+        state.message = '缃戠珯鏍囩椤靛凡鍏抽棴锛屼换鍔¤褰曞凡淇濈暀';
+        await saveAutoRunState(state);
+        /*
           status: 'paused',
           pauseReason: 'page',
           pageCount: state.pageCount,
@@ -1099,7 +1212,7 @@ export default defineBackground(() => {
           message: '网站标签页已关闭，任务记录已保留',
           history: state.history,
           updatedAt: Date.now(),
-        }));
+        })); */
       }
       await Promise.all([
         removeTaskBinding(tabId),
@@ -1716,7 +1829,7 @@ async function isSamePage(tabId: number, scan: ScanSuccessResponse): Promise<boo
 async function retryAutoRunAfterPageChange(state: AutoRunState): Promise<void> {
   state.message = '检测到页面已切换，已丢弃旧页结果并重新识别';
   await saveAutoRunState(state);
-  setTimeout(() => { void processAutoRun(state.tabId); }, 500);
+  if (state.taskId) await scheduleTaskResume(state.taskId, state.tabId, 500);
 }
 
 async function processAutoRun(tabId: number): Promise<void> {
@@ -1749,6 +1862,11 @@ async function processAutoRun(tabId: number): Promise<void> {
       return;
     }
     const markers = buildPageMarkers(scan);
+    state.lastPageKey = semanticPageKey({
+      url: scan.pageUrl,
+      label: scan.pageLabel,
+      signature: scan.pageSignature,
+    });
     await Promise.all([
       rememberPageMarkers(tabId, {
         url: scan.pageUrl,
@@ -1915,7 +2033,7 @@ async function processAutoRun(tabId: number): Promise<void> {
       historyEntry.message = '本页已核对，正在进入下一页';
       historyEntry.updatedAt = Date.now();
       await saveAutoRunState(state);
-      setTimeout(() => { void processAutoRun(tabId); }, 700);
+      if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 700);
       return;
     }
 
@@ -1946,7 +2064,7 @@ async function processAutoRun(tabId: number): Promise<void> {
     historyEntry.message = '本页已核对并进入下一页';
     historyEntry.updatedAt = Date.now();
     await saveAutoRunState(state);
-    setTimeout(() => { void processAutoRun(tabId); }, 250);
+    if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 250);
   } catch (error) {
     const state = await getAutoRunState(tabId);
     if (state?.status === 'running') {

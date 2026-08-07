@@ -137,6 +137,11 @@ function cloneRunnerCheckpoint(checkpoint: ApplicationRunnerCheckpoint): Applica
   };
 }
 
+/** A task can be resumed only while its durable runner explicitly remains running. */
+export function canResumeRunner(checkpoint: ApplicationRunnerCheckpoint | undefined): boolean {
+  return checkpoint?.status === 'running';
+}
+
 export function upsertTaskPageAnalysis(
   task: ApplicationTask,
   analysis: ApplicationPageAnalysis,
