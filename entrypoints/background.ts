@@ -40,8 +40,13 @@ import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { prepareFinalAudit, runFinalAudit } from '@/utils/material-audit';
 import type { AuditPreflight, FinalAuditReport } from '@/utils/final-audit';
 import { canonicalPageUrl, semanticPageKey } from '@/utils/page-identity';
-import { derivePageMarkers, shouldReusePageAnalysis } from '@/utils/page-analysis';
-import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
+import {
+  derivePageMarkers,
+  isCurrentRestoreGeneration,
+  shouldRestoreLegacyMarkers,
+  shouldReusePageAnalysis,
+} from '@/utils/page-analysis';
+import type { ApplicationPageAnalysis, CachedAnalysisRestoreResult } from '@/utils/page-analysis';
 import {
   planRepeatableRecords,
   prepareRepeatableRowScan,
@@ -233,6 +238,7 @@ interface RoleScore {
 }
 
 const autoRunInFlight = new Set<number>();
+const pageRestoreGenerations = new Map<number, number>();
 const AI_MATCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const AI_MATCH_CACHE_LIMIT = 40;
 const aiMatchCache = new Map<string, { expiresAt: number; matches: MatchResult[] }>();
@@ -519,30 +525,46 @@ async function savePageAnalysis(
   }));
 }
 
-async function restoreAnalysisToTab(tabId: number, analysis: ApplicationPageAnalysis): Promise<boolean> {
+function isCurrentPageRestore(tabId: number, generation: number): boolean {
+  return isCurrentRestoreGeneration(pageRestoreGenerations.get(tabId), generation);
+}
+
+async function restoreAnalysisToTab(
+  tabId: number,
+  analysis: ApplicationPageAnalysis,
+  generation?: number,
+): Promise<boolean> {
   const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
     tabId,
     { type: 'getPageMeta' },
   );
+  if (generation != null && !isCurrentPageRestore(tabId, generation)) return false;
   if (semanticPageKey(meta) !== analysis.pageKey) return false;
   await sendToContentScript(tabId, { type: 'markPreview', items: analysis.markers });
   return true;
 }
 
-async function restoreCachedAnalysisForTab(tabId: number): Promise<boolean> {
+async function restoreCachedAnalysisForTab(
+  tabId: number,
+  generation: number,
+): Promise<CachedAnalysisRestoreResult> {
   const taskId = await getBoundTaskId(tabId);
-  if (!taskId) return false;
+  if (!isCurrentPageRestore(tabId, generation)) return 'superseded';
+  if (!taskId) return 'missing';
   const task = await getApplicationTask(taskId);
-  if (!task) return false;
+  if (!isCurrentPageRestore(tabId, generation)) return 'superseded';
+  if (!task) return 'missing';
   const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
     tabId,
     { type: 'getPageMeta' },
   );
+  if (!isCurrentPageRestore(tabId, generation)) return 'superseded';
   const analysis = task.pageAnalyses?.[semanticPageKey(meta)];
-  if (!analysis || !shouldReusePageAnalysis(analysis, meta)) return false;
+  if (!analysis || !shouldReusePageAnalysis(analysis, meta)) return 'missing';
   const refreshed = await refreshAnalysisFromTab(tabId, analysis);
-  if (!refreshed) return false;
-  return restoreAnalysisToTab(tabId, refreshed);
+  if (!isCurrentPageRestore(tabId, generation)) return 'superseded';
+  if (!refreshed) return 'unverified';
+  return await restoreAnalysisToTab(tabId, refreshed, generation) ? 'restored' : 'unverified';
 }
 
 function defaultCheckedIndexes(scan: ScanSuccessResponse): number[] {
@@ -617,15 +639,17 @@ async function rememberPageMarkers(
   await chrome.storage.session.set({ [storageKey]: trimmed });
 }
 
-async function restorePageMarkers(tabId: number, url: string | undefined): Promise<void> {
+async function restorePageMarkers(tabId: number, url: string | undefined, generation: number): Promise<void> {
   const legacyKey = canonicalPageUrl(url);
   if (!legacyKey) return;
   const storageKey = markerStoreKey(tabId);
   const stored = await chrome.storage.session.get(storageKey);
+  if (!isCurrentPageRestore(tabId, generation)) return;
   const pages = stored[storageKey] as Record<string, { items: PageMarkerItem[] }> | undefined;
   if (!pages) return;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
+    if (!isCurrentPageRestore(tabId, generation)) return;
     const current = await chrome.tabs.get(tabId).catch(() => undefined);
     if (!current || canonicalPageUrl(current.url) !== legacyKey) return;
     const meta = await sendToContentScript<{ url: string; label: string; signature: string }>(
@@ -636,12 +660,34 @@ async function restorePageMarkers(tabId: number, url: string | undefined): Promi
     const key = meta ? semanticPageKey(meta) : legacyKey;
     const page = pages[key] ?? pages[legacyKey];
     if (!page) continue;
+    if (!isCurrentPageRestore(tabId, generation)) return;
     const result = await sendToContentScript<{ marked?: number }>(
       tabId,
       { type: 'markPreview', items: page.items },
     ).catch(() => undefined);
     if ((result?.marked ?? 0) > 0 || page.items.length === 0) return;
   }
+}
+
+async function clearPageMarkers(tabId: number, generation: number): Promise<void> {
+  if (!isCurrentPageRestore(tabId, generation)) return;
+  await sendToContentScript(tabId, { type: 'markPreview', items: [] }).catch(() => undefined);
+}
+
+async function restoreMarkersAfterNavigation(
+  tabId: number,
+  url: string | undefined,
+  generation: number,
+): Promise<void> {
+  const cachedResult = await restoreCachedAnalysisForTab(tabId, generation).catch<CachedAnalysisRestoreResult>(
+    () => 'unverified',
+  );
+  if (!isCurrentPageRestore(tabId, generation) || cachedResult === 'superseded') return;
+  if (shouldRestoreLegacyMarkers(cachedResult)) {
+    await restorePageMarkers(tabId, url, generation).catch(() => undefined);
+    return;
+  }
+  if (cachedResult === 'unverified') await clearPageMarkers(tabId, generation);
 }
 
 async function sendToContentScript<T>(
@@ -1025,11 +1071,10 @@ export default defineBackground(() => {
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.status !== 'complete' && !changeInfo.url) return;
+    const generation = (pageRestoreGenerations.get(tabId) ?? 0) + 1;
+    pageRestoreGenerations.set(tabId, generation);
     setTimeout(() => {
-      void (async () => {
-        await restorePageMarkers(tabId, changeInfo.url ?? tab.url).catch(() => undefined);
-        await restoreCachedAnalysisForTab(tabId).catch(() => false);
-      })();
+      void restoreMarkersAfterNavigation(tabId, changeInfo.url ?? tab.url, generation);
     }, 300);
     void getAutoRunState(tabId).then((state) => {
       if (state?.status === 'running') setTimeout(() => { void processAutoRun(tabId); }, 600);
@@ -1038,6 +1083,7 @@ export default defineBackground(() => {
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     autoRunInFlight.delete(tabId);
+    pageRestoreGenerations.delete(tabId);
     void getAutoRunState(tabId).then(async (state) => {
       if (state?.taskId && state.status === 'running') {
         await updateApplicationTask(state.taskId, (task) => updateTaskFromAutoRun(task, {

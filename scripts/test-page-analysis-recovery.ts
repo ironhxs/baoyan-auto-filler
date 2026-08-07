@@ -4,7 +4,12 @@ import {
   getTaskPageAnalysis,
   upsertTaskPageAnalysis,
 } from '../utils/application-tasks';
-import { derivePageMarkers, shouldReusePageAnalysis } from '../utils/page-analysis';
+import {
+  isCurrentRestoreGeneration,
+  shouldRestoreLegacyMarkers,
+  derivePageMarkers,
+  shouldReusePageAnalysis,
+} from '../utils/page-analysis';
 import type { FormFieldInfo, MatchResult } from '../utils/matcher';
 import type { ApplicationPageAnalysis } from '../utils/page-analysis';
 import { semanticPageKey } from '../utils/page-identity';
@@ -107,5 +112,22 @@ const cachedMatch: MatchResult = {
 };
 const refreshedMarkers = derivePageMarkers([changedField], [cachedMatch]);
 assert.equal(refreshedMarkers[0]?.status, 'mismatch', 'live field changes must restamp cached markers');
+
+assert.equal(
+  shouldRestoreLegacyMarkers('unverified'),
+  false,
+  'a matching cached analysis with an unverifiable live refresh must suppress legacy marker fallback',
+);
+assert.equal(
+  shouldRestoreLegacyMarkers('missing'),
+  true,
+  'legacy markers remain available only when no matching cached analysis exists',
+);
+assert.equal(
+  isCurrentRestoreGeneration(2, 1),
+  false,
+  'an older restore generation cannot paint after a newer generation supersedes it',
+);
+assert.equal(isCurrentRestoreGeneration(2, 2), true);
 
 console.log('page analysis recovery tests passed');

@@ -41,6 +41,18 @@ export interface ApplicationPageAnalysis {
   capturedAt: number;
 }
 
+export type CachedAnalysisRestoreResult = 'missing' | 'restored' | 'unverified' | 'superseded';
+
+/** Legacy markers are safe only when this page has no matching cached analysis. */
+export function shouldRestoreLegacyMarkers(result: CachedAnalysisRestoreResult): boolean {
+  return result === 'missing';
+}
+
+/** A restore may paint only while it is the newest generation for its tab. */
+export function isCurrentRestoreGeneration(activeGeneration: number | undefined, generation: number): boolean {
+  return activeGeneration === generation;
+}
+
 /** Derive marker state from the current DOM fields and their cached matches. */
 export function derivePageMarkers(fields: FormFieldInfo[], matches: MatchResult[]): PageMarkerItem[] {
   const matchByIndex = new Map(matches.map((match) => [match.index, match]));
