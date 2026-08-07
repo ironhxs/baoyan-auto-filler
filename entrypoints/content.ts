@@ -4,9 +4,11 @@ import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { isAddRowLabel } from '@/utils/repeatable-records';
 import {
   classifyRepeatDialogFields,
-  classifyRepeatDialogSaveControl,
+  hasVerifiedRepeatRecordChange,
   isProtectedRepeatDialogControl,
   planRepeatDialogAssignments,
+  selectRepeatDialogRoot,
+  selectRepeatDialogSaveCandidate,
 } from '@/utils/repeatable-dialog';
 
 interface FormField {
@@ -577,11 +579,14 @@ async function waitForRowOrRepeatDialog(
   table: HTMLTableElement,
   previousCount: number,
   groupLabel: string,
-): Promise<'row' | 'dialog' | 'none'> {
+  beforeRoots: ReadonlySet<HTMLElement>,
+): Promise<'row' | 'dialog' | 'ambiguous-dialog' | 'none'> {
   for (let attempt = 0; attempt < 16; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 75));
     if (repeatDataRows(table).length > previousCount) return 'row';
-    if (findVisibleRepeatDialogRoot(groupLabel)) return 'dialog';
+    const dialog = findUniqueRepeatDialogRoot(groupLabel, beforeRoots);
+    if (dialog.root) return 'dialog';
+    if (dialog.reason === 'ambiguous-dialog-root') return 'ambiguous-dialog';
   }
   return 'none';
 }
@@ -611,18 +616,23 @@ async function prepareRepeatRows(
         break;
       }
       try {
+        const beforeRoots = new Set(getVisibleDialogRoots());
         control.click();
+        const outcome = await waitForRowOrRepeatDialog(table, previousCount, target.groupLabel, beforeRoots);
+        if (outcome === 'dialog') {
+          dialogGroups.add(target.groupLabel);
+          break;
+        }
+        if (outcome === 'ambiguous-dialog') {
+          failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control opened multiple matching record dialogs or drawers' });
+          break;
+        }
+        if (outcome !== 'row') {
+          failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control did not create a field row' });
+          break;
+        }
       } catch {
         failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control click failed' });
-        break;
-      }
-      const outcome = await waitForRowOrRepeatDialog(table, previousCount, target.groupLabel);
-      if (outcome === 'dialog') {
-        dialogGroups.add(target.groupLabel);
-        break;
-      }
-      if (outcome !== 'row') {
-        failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control did not create a field row' });
         break;
       }
       added++;
@@ -1055,36 +1065,90 @@ function visibleControlLabel(control: HTMLElement): string {
   ].join(' '));
 }
 
-function findVisibleRepeatDialogRoot(groupLabel: string): HTMLElement | undefined {
+const REPEAT_DIALOG_ROOT_SELECTOR = '[role="dialog"],.modal,.dialog,.popup,.drawer,.layui-layer,.ui-dialog,.el-dialog,.el-drawer,.ant-modal,.ant-drawer,.ivu-drawer,.vxe-modal,.window';
+const REPEAT_DIALOG_TITLE_SELECTOR = '[role="heading"],.modal-title,.dialog-title,.el-dialog__title,.ant-modal-title,.drawer-title,.el-drawer__title,.ant-drawer-title,.layui-layer-title,.ui-dialog-title';
+const REPEAT_DIALOG_FOOTER_SELECTOR = 'footer,.modal-footer,.dialog-footer,.el-dialog__footer,.ant-modal-footer,.drawer-footer,.el-drawer__footer,.ant-drawer-footer,.layui-layer-btn,.ui-dialog-buttonpane';
+
+type RepeatDialogRootReason = 'dialog-root' | 'no-dialog-root' | 'no-new-dialog-root' | 'ambiguous-dialog-root';
+
+interface RepeatDialogRootResult {
+  root?: HTMLElement;
+  reason: RepeatDialogRootReason;
+}
+
+function repeatDialogTitleText(root: HTMLElement): string {
+  const labelledBy = root.getAttribute('aria-labelledby')
+    ?.split(/\s+/)
+    .map((id) => root.ownerDocument.getElementById(id)?.textContent ?? '')
+    .join(' ') ?? '';
+  const titles = Array.from(root.querySelectorAll<HTMLElement>(REPEAT_DIALOG_TITLE_SELECTOR))
+    .filter(isVisible)
+    .filter((title) => {
+      const closestRoot = title.closest<HTMLElement>(REPEAT_DIALOG_ROOT_SELECTOR);
+      return !closestRoot || closestRoot === root;
+    })
+    .map((title) => normalizeText(title.textContent ?? ''));
+  return joinUnique([
+    root.getAttribute('aria-label') ?? '',
+    labelledBy,
+    ...titles,
+  ]);
+}
+
+function isGenericRepeatDialogTitle(value: string): boolean {
+  const normalized = normalizeText(value).replace(/\s+/g, '').toLowerCase();
+  return !normalized || /^(?:新增|添加|新建|录入|add|create|new)$/.test(normalized);
+}
+
+function findUniqueRepeatDialogRoot(
+  groupLabel: string,
+  beforeRoots?: ReadonlySet<HTMLElement>,
+): RepeatDialogRootResult {
   const roots = getVisibleDialogRoots()
     .filter((root) => root !== document.body && isVisible(root))
-    .filter((root) => countEditables(root) >= 1)
-    .map((root) => ({
-      root,
-      text: joinUnique([textWithoutControls(root), findNearestHeadingText(root)]),
-    }))
-    .filter(({ text }) => (
-      sameRepeatGroupLabel(detectProfileGroup(text), groupLabel) ||
-      sameRepeatGroupLabel(text, groupLabel)
-    ))
-    .sort((left, right) => countEditables(right.root) - countEditables(left.root));
-  return roots[0]?.root;
+    .filter((root) => countEditables(root) >= 1);
+  const selection = selectRepeatDialogRoot(roots.map((root) => {
+    const title = repeatDialogTitleText(root);
+    const contentGroup = detectProfileGroup(textWithoutControls(root));
+    return {
+      id: root,
+      newlyOpened: !beforeRoots || !beforeRoots.has(root),
+      leaf: !roots.some((other) => other !== root && root.contains(other)),
+      groupMatched: (
+        sameRepeatGroupLabel(detectProfileGroup(title), groupLabel) ||
+        sameRepeatGroupLabel(title, groupLabel) ||
+        (isGenericRepeatDialogTitle(title) && sameRepeatGroupLabel(contentGroup, groupLabel))
+      ),
+    };
+  }), Boolean(beforeRoots));
+  return { root: selection.id, reason: selection.reason };
 }
 
-async function waitForRepeatDialogRoot(groupLabel: string, timeoutMs = 1600): Promise<HTMLElement | undefined> {
+async function waitForRepeatDialogRoot(
+  groupLabel: string,
+  timeoutMs = 1600,
+  beforeRoots?: ReadonlySet<HTMLElement>,
+): Promise<RepeatDialogRootResult> {
   const deadline = Date.now() + timeoutMs;
+  let latest: RepeatDialogRootResult = {
+    reason: beforeRoots ? 'no-new-dialog-root' : 'no-dialog-root',
+  };
   while (Date.now() < deadline) {
-    const root = findVisibleRepeatDialogRoot(groupLabel);
-    if (root) return root;
+    const result = findUniqueRepeatDialogRoot(groupLabel, beforeRoots);
+    if (result.root || result.reason === 'ambiguous-dialog-root') return result;
+    latest = result;
     await new Promise((resolve) => setTimeout(resolve, 80));
   }
-  return undefined;
+  return latest;
 }
 
-function repeatGroupFingerprint(groupLabel: string): string {
+function captureRepeatGroupSnapshot(groupLabel: string): { recordCount: number; text: string } {
   const table = findRepeatTable(groupLabel);
-  if (!table) return '';
-  return `${repeatDataRows(table).length}:${normalizeText(textWithoutControls(table)).slice(0, 1200)}`;
+  if (!table) return { recordCount: 0, text: '' };
+  return {
+    recordCount: repeatDataRows(table).length,
+    text: textWithoutControls(table),
+  };
 }
 
 interface RepeatDialogEntry {
@@ -1104,27 +1168,38 @@ function findUnsafeRepeatDialogControl(root: HTMLElement): HTMLElement | undefin
     .find((control) => isVisible(control) && isProtectedRepeatDialogControl(visibleControlLabel(control)));
 }
 
-function findSafeRepeatDialogSaveControl(root: HTMLElement): HTMLElement | undefined {
+function isRecordAssociatedRepeatDialogSaveControl(root: HTMLElement, control: HTMLElement): boolean {
+  const form = control.closest('form');
+  if (form && root.contains(form)) return true;
+  const footer = control.closest<HTMLElement>(REPEAT_DIALOG_FOOTER_SELECTOR);
+  return Boolean(footer && root.contains(footer));
+}
+
+function findSafeRepeatDialogSaveControl(
+  root: HTMLElement,
+): { control?: HTMLElement; reason: 'record-save' | 'ambiguous-record-save' | 'no-record-save' } {
   const candidates = Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],input[type="submit"],[role="button"]'))
     .filter((control) => isVisible(control) && !(control as HTMLButtonElement).disabled)
-    .map((control) => ({ control, classification: classifyRepeatDialogSaveControl(visibleControlLabel(control)) }))
-    .filter((candidate) => candidate.classification.safe);
-  const preference = ['\u4fdd\u5b58', '\u786e\u5b9a', '\u786e\u8ba4', '\u6dfb\u52a0', '\u65b0\u589e'];
-  const preferenceRank = (control: HTMLElement): number => {
-    const index = preference.findIndex((label) => visibleControlLabel(control) === label);
-    return index < 0 ? preference.length : index;
+    .map((control) => ({
+      id: control,
+      label: visibleControlLabel(control),
+      recordAssociated: isRecordAssociatedRepeatDialogSaveControl(root, control),
+    }));
+  const selection = selectRepeatDialogSaveCandidate(candidates);
+  return {
+    control: selection.id,
+    reason: selection.reason,
   };
-  return candidates.sort((left, right) => preferenceRank(left.control) - preferenceRank(right.control))[0]?.control;
 }
 
 async function fillRepeatDialogRecord(
   root: HTMLElement,
   fields: Array<{ key: string; value: string }>,
-): Promise<{ processedFields: number; reason?: string }> {
+): Promise<{ processedFields: number; assignedValues: string[]; reason?: string }> {
   const entries = collectRepeatDialogEntries(root);
-  if (entries.length === 0) return { processedFields: 0, reason: 'No editable record fields found in dialog' };
+  if (entries.length === 0) return { processedFields: 0, assignedValues: [], reason: 'No editable record fields found in dialog' };
   if (findUnsafeRepeatDialogControl(root)) {
-    return { processedFields: 0, reason: 'Dialog contains a protected high-risk control' };
+    return { processedFields: 0, assignedValues: [], reason: 'Dialog contains a protected high-risk control' };
   }
   const classified = classifyRepeatDialogFields(entries.map((entry) => ({
     index: entry.index,
@@ -1136,37 +1211,51 @@ async function fillRepeatDialogRecord(
   })));
   const plan = planRepeatDialogAssignments(classified, fields);
   if (plan.failures.length > 0) {
-    return { processedFields: 0, reason: `Required dialog fields cannot be safely matched (${plan.failures[0].code})` };
+    return { processedFields: 0, assignedValues: [], reason: `Required dialog fields cannot be safely matched (${plan.failures[0].code})` };
   }
   const entryByIndex = new Map(entries.map((entry) => [entry.index, entry]));
   let processedFields = 0;
   for (const assignment of plan.assignments) {
     const entry = entryByIndex.get(assignment.index);
     if (!entry || !await fillElementAsync(entry.el, assignment.value, 'high')) {
-      return { processedFields, reason: 'Dialog field could not be filled and read back' };
+      return { processedFields, assignedValues: [], reason: 'Dialog field could not be filled and read back' };
     }
     processedFields++;
   }
   for (const entry of entries) {
     if (!entry.field.required) continue;
     if (entry.field.protected || entry.field.kind === 'file' || !getCurrentValue(entry.el).trim()) {
-      return { processedFields, reason: 'A required dialog field remains unverified' };
+      return { processedFields, assignedValues: [], reason: 'A required dialog field remains unverified' };
     }
   }
-  return { processedFields };
+  return { processedFields, assignedValues: plan.assignments.map((assignment) => assignment.value) };
 }
+
+function isRepeatDialogReadyForNextRecord(root: HTMLElement, assignedValues: string[]): boolean {
+  const assigned = assignedValues.map((value) => normalizeText(value)).filter(Boolean);
+  if (assigned.length === 0) return false;
+  return assigned.every((value) => collectRepeatDialogEntries(root)
+    .every((entry) => normalizeText(getCurrentValue(entry.el)) !== value));
+}
+
+type RepeatDialogSaveVerification = 'dialog-closed' | 'record-changed' | 'unverified';
 
 async function waitForRepeatDialogSave(
   root: HTMLElement,
   groupLabel: string,
-  beforeFingerprint: string,
-): Promise<boolean> {
+  beforeSnapshot: { recordCount: number; text: string },
+  assignedValues: string[],
+): Promise<RepeatDialogSaveVerification> {
   for (let attempt = 0; attempt < 24; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
-    if (!root.isConnected || !isVisible(root)) return true;
-    if (repeatGroupFingerprint(groupLabel) !== beforeFingerprint) return true;
+    if (!root.isConnected || !isVisible(root)) return 'dialog-closed';
+    if (hasVerifiedRepeatRecordChange(
+      beforeSnapshot,
+      captureRepeatGroupSnapshot(groupLabel),
+      assignedValues,
+    )) return 'record-changed';
   }
-  return false;
+  return 'unverified';
 }
 
 async function prepareRepeatRecords(
@@ -1186,48 +1275,79 @@ async function prepareRepeatRecords(
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Repeatable group table not found' });
         break;
       }
-      let root = await waitForRepeatDialogRoot(target.groupLabel, 300);
+      let dialog = await waitForRepeatDialogRoot(target.groupLabel, 300);
+      let root = dialog.root;
       if (!root) {
+        if (dialog.reason === 'ambiguous-dialog-root') {
+          failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Multiple matching record dialogs or drawers are open' });
+          break;
+        }
         const control = findAddRowControl(table);
         if (!control) {
           failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'No visible add-record control found' });
           break;
         }
         try {
+          const beforeRoots = new Set(getVisibleDialogRoots());
           control.click();
+          dialog = await waitForRepeatDialogRoot(target.groupLabel, 1600, beforeRoots);
+          root = dialog.root;
         } catch {
           failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Add-record control click failed' });
           break;
         }
-        root = await waitForRepeatDialogRoot(target.groupLabel);
       }
       if (!root) {
-        failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Add-record control did not open a matching dialog or drawer' });
+        failures.push({
+          groupLabel: target.groupLabel,
+          itemIndex: record.itemIndex,
+          presentation: 'dialog',
+          reason: dialog.reason === 'ambiguous-dialog-root'
+            ? 'Add-record control opened multiple matching record dialogs or drawers'
+            : 'Add-record control did not open one unique matching dialog or drawer',
+        });
         break;
       }
-      const beforeFingerprint = repeatGroupFingerprint(target.groupLabel);
+      const beforeSnapshot = captureRepeatGroupSnapshot(target.groupLabel);
       const fillResult = await fillRepeatDialogRecord(root, record.fields);
       if (fillResult.reason) {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: fillResult.reason });
         break;
       }
       const save = findSafeRepeatDialogSaveControl(root);
-      if (!save) {
-        failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'No safe record-level save control found in dialog' });
+      if (!save.control) {
+        failures.push({
+          groupLabel: target.groupLabel,
+          itemIndex: record.itemIndex,
+          presentation: 'dialog',
+          reason: save.reason === 'ambiguous-record-save'
+            ? 'Multiple record-level save controls are open; unable to choose safely'
+            : 'No safe record-level save control found in dialog',
+        });
         break;
       }
       try {
-        save.click();
+        save.control.click();
       } catch {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Record-level save control click failed' });
         break;
       }
-      if (!await waitForRepeatDialogSave(root, target.groupLabel, beforeFingerprint)) {
+      const verification = await waitForRepeatDialogSave(
+        root,
+        target.groupLabel,
+        beforeSnapshot,
+        fillResult.assignedValues,
+      );
+      if (verification === 'unverified') {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Record save could not be verified; dialog remains open' });
         break;
       }
       added++;
       processed += fillResult.processedFields;
+      if (verification === 'record-changed' && !isRepeatDialogReadyForNextRecord(root, fillResult.assignedValues)) {
+        failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Record was saved but the editor remains populated; paused before the next record to avoid overwriting it' });
+        break;
+      }
     }
   }
   return { added, processed, failures };

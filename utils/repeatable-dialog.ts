@@ -33,6 +33,34 @@ export interface RepeatDialogSaveControlClassification {
   reason: 'record-save' | 'protected-action' | 'unknown-action';
 }
 
+export interface RepeatDialogSaveCandidate<T = string> {
+  id: T;
+  label: string;
+  recordAssociated: boolean;
+}
+
+export interface RepeatDialogSaveCandidateSelection<T = string> {
+  id: T | undefined;
+  reason: 'record-save' | 'ambiguous-record-save' | 'no-record-save';
+}
+
+export interface RepeatDialogRootCandidate<T = string> {
+  id: T;
+  newlyOpened: boolean;
+  leaf: boolean;
+  groupMatched: boolean;
+}
+
+export interface RepeatDialogRootSelection<T = string> {
+  id: T | undefined;
+  reason: 'dialog-root' | 'no-dialog-root' | 'no-new-dialog-root' | 'ambiguous-dialog-root';
+}
+
+export interface RepeatRecordSnapshot {
+  recordCount: number;
+  text: string;
+}
+
 export function normalizeRepeatDialogText(value: string | undefined): string {
   return (value ?? '')
     .toLowerCase()
@@ -207,7 +235,7 @@ export function planRepeatDialogAssignments(
   return { assignments, failures };
 }
 
-const PROTECTED_ACTION_PATTERN = /(?:提交报名|确认报名|最终提交|提交申请|确认申请|下一步|上一步|志愿|导师|调剂|承诺|协议|验证码|短信码|图形码|支付|缴费|付款|删除|取消报名)/;
+const PROTECTED_ACTION_PATTERN = /(?:提交报名|确认报名|最终提交|提交申请|确认申请|下一步|上一步|志愿|导师|调剂|承诺|协议|验证码|短信码|图形码|支付|缴费|付款|删除|取消报名|submitapplication|finalsubmit|submitrequest|confirmapplication|confirmrequest|nextstep|previousstep|preference|advisor|supervisor|transfer|agreement|commitment|captcha|verificationcode|smscode|payment|paynow|delete|cancelapplication)/;
 
 export function isProtectedRepeatDialogControl(value: string | undefined): boolean {
   return PROTECTED_ACTION_PATTERN.test(normalizeRepeatDialogText(value));
@@ -218,8 +246,59 @@ export function classifyRepeatDialogSaveControl(
 ): RepeatDialogSaveControlClassification {
   const label = normalizeRepeatDialogText(value);
   if (isProtectedRepeatDialogControl(label)) return { safe: false, reason: 'protected-action' };
-  if (/^(?:保存|确定|确认|添加|新增|保存并关闭|保存并继续)$/.test(label)) {
+  if (/^(?:保存|确定|确认|添加|新增|保存并关闭|保存并继续|save|confirm|add|create|saveandclose|saveandcontinue)$/.test(label)) {
     return { safe: true, reason: 'record-save' };
   }
   return { safe: false, reason: 'unknown-action' };
+}
+
+function recordSavePriority(value: string): number {
+  const label = normalizeRepeatDialogText(value);
+  if (/^(?:保存|保存并关闭|保存并继续|save|saveandclose|saveandcontinue)$/.test(label)) return 0;
+  if (/^(?:确定|确认|confirm)$/.test(label)) return 1;
+  if (/^(?:添加|新增|add|create)$/.test(label)) return 2;
+  return Number.POSITIVE_INFINITY;
+}
+
+export function selectRepeatDialogSaveCandidate<T>(
+  candidates: RepeatDialogSaveCandidate<T>[],
+): RepeatDialogSaveCandidateSelection<T> {
+  const safeCandidates = candidates.filter((candidate) => (
+    candidate.recordAssociated && classifyRepeatDialogSaveControl(candidate.label).safe
+  ));
+  if (safeCandidates.length === 0) return { id: undefined, reason: 'no-record-save' };
+  const bestPriority = Math.min(...safeCandidates.map((candidate) => recordSavePriority(candidate.label)));
+  const best = safeCandidates.filter((candidate) => recordSavePriority(candidate.label) === bestPriority);
+  if (best.length !== 1) return { id: undefined, reason: 'ambiguous-record-save' };
+  return { id: best[0].id, reason: 'record-save' };
+}
+
+export function selectRepeatDialogRoot<T>(
+  candidates: RepeatDialogRootCandidate<T>[],
+  requireNew = false,
+): RepeatDialogRootSelection<T> {
+  const groupCandidates = candidates.filter((candidate) => candidate.groupMatched && candidate.leaf);
+  const eligible = requireNew
+    ? groupCandidates.filter((candidate) => candidate.newlyOpened)
+    : groupCandidates;
+  if (eligible.length === 1) return { id: eligible[0].id, reason: 'dialog-root' };
+  if (eligible.length > 1) return { id: undefined, reason: 'ambiguous-dialog-root' };
+  return {
+    id: undefined,
+    reason: requireNew && groupCandidates.length > 0 ? 'no-new-dialog-root' : 'no-dialog-root',
+  };
+}
+
+export function hasVerifiedRepeatRecordChange(
+  before: RepeatRecordSnapshot,
+  after: RepeatRecordSnapshot,
+  assignedValues: string[],
+): boolean {
+  if (after.recordCount > before.recordCount) return true;
+  const beforeText = normalizeRepeatDialogText(before.text);
+  const afterText = normalizeRepeatDialogText(after.text);
+  return assignedValues
+    .map((value) => normalizeRepeatDialogText(value))
+    .filter(Boolean)
+    .some((value) => !beforeText.includes(value) && afterText.includes(value));
 }

@@ -2,8 +2,11 @@ import assert from 'node:assert/strict';
 import {
   classifyRepeatDialogFields,
   classifyRepeatDialogSaveControl,
+  hasVerifiedRepeatRecordChange,
   isProtectedRepeatDialogControl,
   planRepeatDialogAssignments,
+  selectRepeatDialogRoot,
+  selectRepeatDialogSaveCandidate,
 } from '../utils/repeatable-dialog';
 
 const fields = classifyRepeatDialogFields([
@@ -40,12 +43,64 @@ assert.equal(duplicateNames.every((field) => field.ambiguous), true, 'duplicate 
 assert.equal(classifyRepeatDialogSaveControl('\u4fdd\u5b58').safe, true);
 assert.equal(classifyRepeatDialogSaveControl('\u786e\u5b9a').safe, true);
 assert.equal(classifyRepeatDialogSaveControl('\u4fdd\u5b58\u5e76\u5173\u95ed').safe, true);
+assert.equal(classifyRepeatDialogSaveControl('Save').safe, true);
+assert.equal(classifyRepeatDialogSaveControl('Save and Close').safe, true);
 assert.equal(classifyRepeatDialogSaveControl('\u63d0\u4ea4\u62a5\u540d').safe, false);
 assert.equal(classifyRepeatDialogSaveControl('\u786e\u8ba4\u62a5\u540d').safe, false);
 assert.equal(classifyRepeatDialogSaveControl('\u4e0b\u4e00\u6b65').safe, false);
+assert.equal(classifyRepeatDialogSaveControl('Submit application').safe, false);
+assert.equal(classifyRepeatDialogSaveControl('Pay now').safe, false);
 assert.equal(isProtectedRepeatDialogControl('\u9009\u62e9\u5bfc\u5e08'), true);
 assert.equal(isProtectedRepeatDialogControl('\u8f93\u5165\u9a8c\u8bc1\u7801'), true);
+assert.equal(isProtectedRepeatDialogControl('Choose advisor'), true);
+assert.equal(isProtectedRepeatDialogControl('Captcha'), true);
 assert.equal(isProtectedRepeatDialogControl('\u4fdd\u5b58'), false);
+
+assert.deepEqual(selectRepeatDialogSaveCandidate([
+  { id: 'save', label: '\u4fdd\u5b58', recordAssociated: true },
+]), { id: 'save', reason: 'record-save' });
+assert.deepEqual(selectRepeatDialogSaveCandidate([
+  { id: 'picker-confirm', label: '\u786e\u5b9a', recordAssociated: false },
+  { id: 'record-save', label: '\u4fdd\u5b58', recordAssociated: true },
+]), { id: 'record-save', reason: 'record-save' });
+assert.deepEqual(selectRepeatDialogSaveCandidate([
+  { id: 'first', label: '\u4fdd\u5b58', recordAssociated: true },
+  { id: 'second', label: '\u4fdd\u5b58', recordAssociated: true },
+]), { id: undefined, reason: 'ambiguous-record-save' });
+
+assert.deepEqual(selectRepeatDialogRoot([
+  { id: 'existing', newlyOpened: false, leaf: true, groupMatched: true },
+  { id: 'drawer', newlyOpened: true, leaf: true, groupMatched: true },
+], true), { id: 'drawer', reason: 'dialog-root' });
+assert.deepEqual(selectRepeatDialogRoot([
+  { id: 'parent', newlyOpened: true, leaf: false, groupMatched: true },
+  { id: 'child', newlyOpened: true, leaf: true, groupMatched: true },
+], true), { id: 'child', reason: 'dialog-root' });
+assert.deepEqual(selectRepeatDialogRoot([
+  { id: 'first', newlyOpened: true, leaf: true, groupMatched: true },
+  { id: 'second', newlyOpened: true, leaf: true, groupMatched: true },
+], true), { id: undefined, reason: 'ambiguous-dialog-root' });
+
+assert.equal(hasVerifiedRepeatRecordChange(
+  { recordCount: 2, text: 'existing award' },
+  { recordCount: 2, text: 'validation error message' },
+  ['new award'],
+), false, 'unrelated list text changes must never count as a record save');
+assert.equal(hasVerifiedRepeatRecordChange(
+  { recordCount: 2, text: 'existing award' },
+  { recordCount: 3, text: 'existing award' },
+  ['new award'],
+), true, 'a new data row verifies the record save');
+assert.equal(hasVerifiedRepeatRecordChange(
+  { recordCount: 2, text: 'existing award' },
+  { recordCount: 2, text: 'existing award new award' },
+  ['new award'],
+), true, 'a newly listed assigned value verifies the record save');
+assert.equal(hasVerifiedRepeatRecordChange(
+  { recordCount: 2, text: 'existing award common value' },
+  { recordCount: 2, text: 'existing award common value changed' },
+  ['common value'],
+), false, 'an assigned value already present before saving is not evidence of a new record');
 
 const familyPlan = planRepeatDialogAssignments(reorderedFamilyFields, [
   { key: '\u59d3\u540d', value: 'Family member' },
