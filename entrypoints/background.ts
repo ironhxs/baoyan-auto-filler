@@ -65,6 +65,26 @@ import {
   type RepeatableRecordPlan,
   type PrepareRepeatRowsResult,
 } from '@/utils/repeatable-records';
+import { buildAgentPageSnapshot } from '@/utils/agent/page-snapshot';
+import { retrieveAgentSourceRecords } from '@/utils/agent/profile-retriever';
+import { requestAgentPagePlan } from '@/utils/agent/planner';
+import {
+  createAgentPlanCacheKey,
+  getAgentPlanCache,
+  saveAgentPlanCache,
+} from '@/utils/agent/cache';
+import { canAgentAdvance, validateAgentPlan } from '@/utils/agent/policy';
+import { buildAgentExecutionBatch } from '@/utils/agent/executor';
+import type { AgentExecutionResult } from '@/utils/agent/executor';
+import { verifyAgentExecution } from '@/utils/agent/verifier';
+import { runAgentPage } from '@/utils/agent/runtime';
+import type {
+  AgentActionResult,
+  AgentCheckpoint,
+  AgentPagePlan,
+  AgentPageSnapshot,
+  AgentPlannedAction,
+} from '@/utils/agent/types';
 
 type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 interface PageMarkerItem {
@@ -192,6 +212,7 @@ interface AutoRunState {
   pauseReason?: 'materials' | 'required' | 'navigation' | 'page' | 'error';
   confirmedMaterialPageKey?: string;
   lastPageKey?: string;
+  agent?: AgentCheckpoint;
 }
 
 interface AutoRunSuccessResponse extends AutoRunState {
@@ -492,6 +513,7 @@ async function saveAutoRunState(state: AutoRunState): Promise<void> {
         history: state.history,
         pauseReason: state.pauseReason as ApplicationTaskPauseReason | undefined,
         confirmedMaterialPageKey: state.confirmedMaterialPageKey,
+        agent: state.agent,
         updatedAt: state.updatedAt,
       };
       return updateTaskRunnerCheckpoint(nextTask, checkpoint);
@@ -553,6 +575,7 @@ export async function resumeTaskForTab(tabId: number): Promise<void> {
         updatedAt: Date.now(),
         history: runner.history,
         confirmedMaterialPageKey: runner.confirmedMaterialPageKey,
+        agent: runner.agent,
         lastPageKey: semanticPageKey(meta),
       };
   state.lastPageKey = semanticPageKey(meta);
@@ -1854,6 +1877,288 @@ async function retryAutoRunAfterPageChange(state: AutoRunState): Promise<void> {
   if (state.taskId) await scheduleTaskResume(state.taskId, state.tabId, 500);
 }
 
+function shouldUsePageAgent(scan: ScanSuccessResponse, configured: boolean, enhanced: boolean): boolean {
+  if (!configured || !enhanced) return false;
+  const textFields = scan.fields.filter((field) => field.kind !== 'file' && !field.protected);
+  if (textFields.length === 0) return false;
+  const repeatGroups = new Map<string, Set<string>>();
+  for (const field of textFields) {
+    const group = (field.repeatGroup || field.groupLabel || '').trim();
+    if (!group || field.rowIndex == null) continue;
+    const columns = repeatGroups.get(group) ?? new Set<string>();
+    columns.add((field.columnLabel || field.label || `field-${field.index}`).trim());
+    repeatGroups.set(group, columns);
+  }
+  if ([...repeatGroups.values()].some((columns) => columns.size >= 2)) return true;
+  if (textFields.some((field) => field.fillMode === 'long')) return true;
+  const locallyCovered = new Set(scan.matches.filter((match) => match.kind !== 'file').map((match) => match.index));
+  return textFields.filter((field) => !isMeaningfullyFilled(field) && !locallyCovered.has(field.index)).length >= 2;
+}
+
+function agentInstructions(fields: FormFieldInfo[]): string[] {
+  const values = fields.flatMap((field) => {
+    const contextRules = (field.context ?? '').match(/[^。；;\n]{0,50}(?:日期格式|时间格式|不得|不能|禁止|最多|不超过)[^。；;\n]{0,80}/g) ?? [];
+    return [field.dateFormat ?? '', field.hint ?? '', ...contextRules];
+  });
+  return [...new Set(values.map((value) => value.replace(/\s+/g, ' ').trim()).filter(Boolean))].slice(0, 30);
+}
+
+function buildSnapshotForAgent(
+  scan: Pick<ScanSuccessResponse, 'pageSignature' | 'pageUrl' | 'pageLabel' | 'fields'>,
+): AgentPageSnapshot {
+  return buildAgentPageSnapshot({
+    pageKey: scan.pageSignature,
+    url: scan.pageUrl,
+    title: scan.pageLabel,
+    stepText: scan.pageLabel,
+    instructions: agentInstructions(scan.fields),
+    fields: scan.fields,
+  });
+}
+
+function agentSnapshotValues(snapshot: AgentPageSnapshot): Record<string, string> {
+  return Object.fromEntries(snapshot.groups.flatMap((group) => group.fields)
+    .map((field) => [field.targetId, field.currentValue]));
+}
+
+function agentPlanTargetActions(plan: AgentPagePlan): Map<string, { action: AgentPlannedAction; value: string }> {
+  const result = new Map<string, { action: AgentPlannedAction; value: string }>();
+  for (const action of plan.actions) {
+    if (action.type === 'fill_row') {
+      for (const value of action.values) result.set(value.targetId, { action, value: value.value });
+    } else if (action.type === 'fill_field' || action.type === 'select') {
+      result.set(action.targetId, { action, value: action.value });
+    }
+  }
+  return result;
+}
+
+interface AgentScanRunResult {
+  status: 'complete' | 'paused';
+  canAdvance: boolean;
+  reason?: string;
+  success: number;
+  matches: MatchResult[];
+  cached: boolean;
+  reviewed: number;
+}
+
+async function runAgentForScan(
+  tabId: number,
+  state: AutoRunState,
+  initialScan: ScanSuccessResponse,
+): Promise<AgentScanRunResult> {
+  const apiConfig = await getApiConfig();
+  let currentSnapshot = buildSnapshotForAgent(initialScan);
+  let cached = false;
+  let reviewed = 0;
+  let lastBeforeValues: Record<string, string> = agentSnapshotValues(currentSnapshot);
+  let lastAfterSnapshot = currentSnapshot;
+  let lastContentResults: AgentExecutionResult[] = [];
+  let lastExecutionPlan: AgentPagePlan | null = null;
+  let preparedResults: AgentActionResult[] = [];
+  const filledThisRun = new Set<string>();
+
+  const observe = async (): Promise<AgentPageSnapshot> => {
+    const [results, meta] = await Promise.all([
+      sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
+      sendToContentScript<{ label: string; url: string; signature: string }>(tabId, { type: 'getPageMeta' }),
+    ]);
+    currentSnapshot = buildSnapshotForAgent({
+      pageSignature: meta.signature,
+      pageUrl: meta.url,
+      pageLabel: meta.label,
+      fields: (results ?? []).map((result) => ({ ...result.field, index: result.index })),
+    });
+    return currentSnapshot;
+  };
+
+  const outcome = await runAgentPage({
+    observe,
+    retrieve: async (snapshot) => retrieveAgentSourceRecords(
+      snapshot,
+      await getAllBlockCategories(),
+      await getAllTextFields(),
+    ),
+    plan: async (snapshot, sourceRecords) => {
+      const key = createAgentPlanCacheKey({ snapshot, sourceRecords, apiConfig });
+      const existing = await getAgentPlanCache(key);
+      if (existing) {
+        cached = true;
+        return existing.plan;
+      }
+      const plan = await requestAgentPagePlan({ snapshot, sourceRecords }, apiConfig);
+      await saveAgentPlanCache(key, snapshot.pageKey, plan);
+      return plan;
+    },
+    validate: (plan, snapshot, sourceRecords) => {
+      const previousAgentValues = Object.fromEntries((state.agent?.results ?? [])
+        .filter((result) => result.targetId && (result.status === 'verified' || result.status === 'manual'))
+        .map((result) => [result.targetId!, result.observed]));
+      const validated = validateAgentPlan(plan, {
+        snapshot,
+        sourceRecords,
+        observedValues: agentSnapshotValues(snapshot),
+        lastAgentValues: previousAgentValues,
+      });
+      reviewed = validated.reviewItems.length;
+      return { plan, ...validated };
+    },
+    prepare: async (validated) => {
+      preparedResults = [];
+      const additions = validated.executableActions.filter((action) => action.type === 'add_rows');
+      if (additions.length === 0) return;
+      const targets = additions.flatMap((action) => {
+        if (action.type !== 'add_rows') return [];
+        const group = currentSnapshot.groups.find((candidate) => candidate.groupId === action.groupId);
+        return group ? [{
+          groupLabel: group.label,
+          requiredRows: group.rows.length + action.count,
+          missingItemIndexes: Array.from({ length: action.count }, (_, index) => group.rows.length + index),
+        }] : [];
+      });
+      const prepared = targets.length > 0
+        ? await sendToContentScript<PrepareRepeatRowsResult>(tabId, { type: 'prepareRepeatRows', targets })
+        : { added: 0, failures: [] };
+      preparedResults = additions.map((action) => ({
+        actionId: action.actionId,
+        status: prepared.failures.some((failure) => (
+          currentSnapshot.groups.find((group) => group.groupId === action.groupId)?.label === failure.groupLabel
+        )) ? 'failed' as const : 'verified' as const,
+        observed: String(prepared.added),
+        reason: prepared.failures.length > 0 ? prepared.failures.map((failure) => failure.reason).join('; ') : 'rows-prepared',
+        retryable: prepared.failures.length > 0,
+        updatedAt: Date.now(),
+      }));
+      await observe();
+    },
+    execute: async (validated) => {
+      lastExecutionPlan = { ...validated.plan, actions: validated.executableActions };
+      const batch = buildAgentExecutionBatch(lastExecutionPlan, currentSnapshot);
+      lastBeforeValues = agentSnapshotValues(currentSnapshot);
+      if (!batch.safeToExecute) {
+        lastContentResults = [
+          ...batch.missingTargetIds.map((targetId) => ({
+            actionId: agentPlanTargetActions(validated.plan).get(targetId)?.action.actionId ?? 'unknown',
+            targetId, attempted: false, observed: '', matched: false, reason: 'target-not-found',
+          })),
+          ...batch.blockedTargetIds.map((targetId) => ({
+            actionId: agentPlanTargetActions(validated.plan).get(targetId)?.action.actionId ?? 'unknown',
+            targetId, attempted: false, observed: lastBeforeValues[targetId] ?? '', matched: false, reason: 'protected-target',
+          })),
+        ];
+      } else {
+        lastContentResults = batch.items.length > 0
+          ? await sendToContentScript<AgentExecutionResult[]>(tabId, {
+              type: 'executeAgentActions',
+              pageKey: batch.pageKey,
+              items: batch.items,
+            })
+          : [];
+      }
+      for (const result of lastContentResults) if (result.matched) filledThisRun.add(result.targetId);
+      lastAfterSnapshot = await observe();
+      const executionResults: AgentActionResult[] = lastContentResults.map((result) => ({
+        actionId: result.actionId,
+        targetId: result.targetId,
+        status: result.matched ? 'verified' : result.reason === 'manual-value-changed' ? 'manual' : 'failed',
+        observed: result.observed,
+        reason: result.reason,
+        retryable: /target-not-found|page-changed|write-readback-mismatch/.test(result.reason),
+        updatedAt: Date.now(),
+      }));
+      return { results: [...preparedResults, ...executionResults] };
+    },
+    verify: async (validated, report) => {
+      const verificationPlan = lastExecutionPlan ?? { ...validated.plan, actions: validated.executableActions };
+      const planTargets = agentPlanTargetActions(verificationPlan);
+      const afterValues = agentSnapshotValues(lastAfterSnapshot);
+      const verification = verifyAgentExecution({
+        plan: verificationPlan,
+        snapshot: lastAfterSnapshot,
+        beforeValues: lastBeforeValues,
+        afterValues,
+        lastAgentValues: Object.fromEntries((state.agent?.results ?? [])
+          .filter((result) => result.targetId)
+          .map((result) => [result.targetId!, result.observed])),
+        executionResults: lastContentResults,
+      });
+      const results = Object.entries(verification.fieldStatuses).map(([targetId, status]) => {
+        const resultStatus: AgentActionResult['status'] = status === 'empty' || status === 'planned'
+          ? 'failed'
+          : status;
+        return {
+          actionId: planTargets.get(targetId)?.action.actionId ?? 'unknown',
+          targetId,
+          status: resultStatus,
+          observed: afterValues[targetId] ?? '',
+          reason: resultStatus === 'verified' ? 'readback-verified' : resultStatus,
+          retryable: resultStatus === 'failed',
+          updatedAt: Date.now(),
+        } satisfies AgentActionResult;
+      });
+      const failedActionIds = [...new Set(results.filter((result) => result.status === 'failed')
+        .map((result) => result.actionId))];
+      const rowBlocked = verification.rowStatuses.some((row) => row.blocksAdvance);
+      const allFieldStatuses = Object.fromEntries(lastAfterSnapshot.groups.flatMap((group) => group.fields)
+        .map((field) => [
+          field.targetId,
+          verification.fieldStatuses[field.targetId] ?? (field.currentValue.trim() ? 'manual' : 'empty'),
+        ]));
+      const canAdvance = canAgentAdvance({
+        snapshot: lastAfterSnapshot,
+        nextActionLabel: '下一步',
+        fieldStatuses: allFieldStatuses,
+        rowStatuses: verification.rowStatuses,
+      });
+      return {
+        results: [...report.results.filter((result) => !result.targetId), ...results],
+        complete: failedActionIds.length === 0 && !rowBlocked,
+        needsRepair: failedActionIds.length > 0 || rowBlocked,
+        failedActionIds,
+        canAdvance,
+        reason: rowBlocked ? '复杂表格仍有部分行未完整填写' : failedActionIds.length > 0 ? '部分字段回读失败' : undefined,
+      };
+    },
+    save: async (checkpoint) => {
+      state.agent = checkpoint;
+      await saveAutoRunState(state);
+    },
+  }, state.agent);
+
+  state.agent = outcome.checkpoint;
+  const targetActions = outcome.checkpoint.plan ? agentPlanTargetActions(outcome.checkpoint.plan) : new Map();
+  const fieldsByTarget = new Map(lastAfterSnapshot.groups.flatMap((group) => group.fields)
+    .map((field) => [field.targetId, field]));
+  const matches = outcome.checkpoint.results.flatMap((result): MatchResult[] => {
+    if (!result.targetId || (result.status !== 'verified' && result.status !== 'manual')) return [];
+    const field = fieldsByTarget.get(result.targetId);
+    const planned = targetActions.get(result.targetId);
+    if (!field || !planned) return [];
+    const action = planned.action;
+    const sourceRecordId = action.type === 'fill_row' || action.type === 'fill_field' || action.type === 'select'
+      ? action.sourceRecordId
+      : 'agent';
+    return [{
+      kind: 'text',
+      index: field.index,
+      fieldKey: sourceRecordId,
+      value: planned.value,
+      shortLabel: field.label.slice(0, 12),
+      confidence: result.status === 'verified' ? 'high' : 'medium',
+    }];
+  });
+  return {
+    status: outcome.status,
+    canAdvance: outcome.canAdvance,
+    reason: outcome.reason,
+    success: filledThisRun.size,
+    matches,
+    cached,
+    reviewed,
+  };
+}
+
 async function processAutoRun(tabId: number): Promise<void> {
   if (autoRunInFlight.has(tabId)) return;
   autoRunInFlight.add(tabId);
@@ -1966,18 +2271,51 @@ async function processAutoRun(tabId: number): Promise<void> {
       await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
       return;
     }
-    const selectedMatches = scan.matches.filter((match) => (
-      shouldAutoFillMatch(match, scannedFieldByIndex.get(match.index))
-    ));
-    const result = await sendToContentScript<{ success: number; failure: number }>(tabId, {
-      type: 'fill',
-      items: selectedMatches.map((match) => ({
-        kind: 'text',
-        index: match.index,
-        value: match.value,
-        confidence: match.confidence,
-      })),
-    });
+    const [apiConfig, configured] = await Promise.all([getApiConfig(), isApiConfigured()]);
+    let result: { success: number; failure: number };
+    if (shouldUsePageAgent(scan, configured, apiConfig.aiEnhanced)) {
+      state.message = '保填 Agent 正在按页面行列和填写规则生成整页计划';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
+      await saveAutoRunState(state);
+      const agentRun = await runAgentForScan(tabId, state, scan);
+      scan.ai.attempted = true;
+      scan.ai.cached = agentRun.cached;
+      scan.ai.reviewed += agentRun.reviewed;
+      const agentIndexes = new Set(agentRun.matches.map((match) => match.index));
+      scan.matches = [
+        ...scan.matches.filter((match) => match.kind === 'file' || !agentIndexes.has(match.index)),
+        ...agentRun.matches,
+      ].sort((left, right) => left.index - right.index);
+      scan.matched = scan.matches.length;
+      historyEntry.aiAttempted = true;
+      historyEntry.aiCached = agentRun.cached;
+      historyEntry.aiReviewed += agentRun.reviewed;
+      if (agentRun.status === 'paused') {
+        state.status = 'paused';
+        state.pauseReason = /LLM API error|API|502|401|403|429/i.test(agentRun.reason ?? '') ? 'error' : 'required';
+        state.message = agentRun.reason || '保填 Agent 需要人工确认后继续';
+        historyEntry.status = 'paused';
+        historyEntry.message = state.message;
+        historyEntry.updatedAt = Date.now();
+        await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
+        return;
+      }
+      result = { success: agentRun.success, failure: 0 };
+    } else {
+      const selectedMatches = scan.matches.filter((match) => (
+        shouldAutoFillMatch(match, scannedFieldByIndex.get(match.index))
+      ));
+      result = await sendToContentScript<{ success: number; failure: number }>(tabId, {
+        type: 'fill',
+        items: selectedMatches.map((match) => ({
+          kind: 'text',
+          index: match.index,
+          value: match.value,
+          confidence: match.confidence,
+        })),
+      });
+    }
     if (!(await isSamePage(tabId, scan))) {
       if (state.history.at(-1) === historyEntry) state.history.pop();
       await retryAutoRunAfterPageChange(state);
