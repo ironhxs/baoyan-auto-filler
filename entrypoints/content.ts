@@ -3,6 +3,12 @@ import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { isAddRowLabel } from '@/utils/repeatable-records';
 import {
+  classifyRepeatPreparation,
+  selectNewDialogRoot,
+  selectScopedConfirm,
+  selectScopedTrigger,
+} from '@/utils/dom-selection-policy';
+import {
   classifyRepeatDialogFields,
   hasVerifiedRepeatRecordChange,
   isProtectedRepeatDialogControl,
@@ -243,13 +249,31 @@ function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
   for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
     const controls = Array.from(container.querySelectorAll<HTMLElement>(
       'button,input[type="button"],a,[role="button"],span,.add-on',
-    ));
-    const trigger = controls.find((candidate) => {
-      if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
-      const text = normalizeText((candidate as HTMLInputElement).value || candidate.textContent || '');
-      return /^(选择|请选择|选取)$/.test(text);
+    )).filter((candidate) => isVisible(candidate) && !(candidate as HTMLButtonElement).disabled);
+    const inputs = Array.from(container.querySelectorAll<HTMLInputElement>('input'))
+      .filter((candidate) => isVisible(candidate) && candidate.type !== 'hidden' && candidate.type !== 'button');
+    const distance = (left: HTMLElement, right: HTMLElement): number => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      const leftX = leftRect.left + leftRect.width / 2;
+      const leftY = leftRect.top + leftRect.height / 2;
+      const rightX = rightRect.left + rightRect.width / 2;
+      const rightY = rightRect.top + rightRect.height / 2;
+      return Math.round(Math.hypot(leftX - rightX, leftY - rightY));
+    };
+    const candidates = controls.map((candidate, index) => {
+      const nearestInput = inputs
+        .map((input) => ({ input, distance: distance(input, candidate) }))
+        .sort((left, right) => left.distance - right.distance)[0];
+      return {
+        id: String(index),
+        ownerId: nearestInput?.input === el ? 'target' : 'other',
+        distance: nearestInput?.distance ?? Number.MAX_SAFE_INTEGER,
+        label: normalizeText((candidate as HTMLInputElement).value || candidate.textContent || ''),
+      };
     });
-    if (trigger) return trigger;
+    const selected = selectScopedTrigger(candidates, 'target');
+    if (selected != null) return controls[Number(selected)] ?? null;
     if (container.matches('tr,.form-group,.form-item,.form-row,.ant-form-item,.el-form-item')) break;
   }
   return null;
@@ -551,7 +575,11 @@ function repeatDataRows(table: HTMLTableElement): HTMLTableRowElement[] {
 
 function findRepeatTable(groupLabel: string): HTMLTableElement | undefined {
   return Array.from(document.querySelectorAll<HTMLTableElement>('table')).find((table) => {
-    const detectedGroup = inferProfileGroupFromTable(table) || detectProfileGroup(findGroupText(table, table));
+    const localHeading = findNearestHeadingText(table);
+    const detectedGroup = inferProfileGroupFromTable(table) || detectProfileGroup(joinUnique([
+      normalizeText(table.caption?.textContent ?? ''),
+      localHeading,
+    ]));
     return detectedGroup === groupLabel;
   });
 }
@@ -620,7 +648,7 @@ async function prepareRepeatRows(
   for (const target of targets) {
     const table = findRepeatTable(target.groupLabel);
     if (!table) {
-      failures.push({ groupLabel: target.groupLabel, reason: 'Repeatable group table not found' });
+      if (classifyRepeatPreparation({ tableMatch: 'none', hasAddControl: false }) === 'skip') continue;
       continue;
     }
     const requestedRows = Math.max(Math.floor(target.requiredRows), 0);
@@ -632,7 +660,9 @@ async function prepareRepeatRows(
       const previousCount = repeatDataRows(table).length;
       const control = findAddRowControl(table);
       if (!control) {
-        failures.push({ groupLabel: target.groupLabel, reason: 'No visible add-row control found' });
+        if (classifyRepeatPreparation({ tableMatch: 'strong', hasAddControl: false }) === 'failure') {
+          failures.push({ groupLabel: target.groupLabel, reason: 'No visible add-row control found' });
+        }
         break;
       }
       try {
@@ -1051,7 +1081,7 @@ function valueMatches(el: HTMLElement, expected: string): boolean {
   return normalizedActual === normalizedExpected;
 }
 
-function getVisibleDialogRoots(): HTMLElement[] {
+function collectVisibleDialogRoots(): HTMLElement[] {
   const roots = Array.from(document.querySelectorAll<HTMLElement>(
     '[role="dialog"],.modal,.dialog,.popup,.drawer,.layui-layer,.ui-dialog,.el-dialog,.el-drawer,.ant-modal,.ant-drawer,.ivu-drawer,.vxe-modal,.window',
   )).filter(isVisible);
@@ -1063,6 +1093,11 @@ function getVisibleDialogRoots(): HTMLElement[] {
       // Cross-origin dialog frames cannot be automated safely.
     }
   }
+  return roots;
+}
+
+function getVisibleDialogRoots(): HTMLElement[] {
+  const roots = collectVisibleDialogRoots();
   return roots.length ? roots : [document.body];
 }
 
@@ -1377,14 +1412,14 @@ function normalizeSelectionText(text: string): string {
   return normalizeText(text).trim();
 }
 
-async function waitForDialogChoice(value: string, timeoutMs = 2500): Promise<HTMLElement | null> {
+async function waitForDialogChoice(root: HTMLElement, value: string, timeoutMs = 2500): Promise<HTMLElement | null> {
   const deadline = Date.now() + timeoutMs;
   const wanted = normalizeSelectionText(value);
   const comparable = (text: string) => normalizeSelectionText(text).replace(/^\d{4,12}\s*/, '');
   while (Date.now() < deadline) {
-    const candidates = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>(
+    const candidates = Array.from(root.querySelectorAll<HTMLElement>(
       '[role="option"],li,td,a,button,.option,.item,.tree-node,.el-tree-node__label,.ant-select-item-option-content',
-    ))).filter((candidate) => isVisible(candidate) && candidate.childElementCount <= 3);
+    )).filter((candidate) => isVisible(candidate) && candidate.childElementCount <= 3);
     const exact = candidates
       .filter((candidate) => {
         const text = normalizeSelectionText(candidate.textContent ?? '');
@@ -1420,25 +1455,21 @@ function setDialogSearchValue(input: HTMLInputElement, value: string): void {
   input.dispatchEvent(new EventConstructor('change', { bubbles: true }));
 }
 
-async function searchDialogChoice(value: string): Promise<HTMLElement | null> {
+async function searchDialogChoice(root: HTMLElement, value: string): Promise<HTMLElement | null> {
   const term = getTerminalSelectionTerm(value);
   if (!term) return null;
-  for (const root of getVisibleDialogRoots()) {
-    const input = Array.from(root.querySelectorAll<HTMLInputElement>(
-      'input[type="search"],input[type="text"],input:not([type])',
-    )).find((candidate) => isVisible(candidate) && !candidate.disabled && !candidate.readOnly);
-    if (!input) continue;
-    const button = Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]'))
-      .find((candidate) => isVisible(candidate) && /^(搜索|查询|查找)$/.test(normalizeText(
-        (candidate as HTMLInputElement).value || candidate.textContent || '',
-      )));
-    if (!button) continue;
-    setDialogSearchValue(input, term);
-    button.click();
-    const choice = await waitForDialogChoice(term, 1800);
-    if (choice) return choice;
-  }
-  return null;
+  const input = Array.from(root.querySelectorAll<HTMLInputElement>(
+    'input[type="search"],input[type="text"],input:not([type])',
+  )).find((candidate) => isVisible(candidate) && !candidate.disabled && !candidate.readOnly);
+  if (!input) return null;
+  const button = Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]'))
+    .find((candidate) => isVisible(candidate) && /^(搜索|查询|查找)$/.test(normalizeText(
+      (candidate as HTMLInputElement).value || candidate.textContent || '',
+    )));
+  if (!button) return null;
+  setDialogSearchValue(input, term);
+  button.click();
+  return waitForDialogChoice(root, term, 1800);
 }
 
 function dialogValueMatches(el: HTMLElement, expected: string): boolean {
@@ -1448,6 +1479,62 @@ function dialogValueMatches(el: HTMLElement, expected: string): boolean {
   return Boolean(actual && wanted && (actual.includes(wanted) || wanted.includes(actual)));
 }
 
+function selectionFieldKeyword(fieldText: string): string {
+  if (/院系|学院|系所/.test(fieldText)) return '院系';
+  if (/专业/.test(fieldText)) return '专业';
+  if (/学校|院校/.test(fieldText)) return '学校';
+  return '';
+}
+
+async function waitForSelectionDialogRoot(
+  fieldText: string,
+  beforeRoots: ReadonlySet<HTMLElement>,
+  timeoutMs = 1800,
+): Promise<HTMLElement | null> {
+  const deadline = Date.now() + timeoutMs;
+  const keyword = selectionFieldKeyword(fieldText);
+  while (Date.now() < deadline) {
+    const roots = collectVisibleDialogRoots();
+    const newlyOpened = roots.filter((root) => !beforeRoots.has(root));
+    const candidates = roots.map((root, index) => {
+      const rootText = normalizeText([
+        repeatDialogTitleText(root),
+        root.getAttribute('aria-label') ?? '',
+      ].join(' '));
+      return {
+        id: String(index),
+        wasVisibleBefore: beforeRoots.has(root),
+        associated: newlyOpened.length === 1 || !keyword || rootText.includes(keyword),
+      };
+    });
+    const selected = selectNewDialogRoot(candidates);
+    if (selected != null) return roots[Number(selected)] ?? null;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  return null;
+}
+
+function findScopedSelectionConfirm(root: HTMLElement): HTMLElement | null {
+  const controls = Array.from(root.querySelectorAll<HTMLElement>(
+    'button,a,input[type="button"],input[type="submit"],[role="button"]',
+  )).filter((candidate) => isVisible(candidate) && !(candidate as HTMLButtonElement).disabled);
+  const selected = selectScopedConfirm(controls.map((control, index) => ({
+    id: String(index),
+    dialogId: 'target-dialog',
+    label: normalizeText((control as HTMLInputElement).value || control.textContent || ''),
+  })), 'target-dialog');
+  return selected == null ? null : controls[Number(selected)] ?? null;
+}
+
+async function waitForDialogValue(el: HTMLElement, value: string, timeoutMs = 1400): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (dialogValueMatches(el, value)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  return dialogValueMatches(el, value);
+}
+
 async function fillDialogSelection(
   el: HTMLElement,
   value: string,
@@ -1455,23 +1542,33 @@ async function fillDialogSelection(
 ): Promise<boolean> {
   const trigger = findSelectionTrigger(el);
   if (!trigger) return false;
+  const field = extractField(el);
+  const fieldText = joinUnique([field.label, field.hint, field.context, field.ariaLabel, field.title]);
+  const beforeRoots = new Set(collectVisibleDialogRoots());
   trigger.click();
-  let choice = await waitForDialogChoice(value, 1200);
+  const dialogRoot = await waitForSelectionDialogRoot(fieldText, beforeRoots);
+  if (!dialogRoot) {
+    markField(el, 'review');
+    return false;
+  }
+  let choice = await waitForDialogChoice(dialogRoot, value, 1200);
 
   if (!choice) {
-    choice = await searchDialogChoice(value);
+    choice = await searchDialogChoice(dialogRoot, value);
   }
 
   if (!choice) {
-    const search = getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLInputElement>(
+    const search = Array.from(dialogRoot.querySelectorAll<HTMLInputElement>(
       'input[type="text"],input:not([type])',
-    ))).find((input) => input !== el && isVisible(input) && !input.readOnly && !input.disabled);
+    )).find((input) => input !== el && isVisible(input) && !input.readOnly && !input.disabled);
     if (search) {
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      const view = search.ownerDocument.defaultView;
+      const setter = view?.HTMLInputElement && Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value')?.set;
       if (setter) setter.call(search, value); else search.value = value;
-      search.dispatchEvent(new Event('input', { bubbles: true }));
-      search.dispatchEvent(new Event('change', { bubbles: true }));
-      choice = await waitForDialogChoice(value, 1800);
+      const EventConstructor = view?.Event ?? Event;
+      search.dispatchEvent(new EventConstructor('input', { bubbles: true }));
+      search.dispatchEvent(new EventConstructor('change', { bubbles: true }));
+      choice = await waitForDialogChoice(dialogRoot, value, 1800);
     }
   }
 
@@ -1480,16 +1577,12 @@ async function fillDialogSelection(
     return false;
   }
   choice.click();
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitForDialogValue(el, value, 500);
 
   if (!dialogValueMatches(el, value)) {
-    const confirm = [
-      ...Array.from(document.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]')),
-      ...getVisibleDialogRoots().flatMap((root) => Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]'))),
-    ]
-      .find((candidate) => isVisible(candidate) && /^(确定|确认|保存)$/.test(normalizeText(candidate.textContent ?? '')));
+    const confirm = findScopedSelectionConfirm(dialogRoot);
     confirm?.click();
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await waitForDialogValue(el, value);
   }
 
   const verified = dialogValueMatches(el, value);
