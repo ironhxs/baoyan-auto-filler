@@ -270,6 +270,7 @@ export interface ModelJsonSchema {
 export interface ModelRequestOptions {
   stream?: boolean;
   jsonSchema?: ModelJsonSchema;
+  timeoutMs?: number;
 }
 
 export function getRequestBody(
@@ -420,15 +421,34 @@ export function isUnsupportedMultimodalError(status: number, raw: string): boole
   return /input[_ -]?(?:image|file)|image[_ -]?(?:url|input)|multimodal|vision|unsupported|not supported|unknown (?:content|input) type/i.test(raw);
 }
 
-async function postModelRequest(apiConfig: ApiConfig, body: Record<string, unknown>): Promise<Response> {
-  return fetch(getRequestUrl(apiConfig), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiConfig.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+export const MODEL_REQUEST_TIMEOUT_MS = 90_000;
+
+async function postModelRequest(
+  apiConfig: ApiConfig,
+  body: Record<string, unknown>,
+  timeoutMs = MODEL_REQUEST_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const effectiveTimeout = Math.max(1, timeoutMs);
+  const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+  try {
+    return await fetch(getRequestUrl(apiConfig), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiConfig.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`LLM API 请求超过 ${Math.ceil(effectiveTimeout / 1000)} 秒，已安全暂停`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function extractModelResponse(response: Response, apiMode: ApiMode): Promise<string> {
@@ -489,7 +509,7 @@ export async function requestModelText(
   if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
   const apiMode = getApiMode(apiConfig);
   return extractModelResponse(
-    await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, options)),
+    await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, options), options.timeoutMs),
     apiMode,
   );
 }

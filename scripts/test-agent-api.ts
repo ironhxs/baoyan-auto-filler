@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { getRequestBody } from '../utils/matcher';
+import { getRequestBody, requestModelText } from '../utils/matcher';
 import {
   agentFingerprint,
   requestAgentPagePlan,
@@ -143,6 +143,25 @@ try {
     /network down/,
   );
   assert.equal(networkAttempts, 1, 'network errors must not trigger a second mode');
+
+  let receivedSignal = false;
+  globalThis.fetch = async (_input, init) => {
+    receivedSignal = init?.signal instanceof AbortSignal;
+    return new Response(JSON.stringify({ output_text: JSON.stringify(planObject) }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  await requestModelText(responsesConfig, 'timeout probe', { timeoutMs: 20 });
+  assert.equal(receivedSignal, true, 'model requests must be abortable');
+
+  globalThis.fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+  });
+  await assert.rejects(
+    () => requestModelText(responsesConfig, 'timeout probe', { timeoutMs: 10 }),
+    /LLM API 请求超过 1 秒，已安全暂停/,
+  );
 } finally {
   globalThis.fetch = originalFetch;
 }
