@@ -4,6 +4,7 @@ export type ProfileSectionId =
   | 'basic'
   | 'family'
   | 'education'
+  | 'education_career'
   | 'language'
   | 'research_training'
   | 'internship_practice'
@@ -67,6 +68,13 @@ export const PROFILE_SECTIONS: ProfileSectionDefinition[] = [
     icon: '🌐',
     kind: 'repeat',
     fieldKeys: ['考试名称', '成绩', '考试日期', '备注', '证书编号'],
+  },
+  {
+    id: 'education_career',
+    title: '学习与工作履历',
+    icon: '🗓️',
+    kind: 'repeat',
+    fieldKeys: ['起始时间', '结束时间', '学校或工作单位', '担任职务'],
   },
   {
     id: 'research_training',

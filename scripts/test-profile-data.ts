@@ -10,6 +10,10 @@ import {
   parseProfileImportBundle,
   stringifyProfileExport,
 } from '../utils/profile-data';
+import { PROFILE_SECTIONS } from '../utils/profile-schema';
+
+const chronologySection = PROFILE_SECTIONS.find((section) => section.id === 'education_career');
+assert.deepEqual(chronologySection?.fieldKeys, ['起始时间', '结束时间', '学校或工作单位', '担任职务']);
 
 assert.deepEqual(normalizeProfileFields([
   { key: ' 姓名 ', value: ' 张三 ' },

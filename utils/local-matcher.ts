@@ -315,7 +315,7 @@ function findProjectedAggregateMatch(
 ): MatchResult | undefined {
   if (field.rowIndex != null || !field.groupLabel || field.fillMode !== 'long') return undefined;
   const sourceBlocks = blocks.filter((block) => [
-    'research_training', 'internship_practice', 'social_work', 'published_papers',
+    'education_career', 'research_training', 'internship_practice', 'social_work', 'published_papers',
     'granted_patents', 'subject_competitions', 'honors_awards',
   ].includes(block.sectionId ?? ''));
   const targetFieldKeys = Array.from(new Set(sourceBlocks.flatMap((block) => [

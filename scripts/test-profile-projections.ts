@@ -97,4 +97,33 @@ assert.deepEqual(
   'education/work chronology must stay empty when the profile contains only project, paper, competition, and award records',
 );
 
+const explicitChronologyCandidates = projectProfileToTargetSchema({
+  groupLabel: '学习和工作经历（从高中开始填写）',
+  fields: [
+    { key: '起始时间', label: '起始时间（日期格式：2019-11）' },
+    { key: '结束时间', label: '结束时间（日期格式：2019-11）' },
+    { key: '学校或工作单位', label: '学校或工作单位' },
+    { key: '担任职务', label: '担任职务' },
+  ],
+}, [{
+  title: '学习与工作履历',
+  sectionId: 'education_career',
+  items: [{ fields: [
+    { key: '起始时间', value: '2020-09' },
+    { key: '结束时间', value: '2023-06' },
+    { key: '学校或工作单位', value: '示例中学' },
+    { key: '担任职务', value: '学生' },
+  ] }],
+}], textFields);
+assert.deepEqual(
+  Object.fromEntries(explicitChronologyCandidates.map((candidate) => [candidate.targetFieldKey, candidate.value])),
+  {
+    起始时间: '2020-09',
+    结束时间: '2023-06',
+    学校或工作单位: '示例中学',
+    担任职务: '学生',
+  },
+  'an explicit chronology record must map one-to-one to the four chronology columns',
+);
+
 console.log('profile projection tests passed');

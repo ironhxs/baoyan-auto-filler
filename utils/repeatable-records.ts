@@ -71,6 +71,7 @@ export function isAddRowLabel(value: string | undefined): boolean {
 const IDENTITY_KEYS: Record<string, string[]> = {
   language: ['考试名称', '外语考试', '外语水平', '外语等级', '考试类型'],
   family: ['姓名', '成员姓名', '家庭成员姓名'],
+  education_career: ['学校或工作单位', '起始时间', '结束时间'],
   research_training: ['项目名称', '起止时间'],
   internship_practice: ['实习实践单位', '起止时间'],
   social_work: ['社会工作名称', '起止时间'],
@@ -81,7 +82,6 @@ const IDENTITY_KEYS: Record<string, string[]> = {
   '项目经历': ['项目名称', '实习实践单位', '社会工作名称', '起止时间'],
   '论文情况': ['论文标题', '论文名称', '作者'],
   '获奖情况': ['获奖项目名称', '获奖名称', '竞赛名称', '获奖人'],
-  '学习和工作经历': ['项目名称', '实习实践单位', '社会工作名称', '起止时间'],
   '学术成果': ['论文标题', '论文名称', '专利名称', '获奖项目名称', '竞赛名称'],
   '奖励情况': ['获奖项目名称', '获奖名称', '竞赛名称', '获奖人'],
 };
@@ -124,6 +124,11 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
   const sourceBySection = new Map(groups.filter((group) => group.sectionId).map((group) => [group.sectionId!, group]));
   const mergedGroups: RepeatableSourceGroup[] = [
     {
+      label: '学习和工作经历',
+      sectionId: 'education_career',
+      items: [...(sourceBySection.get('education_career')?.items ?? [])],
+    },
+    {
       label: '项目经历',
       items: [
         ...(sourceBySection.get('research_training')?.items ?? []),
@@ -140,14 +145,6 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
       items: [
         ...(sourceBySection.get('subject_competitions')?.items ?? []),
         ...(sourceBySection.get('honors_awards')?.items ?? []),
-      ],
-    },
-    {
-      label: '学习和工作经历',
-      items: [
-        ...(sourceBySection.get('research_training')?.items ?? []),
-        ...(sourceBySection.get('internship_practice')?.items ?? []),
-        ...(sourceBySection.get('social_work')?.items ?? []),
       ],
     },
     {

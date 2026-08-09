@@ -25,6 +25,7 @@ export interface ProfileProjectionCandidate {
 type SourceSectionId = ProfileProjectionCandidate['sourceSectionId'];
 
 const REPEAT_SECTION_IDS: SourceSectionId[] = [
+  'education_career',
   'research_training',
   'internship_practice',
   'social_work',
@@ -46,10 +47,22 @@ function getSourceSection(block: BlockCategory): SourceSectionId {
     : 'custom') as SourceSectionId;
 }
 
-function sourceSectionsForTarget(groupLabel: string): SourceSectionId[] {
-  const label = normalize(groupLabel);
+function sourceSectionsForTarget(target: TargetFieldSchema): SourceSectionId[] {
+  const label = normalize(target.groupLabel);
+  const targetFields = normalize(target.fields.map((field) => `${field.key}${field.label}`).join(''));
+  const chronologyTarget = /学习和工作经历|从高中|教育经历|学习经历/.test(label)
+    || (
+      /(起始时间|开始时间)/.test(targetFields)
+      && /结束时间/.test(targetFields)
+      && /学校或工作单位/.test(targetFields)
+      && /担任职务/.test(targetFields)
+    );
+  if (chronologyTarget) return ['education_career'];
   if (/论文|学术成果|论文情况/.test(label)) return ['published_papers'];
-  if (/项目经历|项目经验|科研实践|经历/.test(label)) {
+  if (
+    /项目经历|项目经验|科研实践/.test(label)
+    || (/经历/.test(label) && /(项目名称|项目描述|项目时间|本人角色)/.test(targetFields))
+  ) {
     return ['research_training', 'internship_practice', 'social_work'];
   }
   if (/获奖|奖励|荣誉|竞赛|奖项/.test(label)) {
@@ -72,6 +85,13 @@ function splitAwardLevelAndGrade(value: string): { level: string; grade: string 
 
 function resolveSourceField(target: string, sourceSectionId: SourceSectionId): { keys: string[]; transform?: (value: string) => string; derived?: boolean; reason: string } | undefined {
   const label = normalize(target);
+
+  if (sourceSectionId === 'education_career') {
+    if (/起始|开始/.test(label)) return { keys: ['起始时间'], reason: '履历起始时间按语义映射' };
+    if (/结束|终止/.test(label)) return { keys: ['结束时间'], reason: '履历结束时间按语义映射' };
+    if (/学校|工作单位|单位|机构/.test(label)) return { keys: ['学校或工作单位'], reason: '学校或工作单位按语义映射' };
+    if (/职务|岗位|身份/.test(label)) return { keys: ['担任职务'], reason: '担任职务按语义映射' };
+  }
 
   if (sourceSectionId === 'research_training') {
     if (/时间|日期|项目时间/.test(label)) return { keys: ['起止时间'], reason: '项目时间字段按语义映射' };
@@ -150,7 +170,7 @@ export function projectProfileToTargetSchema(
   blocks: BlockCategory[],
   _textFields: TextField[] = [],
 ): ProfileProjectionCandidate[] {
-  const sourceIds = sourceSectionsForTarget(target.groupLabel);
+  const sourceIds = sourceSectionsForTarget(target);
   const candidates: ProfileProjectionCandidate[] = [];
 
   for (const block of blocks) {
