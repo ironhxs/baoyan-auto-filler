@@ -15,6 +15,9 @@ for (const p of CHROMIUM_FALLBACKS) {
 }
 
 export default defineConfig({
+  zip: {
+    zipSources: false,
+  },
   manifest: ({ browser }) => ({
     name: '保填',
     permissions: ['storage', 'activeTab', 'scripting', 'alarms'],
