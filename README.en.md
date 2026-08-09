@@ -1,167 +1,165 @@
-# 保填
-
-English | [中文](README.md)
-
-A Chrome / Edge form-filling assistant for graduate recommendation applications. It preserves the 1.0 full-page AI semantic-matching flow and adds deterministic value safeguards, filled-value auditing, multi-step background filling, repeatable tables, manual quick fill, and PDF document synthesis. Profile data stays in the browser; no account is required.
-
 <div align="center">
-  <a href="../../releases/latest"><b>⬇️ Download & Install</b></a>
+  <img src="assets/logo.png" width="112" alt="Baotian icon" />
+  <h1>Baotian</h1>
+  <p><strong>Less repetitive copying, more time for the final review.</strong></p>
+  <p>A local-first graduate application form assistant for Chrome, Edge, and Firefox.</p>
+
+  <p>
+    <img alt="Version" src="https://img.shields.io/badge/version-2.0.0-2563eb" />
+    <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.9-3178c6" />
+    <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-16a34a" />
+  </p>
+
+  <p>
+    <a href="https://github.com/ironhxs/baoyan-auto-filler/releases/latest"><strong>Download</strong></a>
+    · <a href="#quick-start">Quick start</a>
+    · <a href="#security-and-privacy">Security</a>
+    · <a href="README.md">中文</a>
+  </p>
 </div>
 
+---
+
+Graduate recommendation and early-admission systems repeatedly ask for the same profile, family, education, language, project, publication, patent, competition, and award data. Baotian keeps those records in the browser and helps inspect, plan, fill, and verify each application page.
+
+Version 2.0 introduces a page-level form Agent. Instead of matching keywords in isolation, it receives the actual page groups, rows, columns, format rules, and only the relevant saved records. This allows one profile to be transformed into different school-specific structures while remaining grounded in stored facts.
+
 <div align="center">
-  <img src="assets/1-popup.png" width="210" alt="Popup" />
-  <img src="assets/2-filling.png" width="210" alt="Filling" />
-  <img src="assets/3-page.png" width="210" alt="Result" />
+  <img src="assets/1-popup.png" width="30%" alt="Current-site status" />
+  <img src="assets/2-filling.png" width="30%" alt="Agent plan" />
+  <img src="assets/3-page.png" width="30%" alt="Readback markers" />
 </div>
 
-## Features
+## Page-level Agent in 2.0
 
-### Smart Form Filling
-- Manages seven profile groups: basic info, family, education, languages, experience, academic work, and awards
-- AI Enhanced Review (enabled by default) sends all safe fields on the current page to the configured API, as version 1.0 did, while deterministic stored values prevent factual rewrites
-- AI Enhanced Review can be disabled to use the API only for fields that local rules cannot match
-- Adds and fills repeatable rows for family members, language scores, experience, academic work, and awards; also handles record editors opened in a modal or drawer after an Add action
-- Matches repeatable rows by group, row number, and subfield semantics, so different web-column ordering does not change the saved item mapping; optional AI fallback is grounded to the same stored row
-- Fills modal/drawer record editors by subfield semantics rather than visual ordering, reads values back, and only clicks a record-level Save / Confirm / Add control inside that editor
-- Aggregates one repeatable record into a single textarea when the page exposes only one field; ambiguous required fields, unreadable values, and protected controls pause for review instead of being guessed
-- Supports exact-match school and major selection dialogs
-- Works with React and other framework pages (uses native setters to trigger updates)
-- Uses green, orange, and red readback states to show verified, review-needed, and mismatched values
-- Draws the same green / orange / red state on page controls after preview; clicking a sidebar result locates and focuses the corresponding field
-- Includes manual quick fill for complex controls not covered automatically
+When a saved award record has fields such as title, level, date, organizer, description, and personal rank, but a school asks for only **Date / Place / Content**, the Agent plans one complete row:
 
-### Background Multi-step Filling
-- Continues after the popup is closed and across both full navigations and single-page-app transitions
-- Clicks only explicit safe next-step controls after the current page is filled and read back
-- Pauses when required fields remain unresolved and stops after at most 20 pages
-- Stops on the final review page and never clicks final submit, payment, CAPTCHA, agreements, advisor, or preference actions
+- dates are adapted to the page example;
+- place uses an organizer or another grounded location-like field when available;
+- content combines only relevant saved facts and obeys forbidden-character and length rules;
+- all columns in a record are treated atomically, so a partial row is never reported as complete.
 
-### Local Backup and Restore
-- Exports and imports all seven profile groups and repeatable items
-- API keys and uploaded documents are excluded from profile backups
+The Agent runs inside the extension and uses the OpenAI-compatible relay configured by the user. No Codex desktop integration or local model is required. Both Responses and Chat Completions are supported, with strict structured output when the relay accepts it and a single plain-JSON fallback when it does not.
 
-### Document Management
-- Upload images (JPG/PNG/WebP) and PDF files
-- Organize documents by category (ID, education, certificates, photos, etc.)
-- Preview, rename, move between categories, and delete
-- Recommends locally stored files for clearly identified upload fields using page context plus filenames, descriptions, and categories; document matches are unchecked until the user explicitly confirms them in preview
+```mermaid
+flowchart LR
+  A[Observe the current page] --> B[Retrieve relevant local records]
+  B --> C[Request a structured plan]
+  C --> D[Validate targets, evidence, and safety]
+  D --> E[Execute fields or atomic rows]
+  E --> F[Read values back from the page]
+  F -->|Verified| G[Cache the plan and checkpoint]
+  F -->|Failed| H[Repair up to two times]
+  H --> E
+  H -->|Still unresolved| I[Pause for review]
+```
 
-### PDF Synthesis
-- Select images and PDFs from your documents, drag to reorder, then merge into one PDF
-- Upload new files on the fly (auto-saved to your document library)
-- Images auto-scale to fit A4 pages, centered with margins
-- Merged result saved to your document library for easy download
-- Runs entirely in the browser — no server needed
+The popup reports planned actions, readback-verified values, preserved manual edits, review items, failures, retries, and cache reuse. Users can locate a failed field, retry failed actions only, replan the page, or stop the task.
 
-### API Configuration
-- Supports both OpenAI-compatible Chat Completions (`/chat/completions`) and Responses (`/responses`)
-- Connects to hosted providers, aggregators, third-party gateways, and local model servers
-- Includes provider presets and supports custom Base URLs and model names
-- Supports Fast mode (`service_tier: fast`), a privacy-safe API connection test, and an explicit per-scan indicator showing whether the API was actually called
-- Optional Fast mode adds `service_tier: "fast"`; it is disabled by default
+## Managed profile data
+
+Baotian manages seven primary groups:
+
+| Group | Examples |
+|---|---|
+| Basic information | identity, contacts, address, political status |
+| Family members | name, relationship, employer/position, phone |
+| Education | school, department, major, GPA, ranking |
+| Languages | CET, IELTS, TOEFL, score, date |
+| Study and work experience | research, internships, practice, social work |
+| Academic work | publications and patents |
+| Awards | competitions and university-or-higher honors |
+
+A separate **Education and employment chronology** compatibility group maps start date, end date, school/employer, and role. It is intentionally isolated from research projects and practice records, preventing projects from being inserted into an education timeline.
+
+## Main capabilities
+
+### Reliable page filling
+
+- Deterministic local rules handle exact values such as names, identity numbers, phones, dates, and scores.
+- The Agent handles cross-schema conversion, multi-column tables, unfamiliar labels, and long questions.
+- Existing values are audited instead of ignored.
+- Green means readback verified, orange means review recommended, and red means the page value differs from the plan.
+- Clicking an item locates the page control; manual quick fill remains available for unsupported widgets.
+
+### Repeatable records and selectors
+
+- Supports inline tables and Add actions that open a modal or drawer.
+- Matches by profile group, record number, and subfield semantics rather than visual column order.
+- Search inputs, candidates, and confirmation buttons are scoped to the newly opened selector.
+- School, department, and major selectors require a unique candidate and successful page readback.
+- React/Vue controlled inputs are updated through native setters and events, followed by a framework readback wait.
+
+### Persistent multi-site tasks
+
+- Work continues after the popup closes or another tab is selected.
+- Different schools and projects keep separate page histories, checkpoints, materials, and audit states.
+- The current site is shown first; the audit center summarizes the selected batch.
+- Only explicit safe next-step controls are eligible.
+- Unresolved required fields, materials, page changes, or readback failures pause the task.
+- Final submit, confirmation, payment, CAPTCHA, agreement, preference, and advisor actions are never clicked.
+
+### Materials and final audit
+
+- Store and preview JPG, PNG, WebP, and PDF files locally; categorize, rename, and merge PDFs.
+- Recommend files from the upload prompt, filename, description, and category.
+- A high-confidence candidate may be attached before pausing, but the prompt title and filename are shown for human preview before navigation continues.
+- Final audit is manually triggered and read-only. It reviews selected task pages, material records, and deterministic PDF samples through the configured model.
+
+> AI import of profile data from Word/PDF is intentionally not included in 2.0. JSON profile import, document management, and PDF synthesis remain available.
+
+## Quick start
+
+1. Enter the seven profile groups in the workbench or import a JSON backup.
+2. Open an application page and choose **Scan and preview** or **Fill in background until final review**.
+3. Review all colored states and the final audit report before deciding whether to submit.
+
+### Relay API configuration
+
+- Choose **Responses** for Codex-style models or relays that expose `/responses`.
+- Choose **Chat Completions** for traditional OpenAI-compatible endpoints.
+- Fast mode adds `service_tier: "fast"`.
+- Connection testing sends no profile data. Agent use sends the page structure and only the records required for the current request to the user-selected provider.
 
 ## Installation
 
-### From Release (Recommended)
-
-Download the zip file from [Releases](../../releases):
+Download from [GitHub Releases](https://github.com/ironhxs/baoyan-auto-filler/releases/latest):
 
 | File | Browser |
-|------|---------|
-| `baotian-chrome.zip` | Chrome / Edge / Brave and other Chromium-based browsers |
-| `baotian-firefox.zip` | Firefox |
+|---|---|
+| `baotian-2.0.0-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
+| `baotian-2.0.0-firefox.zip` | Firefox temporary loading or later signed distribution |
 
-**Chrome / Edge:**
+For Chrome / Edge, extract the archive, open `chrome://extensions/` or `edge://extensions/`, enable Developer mode, and choose **Load unpacked**.
 
-1. Open `chrome://extensions/` (or `edge://extensions/`)
-2. Enable **Developer mode** in the top-right corner
-3. Extract the zip, click **Load unpacked**, and select the extracted directory
+To preserve data during an update, overwrite the files in the same unpacked directory and click **Reload**. Keeping the same directory and extension ID preserves IndexedDB and `chrome.storage` data.
 
-**Firefox:**
+## Security and privacy
 
-1. Open `about:debugging#/runtime/this-firefox`
-2. Click "Load Temporary Add-on"
-3. Select the downloaded zip file (Firefox marks it as temporary — reload after restart)
+- Profile data, documents, task history, and API settings remain in the current browser; the project has no application backend.
+- API keys are excluded from profile exports, Git, Agent plan caches, and status summaries.
+- Model actions may only reference observed page targets and retrieved source records. Invented targets, record IDs, evidence, and click actions are rejected locally.
+- Passwords, cookies, authorization data, CSRF values, CAPTCHAs, identity numbers, phone numbers, and raw model responses are excluded from the Agent status view.
+- The extension never performs final submission, application confirmation, payment, agreements, preference/advisor selection, or CAPTCHA handling.
+- Application systems still differ. The applicant must complete the final review.
 
-### Build from Source
+## Build from source
 
 ```bash
 npm install
-npm run build            # Chrome
-npm run build:firefox    # Firefox
+npm run compile
+npm run build
+npm run build:firefox
+npm run zip
+npm run zip:firefox
 ```
 
-The output is in the `.output/` directory. Load it via "Load unpacked" in your browser's extension management page.
+The project uses WXT, TypeScript, IndexedDB, `chrome.storage`, pdf-lib, PDF.js, and pinyin-pro. Agent modules live under `utils/agent/` and cover page snapshots, record retrieval, planning, policy validation, execution, readback verification, caching, recovery, and the status view.
 
-### Package
+## Contributing
 
-```bash
-npm run zip            # Chrome
-npm run zip:firefox    # Firefox
-```
-
-Output in `.output/`, ready for Chrome Web Store or GitHub Releases.
-
-## Usage
-
-1. Add and maintain the seven profile groups in the workbench.
-2. Export a local backup after entering the profile and before reinstalling or changing devices.
-3. On an application page, open the extension, scan and preview, then confirm the fill.
-4. Choose background multi-step filling to continue until final review; handle any required-field pause before resuming.
-5. Review every date, rank, selection, and repeatable row yourself before submission.
-6. Optionally configure an API URL, protocol, key, and model for unresolved fields. Choose `Responses` for Codex-style models or gateways that only support that API.
-
-> AI import from Word or PDF profile documents is not included in this version. Document management and PDF synthesis remain available.
-
-## Safety and Privacy
-
-- Profile data, documents, and API settings are stored in the current browser; the extension has no application server.
-- Text is sent to the user-configured model provider only when an AI feature is actively used.
-- The extension never automatically submits, pays, solves CAPTCHAs, accepts agreements, chooses advisors/preferences, or uploads files.
-- Application systems differ; the applicant must review all filled values before submission.
-
-## Tech Stack
-
-- **Framework**: [WXT](https://wxt.dev/) (Vite-based browser extension framework)
-- **Language**: TypeScript
-- **UI**: Vanilla HTML/CSS, no framework
-- **PDF**: [pdf-lib](https://pdf-lib.js.org/)
-- **Pinyin**: [pinyin-pro](https://github.com/nicoleee-h/pinyin-pro)
-- **Storage**: IndexedDB + chrome.storage.local
-
-## Project Structure
-
-```
-├── entrypoints/
-│   ├── background.ts        # Service Worker: message routing, LLM calls
-│   ├── content.ts           # Content script: DOM scanning, form filling
-│   ├── popup/               # Popup: scan → confirm → fill
-│   └── options/             # Options page: info management, documents, PDF, settings
-├── utils/
-│   ├── db.ts                # IndexedDB wrapper
-│   ├── storage.ts           # chrome.storage wrapper
-│   ├── matcher.ts           # LLM semantic matching
-│   ├── local-matcher.ts     # Deterministic local field matching
-│   ├── profile-schema.ts    # Seven profile groups and language inference
-│   ├── pdf-merge.ts         # PDF merge logic
-│   └── providers.ts         # API provider presets
-└── public/icons/            # Static icon assets
-```
-
-## Development
-
-```bash
-npm run dev              # Chrome dev mode (HMR)
-npm run dev:firefox      # Firefox dev mode
-npm run compile          # Type check only
-```
-
-## Future Work
-
-- Add adapters for more cascading region, school, and major selectors
-- Reconsider Word/PDF profile import only when its value justifies the complexity
-- Add conservative, readback-verified support for more date controls and complex tables
+For a new school integration issue, provide sanitized screenshots, field/column labels, the expected mapping, the actual result, and the browser version. Never upload API keys, identity numbers, phone numbers, cookies, credentials, or unsanitized application materials.
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+[Apache License 2.0](LICENSE)
