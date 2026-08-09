@@ -3,6 +3,7 @@ import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { stableTargetId } from '@/utils/agent/page-snapshot';
 import type { AgentExecutionItem, AgentExecutionResult } from '@/utils/agent/executor';
+import { classifyObservedRepeatTable, extractAgentFieldRules } from '@/utils/agent/field-rules';
 import {
   MAX_REPEAT_ROW_ADDITIONS_PER_PASS,
   isAddRowLabel,
@@ -37,6 +38,8 @@ interface FormField {
   ariaLabel: string;
   title: string;
   dateFormat?: string;
+  maxLength?: number;
+  forbiddenCharacters?: string[];
   value: string;
   options: string[];
   accept: string;
@@ -531,20 +534,15 @@ function getRepeatFieldMeta(el: HTMLElement): RepeatFieldMeta {
   const table = el.closest<HTMLTableElement>('table');
   const groupText = findGroupText(el, table);
   const nearestHeading = findNearestHeadingText(el);
-  const groupLabel = table
+  const knownGroupLabel = table
     ? inferProfileGroupFromTable(table) || detectProfileGroup(nearestHeading)
     : detectProfileGroup(nearestHeading || groupText);
-  const repeatProfileGroups = new Set([
-    '家庭成员', '外语水平', '学习和工作经历', '学术成果', '奖励情况',
-    '科研训练', '实习实践', '社会工作', '已发表论文', '已取得专利',
-    '学科竞赛', '本科期间校级以上（含）荣誉奖励', '项目经历', '论文情况', '获奖情况',
-  ]);
 
-  if (!row || !table || !repeatProfileGroups.has(groupLabel)) {
+  if (!row || !table) {
     return {
-      groupLabel,
+      groupLabel: knownGroupLabel,
       columnLabel: '',
-      repeatGroup: groupLabel,
+      repeatGroup: knownGroupLabel,
     };
   }
 
@@ -552,12 +550,36 @@ function getRepeatFieldMeta(el: HTMLElement): RepeatFieldMeta {
     .filter((candidate) => countEditables(candidate) >= 2);
   const rowIndex = dataRows.indexOf(row);
   const columnLabel = getTableColumnLabel(el, table, row);
+  const scope = table.parentElement ?? table;
+  const hasAddControl = Array.from(scope.querySelectorAll<HTMLElement>('button,a,[role="button"],input[type="button"]'))
+    .filter(isVisible)
+    .some((candidate) => isAddRowLabel(normalizeText(
+      candidate instanceof HTMLInputElement ? candidate.value : candidate.textContent ?? '',
+    )));
+  const classification = classifyObservedRepeatTable({
+    knownGroupLabel,
+    nearestHeading: nearestHeading || groupText,
+    rowEditableCounts: dataRows.map((candidate) => countEditables(candidate)),
+    columnLabels: dataRows[0]
+      ? Array.from(dataRows[0].querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR))
+          .filter(isFillable)
+          .map((field) => getTableColumnLabel(field, table, dataRows[0]))
+      : [],
+    hasAddControl,
+  });
+  if (!classification.repeatable || rowIndex < 0) {
+    return {
+      groupLabel: knownGroupLabel,
+      columnLabel: '',
+      repeatGroup: knownGroupLabel,
+    };
+  }
 
   return {
-    groupLabel,
+    groupLabel: classification.groupLabel,
     columnLabel,
-    rowIndex: rowIndex >= 0 ? rowIndex : undefined,
-    repeatGroup: groupLabel || normalizeText(table.getAttribute('id') ?? table.getAttribute('class') ?? ''),
+    rowIndex,
+    repeatGroup: classification.groupLabel || normalizeText(table.getAttribute('id') ?? table.getAttribute('class') ?? ''),
   };
 }
 
@@ -893,11 +915,18 @@ function extractField(el: HTMLElement): FormField {
   const fieldText = joinUnique([repeatMeta.groupLabel, repeatMeta.columnLabel, label, hint, context]);
   const protection = getProtection(el, fieldText, isFile);
   const required = isRequiredField(el, fieldText);
-  const dateFormat = [
+  const explicitDateFormat = [
     el.getAttribute('data-date-format'),
     el.getAttribute('data-datefmt'),
     el.getAttribute('onclick')?.match(/dateFmt\s*:\s*['"]([^'"]+)['"]/i)?.[1],
   ].find(Boolean) ?? '';
+  const rules = extractAgentFieldRules({
+    texts: [label, hint, context, fieldText],
+    explicitDateFormat,
+    domMaxLength: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
+      ? el.maxLength
+      : undefined,
+  });
   const existingFile = isFile ? findExistingFileEvidence(el as HTMLInputElement) : '';
   return {
     kind: isFile ? 'file' : 'text',
@@ -910,7 +939,9 @@ function extractField(el: HTMLElement): FormField {
     placeholder: el.getAttribute('placeholder') ?? '',
     ariaLabel: el.getAttribute('aria-label') ?? '',
     title: el.getAttribute('title') ?? '',
-    dateFormat,
+    dateFormat: rules.dateFormat,
+    maxLength: rules.maxLength,
+    forbiddenCharacters: rules.forbiddenCharacters,
     value: isFile ? (getCurrentValue(el) || existingFile) : getCurrentValue(el),
     options: getOptions(el),
     accept: isFile ? el.accept : '',
@@ -1075,6 +1106,20 @@ function valueMatches(el: HTMLElement, expected: string): boolean {
     return normalizedActual === normalizedExpected || normalizeText(el.value).toLowerCase() === normalizedExpected;
   }
   return normalizedActual === normalizedExpected;
+}
+
+async function waitForElementValue(
+  el: HTMLElement,
+  expected: string,
+  timeoutMs = 1600,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!el.isConnected) return false;
+    if (valueMatches(el, expected)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  return el.isConnected && valueMatches(el, expected);
 }
 
 function collectVisibleDialogRoots(): HTMLElement[] {
@@ -1596,7 +1641,12 @@ async function fillElementAsync(
   confidence: 'high' | 'medium' | 'low' = 'medium',
 ): Promise<boolean> {
   if (isSupportedDialogSelection(el)) return fillDialogSelection(el, value, confidence);
-  return fillElement(el, value, confidence);
+  if (extractField(el).protected) return false;
+  const immediate = fillElement(el, value, confidence);
+  if (immediate) return true;
+  const verified = await waitForElementValue(el, value);
+  markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+  return verified;
 }
 
 function fillElement(el: HTMLElement, value: string, confidence: 'high' | 'medium' | 'low' = 'medium'): boolean {

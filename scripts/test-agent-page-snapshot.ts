@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { buildAgentPageSnapshot, stableTargetId } from '../utils/agent/page-snapshot';
+import { classifyObservedRepeatTable, extractAgentFieldRules } from '../utils/agent/field-rules';
 import type { FormFieldInfo } from '../utils/matcher';
 
 function awardField(
@@ -103,5 +104,30 @@ assert.equal(
   stableTargetId('fudan-awards', { ...stableField, index: 99 }),
   'targetId must survive scan index changes between planning and execution',
 );
+
+assert.deepEqual(extractAgentFieldRules({
+  texts: ['时间（日期格式：2018-11）', '内容中不得含有 |、#', '最多填写60个字符'],
+  domMaxLength: 80,
+}), {
+  dateFormat: '2018-11',
+  formatHints: ['2018-11'],
+  forbiddenCharacters: ['|', '#'],
+  maxLength: 60,
+});
+
+assert.deepEqual(classifyObservedRepeatTable({
+  knownGroupLabel: '',
+  nearestHeading: '本科期间奖励情况',
+  rowEditableCounts: [3, 3, 3],
+  columnLabels: ['时间', '地点', '内容'],
+  hasAddControl: true,
+}), { repeatable: true, groupLabel: '本科期间奖励情况' });
+assert.equal(classifyObservedRepeatTable({
+  knownGroupLabel: '',
+  nearestHeading: '基本信息',
+  rowEditableCounts: [1, 1, 1],
+  columnLabels: ['字段', '值'],
+  hasAddControl: false,
+}).repeatable, false);
 
 console.log('agent page snapshot tests passed');
