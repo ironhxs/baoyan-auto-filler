@@ -1,10 +1,24 @@
 import assert from 'node:assert/strict';
 import {
+  classifyRepeatableHeaderSchema,
   classifyRepeatPreparation,
   selectNewDialogRoot,
   selectScopedConfirm,
   selectScopedTrigger,
 } from '../utils/dom-selection-policy';
+
+assert.equal(classifyRepeatableHeaderSchema([
+  '起始时间（日期格式：2019-11）',
+  '结束时间（日期格式：2019-11）',
+  '学校或工作单位',
+  '担任职务',
+]), '学习和工作经历', 'a school/work chronology table must not be classified as a project table');
+assert.equal(classifyRepeatableHeaderSchema([
+  '项目名称',
+  '项目描述',
+  '项目时间段',
+  '本人角色',
+]), '项目经历', 'project-specific columns should still classify as a project table');
 
 assert.equal(
   classifyRepeatPreparation({ tableMatch: 'none', hasAddControl: false }),

@@ -9,6 +9,7 @@ import { flattenProfileValues } from '../utils/profile-schema';
 import { isPageValueConsistent } from '../utils/value-compare';
 import { fieldFingerprint } from '../utils/field-fingerprint';
 import type { FormFieldInfo, MatchResult } from '../utils/matcher';
+import { isSemanticallyCompatibleMatch } from '../utils/matcher';
 import type { BlockCategory, TextField } from '../utils/db';
 
 function field(index: number, overrides: Partial<FormFieldInfo>): FormFieldInfo {
@@ -207,6 +208,30 @@ assert.equal(
 assert.notEqual(
   fieldFingerprint(field(30, { label: '手机号' })),
   fieldFingerprint(field(30, { label: '家庭住址' })),
+);
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(50, { groupLabel: '学习和工作经历', columnLabel: '起始时间' }),
+    '科研训练[1].起止时间',
+  ),
+  false,
+  'AI must not use a research project date for education/work chronology',
+);
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(51, { groupLabel: '学习和工作经历', columnLabel: '学校或工作单位' }),
+    '学习与工作履历[1].学校或工作单位',
+  ),
+  true,
+  'AI may use an explicit education/work chronology record for the chronology table',
+);
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(52, { groupLabel: '项目经历', columnLabel: '项目名称' }),
+    '科研训练[1].项目名称',
+  ),
+  true,
+  'project pages may still use research training records',
 );
 
 const aiEligible = getAiEligibleFields(fields, matches);

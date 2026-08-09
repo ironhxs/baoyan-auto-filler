@@ -97,6 +97,43 @@ function sourceLeafKey(fieldKey: string): string {
   return fieldKey.split('.').at(-1) ?? fieldKey;
 }
 
+function sourceGroupKey(fieldKey: string): string {
+  return fieldKey.match(/^(.+?)\[\d+\]\./)?.[1] ?? '';
+}
+
+function normalizeGroupKey(value: string): string {
+  return value.toLowerCase().replace(/[\s　：:，,。；;（）()【】\[\]\/|｜_*#与和]/g, '');
+}
+
+function isRepeatGroupSourceCompatible(targetGroup: string, sourceGroup: string): boolean {
+  const target = normalizeGroupKey(targetGroup);
+  const source = normalizeGroupKey(sourceGroup);
+  if (!target || !source) return true;
+
+  const targetMatches = (pattern: RegExp) => pattern.test(target);
+  const sourceMatches = (pattern: RegExp) => pattern.test(source);
+  if (targetMatches(/学习工作经历|学习工作履历|教育经历|工作履历/)) {
+    return sourceMatches(/学习工作经历|学习工作履历|教育经历|工作履历/);
+  }
+  if (targetMatches(/项目经历|项目经验|科研实践/)) {
+    return sourceMatches(/项目经历|科研训练|实习实践|社会工作/);
+  }
+  if (targetMatches(/家庭成员|社会关系/)) return sourceMatches(/家庭成员|社会关系/);
+  if (targetMatches(/外语水平|英语考试|四六级/)) return sourceMatches(/外语水平|英语考试|四六级/);
+  if (targetMatches(/科研训练|科研项目|研究项目/)) return sourceMatches(/科研训练|科研项目|研究项目/);
+  if (targetMatches(/实习实践|实习经历|实践经历/)) return sourceMatches(/实习实践|实习经历|实践经历/);
+  if (targetMatches(/社会工作|学生工作|社会职务/)) return sourceMatches(/社会工作|学生工作|社会职务/);
+  if (targetMatches(/论文情况|已发表论文|论文成果/)) return sourceMatches(/已发表论文|论文情况|论文成果/);
+  if (targetMatches(/已取得专利|专利情况|专利成果/)) return sourceMatches(/已取得专利|专利情况|专利成果/);
+  if (targetMatches(/获奖情况|奖励情况|学科竞赛|荣誉奖励/)) {
+    return sourceMatches(/获奖情况|奖励情况|学科竞赛|荣誉奖励/);
+  }
+  if (targetMatches(/学术成果|科研成果/)) {
+    return sourceMatches(/已发表论文|论文情况|已取得专利|专利情况|学科竞赛/);
+  }
+  return true;
+}
+
 export function isSemanticallyCompatibleMatch(field: FormFieldInfo | undefined, fieldKey: string): boolean {
   if (!field || !fieldKey) return false;
   if (field.fillMode === 'long' && fieldKey === 'generated_long_text') return true;
@@ -104,6 +141,11 @@ export function isSemanticallyCompatibleMatch(field: FormFieldInfo | undefined, 
     .filter(Boolean)
     .join(' ');
   const source = sourceLeafKey(fieldKey);
+  const sourceGroup = sourceGroupKey(fieldKey);
+
+  if (field.groupLabel && sourceGroup && !isRepeatGroupSourceCompatible(field.groupLabel, sourceGroup)) {
+    return false;
+  }
 
   if (/固定电话|座机|住宅电话|办公电话/.test(target)) {
     return /固定电话|座机|住宅电话|办公电话/.test(source);

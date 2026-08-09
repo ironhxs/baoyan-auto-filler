@@ -3,6 +3,7 @@ import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { isAddRowLabel } from '@/utils/repeatable-records';
 import {
+  classifyRepeatableHeaderSchema,
   classifyRepeatPreparation,
   selectNewDialogRoot,
   selectScopedConfirm,
@@ -440,7 +441,7 @@ function detectProfileGroup(text: string): string {
     ['项目经历', /项目经历|项目经验|科研实践/],
     ['论文情况', /论文情况|论文成果/],
     ['获奖情况', /获奖情况|奖励情况|奖惩情况|获奖经历/],
-    ['学习和工作经历', /学习.{0,3}工作经历|教育经历|工作经历|学习经历/],
+    ['学习和工作经历', /学习.{0,3}工作(?:经历|履历)|教育经历|工作经历|学习经历/],
     ['学术成果', /学术成果|科研成果|论文|专利|著作/],
     ['奖励情况', /奖励|获奖|荣誉|奖惩/],
     ['外语水平', /外语|英语|四六级|雅思|托福/],
@@ -472,30 +473,10 @@ function findGroupText(el: HTMLElement, table: HTMLTableElement | null): string 
 }
 
 function inferProfileGroupFromTable(table: HTMLTableElement): string {
-  const headerText = Array.from(table.querySelectorAll<HTMLElement>('th,thead td'))
+  const headers = Array.from(table.querySelectorAll<HTMLElement>('th,thead td'))
     .map((cell) => textWithoutControls(cell))
-    .filter(Boolean)
-    .join('|');
-  if (/姓名/.test(headerText) && /关系/.test(headerText) && /(联系电话|工作单位|职务)/.test(headerText)) {
-    return '家庭成员';
-  }
-  if (/(外语|考试|等级)/.test(headerText) && /成绩/.test(headerText)) return '外语水平';
-  if (/(获奖|奖励|奖项|竞赛)/.test(headerText) && /(名称|等级|级别|时间|日期)/.test(headerText)) {
-    return '获奖情况';
-  }
-  if (/论文/.test(headerText) && /(名称|标题|类型|时间|排序|发表)/.test(headerText)) {
-    return '论文情况';
-  }
-  if (/专利/.test(headerText) && /(名称|标题|类型|时间|授权|受理)/.test(headerText)) {
-    return '已取得专利';
-  }
-  if (/(项目|实践|工作)/.test(headerText) && /(描述|时间|期间|角色|单位|名称)/.test(headerText)) {
-    return '项目经历';
-  }
-  if (/(开始|起始)/.test(headerText) && /(结束|终止)/.test(headerText) && /(学校|单位|职务|专业)/.test(headerText)) {
-    return '学习和工作经历';
-  }
-  return '';
+    .filter(Boolean);
+  return classifyRepeatableHeaderSchema(headers);
 }
 
 function findNearestHeadingText(el: HTMLElement): string {
