@@ -37,8 +37,16 @@ export interface Category {
   _confirmDelete?: boolean;
 }
 
+export interface AgentPlanCacheRecord {
+  key: string;
+  pageKey: string;
+  plan: AgentPagePlan;
+  createdAt: number;
+  updatedAt: number;
+}
+
 const DB_NAME = 'autoFillerDB';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 let dbInstance: IDBDatabase | null = null;
 
 const DEFAULT_CATEGORIES: Omit<Category, 'id'>[] = [
@@ -107,6 +115,11 @@ function openDB(): Promise<IDBDatabase> {
             };
           }
         };
+      }
+      if (oldVersion < 4 && !db.objectStoreNames.contains('agentPlans')) {
+        const agentStore = db.createObjectStore('agentPlans', { keyPath: 'key' });
+        agentStore.createIndex('pageKey', 'pageKey', { unique: false });
+        agentStore.createIndex('updatedAt', 'updatedAt', { unique: false });
       }
     };
     req.onsuccess = () => {
@@ -394,3 +407,36 @@ export async function ensureCategoriesSeeded(): Promise<void> {
     tx.onerror = () => reject(tx.error);
   });
 }
+
+// ── Agent page plan cache ──
+
+export async function getAgentPlanCacheRecord(key: string): Promise<AgentPlanCacheRecord | null> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('agentPlans', 'readonly');
+    const req = tx.objectStore('agentPlans').get(key);
+    req.onsuccess = () => resolve((req.result as AgentPlanCacheRecord | undefined) ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function saveAgentPlanCacheRecord(record: AgentPlanCacheRecord): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('agentPlans', 'readwrite');
+    tx.objectStore('agentPlans').put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function deleteAgentPlanCacheRecord(key: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('agentPlans', 'readwrite');
+    tx.objectStore('agentPlans').delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+import type { AgentPagePlan } from './agent/types';

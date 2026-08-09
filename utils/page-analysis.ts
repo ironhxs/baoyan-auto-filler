@@ -8,6 +8,7 @@ import type {
   ApplicationTaskPauseReason,
 } from './application-tasks';
 import { semanticPageKey } from './page-identity';
+import type { AgentCheckpoint } from './agent/types';
 
 export type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 
@@ -120,6 +121,7 @@ export interface ApplicationRunnerCheckpoint {
   pauseReason?: ApplicationTaskPauseReason;
   confirmedMaterialPageKey?: string;
   resumeAfter?: number;
+  agent?: AgentCheckpoint;
   updatedAt: number;
 }
 

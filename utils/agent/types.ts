@@ -112,3 +112,38 @@ export interface AgentPagePlan {
   actions: AgentPlannedAction[];
   reviewItems: AgentReviewItem[];
 }
+
+export type AgentPhase =
+  | 'observing'
+  | 'planning'
+  | 'validating'
+  | 'preparing'
+  | 'executing'
+  | 'verifying'
+  | 'repairing'
+  | 'paused'
+  | 'complete';
+
+export interface AgentActionResult {
+  actionId: string;
+  targetId?: string;
+  status: 'verified' | 'manual' | 'review' | 'failed' | 'skipped';
+  observed: string;
+  reason: string;
+  retryable?: boolean;
+  updatedAt: number;
+}
+
+export interface AgentCheckpoint {
+  pageKey: string;
+  phase: AgentPhase;
+  plan?: AgentPagePlan;
+  snapshotFingerprint?: string;
+  profileFingerprint?: string;
+  nextActionIndex: number;
+  results: AgentActionResult[];
+  retries: Record<string, number>;
+  manualOverrides: Record<string, string>;
+  error?: string;
+  updatedAt: number;
+}

@@ -134,6 +134,7 @@ function cloneRunnerCheckpoint(checkpoint: ApplicationRunnerCheckpoint): Applica
   return {
     ...checkpoint,
     history: checkpoint.history.map((entry) => ({ ...entry })),
+    ...(checkpoint.agent ? { agent: structuredClone(checkpoint.agent) } : {}),
   };
 }
 
