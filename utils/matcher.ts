@@ -261,7 +261,26 @@ export function getRequestUrl(apiConfig: ApiConfig): string {
   return `${baseUrl}/${getApiMode(apiConfig) === 'responses' ? 'responses' : 'chat/completions'}`;
 }
 
-export function getRequestBody(apiConfig: ApiConfig, prompt: string, stream: boolean): Record<string, unknown> {
+export interface ModelJsonSchema {
+  name: string;
+  schema: Record<string, unknown>;
+  strict?: boolean;
+}
+
+export interface ModelRequestOptions {
+  stream?: boolean;
+  jsonSchema?: ModelJsonSchema;
+}
+
+export function getRequestBody(
+  apiConfig: ApiConfig,
+  prompt: string,
+  streamOrOptions: boolean | ModelRequestOptions = false,
+): Record<string, unknown> {
+  const options = typeof streamOrOptions === 'boolean'
+    ? { stream: streamOrOptions }
+    : streamOrOptions;
+  const stream = options.stream ?? false;
   const common = {
     model: apiConfig.model,
     stream,
@@ -273,6 +292,16 @@ export function getRequestBody(apiConfig: ApiConfig, prompt: string, stream: boo
       ...common,
       input: prompt,
       store: false,
+      ...(options.jsonSchema ? {
+        text: {
+          format: {
+            type: 'json_schema',
+            name: options.jsonSchema.name,
+            schema: options.jsonSchema.schema,
+            strict: options.jsonSchema.strict ?? true,
+          },
+        },
+      } : {}),
     };
   }
 
@@ -280,6 +309,16 @@ export function getRequestBody(apiConfig: ApiConfig, prompt: string, stream: boo
     ...common,
     messages: [{ role: 'user', content: prompt }],
     temperature: 0,
+    ...(options.jsonSchema ? {
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: options.jsonSchema.name,
+          schema: options.jsonSchema.schema,
+          strict: options.jsonSchema.strict ?? true,
+        },
+      },
+    } : {}),
   };
 }
 
@@ -442,11 +481,15 @@ export async function requestAuditModel(
   };
 }
 
-export async function requestModelText(apiConfig: ApiConfig, prompt: string): Promise<string> {
+export async function requestModelText(
+  apiConfig: ApiConfig,
+  prompt: string,
+  options: ModelRequestOptions = {},
+): Promise<string> {
   if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
   const apiMode = getApiMode(apiConfig);
   return extractModelResponse(
-    await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, false)),
+    await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, options)),
     apiMode,
   );
 }
