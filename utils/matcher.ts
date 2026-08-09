@@ -20,6 +20,8 @@ export interface FormFieldInfo {
   ariaLabel: string;
   title?: string;
   dateFormat?: string;
+  maxLength?: number;
+  forbiddenCharacters?: string[];
   value?: string;
   options?: string[];
   accept?: string;
