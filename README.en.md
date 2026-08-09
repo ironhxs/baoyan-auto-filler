@@ -138,6 +138,7 @@ To preserve data during an update, overwrite the files in the same unpacked dire
 
 - Profile data, documents, task history, and API settings remain in the current browser; the project has no application backend.
 - API keys are excluded from profile exports, Git, Agent plan caches, and status summaries.
+- Only an explicit AI/Agent action transmits the profile fields, page structure, current URL, and API authentication data required for that request to the model provider configured by the user. The Firefox build declares these transmission types during installation and requires Firefox 140 or newer.
 - Model actions may only reference observed page targets and retrieved source records. Invented targets, record IDs, evidence, and click actions are rejected locally.
 - Passwords, cookies, authorization data, CSRF values, CAPTCHAs, identity numbers, phone numbers, and raw model responses are excluded from the Agent status view.
 - The extension never performs final submission, application confirmation, payment, agreements, preference/advisor selection, or CAPTCHA handling.

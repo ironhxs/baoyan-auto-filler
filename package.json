@@ -38,6 +38,7 @@
     "test:agent:runtime": "tsx scripts/test-agent-runtime.ts",
     "test:agent:activation": "tsx scripts/test-agent-activation.ts",
     "test:agent:ui": "tsx scripts/test-agent-ui.ts",
+    "test:firefox:privacy": "tsx scripts/test-firefox-privacy-manifest.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {

@@ -15,11 +15,26 @@ for (const p of CHROMIUM_FALLBACKS) {
 }
 
 export default defineConfig({
-  manifest: {
+  manifest: ({ browser }) => ({
     name: '保填',
     permissions: ['storage', 'activeTab', 'scripting', 'alarms'],
     host_permissions: ['<all_urls>'],
-  },
+    ...(browser === 'firefox' ? {
+      browser_specific_settings: {
+        gecko: {
+          strict_min_version: '140.0',
+          data_collection_permissions: {
+            required: [
+              'personallyIdentifyingInfo',
+              'authenticationInfo',
+              'browsingActivity',
+              'websiteContent',
+            ],
+          },
+        },
+      },
+    } : {}),
+  }),
   hooks: {
     'build:manifestGenerated': (_wxt, manifest) => {
       if (manifest.options_ui) {
