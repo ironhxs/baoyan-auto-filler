@@ -20,6 +20,7 @@
     "test:repeatable-records": "tsx scripts/test-repeatable-records.ts",
     "test:repeatable-row-request": "tsx scripts/test-repeatable-row-request.ts",
     "test:repeatable-dialog": "tsx scripts/test-repeatable-dialog.ts",
+    "test:dom-selection-policy": "tsx scripts/test-dom-selection-policy.ts",
     "test:tasks": "tsx scripts/test-application-tasks.ts",
     "test:page-analysis-recovery": "tsx scripts/test-page-analysis-recovery.ts",
     "test:audit": "tsx scripts/test-final-audit.ts",

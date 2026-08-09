@@ -82,4 +82,19 @@ const projectCandidates = projectProfileToTargetSchema({
 assert.equal(projectCandidates.find((candidate) => candidate.sourceSectionId === 'research_training' && candidate.targetFieldKey === '项目名称')?.value, 'PRISM-Net');
 assert.equal(projectCandidates.find((candidate) => candidate.sourceSectionId === 'research_training' && candidate.targetFieldKey === '项目描述')?.value, '面向缺失模态脑肿瘤分割');
 
+const chronologyCandidates = projectProfileToTargetSchema({
+  groupLabel: '学习和工作经历（从高中开始填写）',
+  fields: [
+    { key: '起始时间', label: '起始时间（日期格式：2019-11）' },
+    { key: '结束时间', label: '结束时间（日期格式：2019-11）' },
+    { key: '学校或工作单位', label: '学校或工作单位' },
+    { key: '担任职务', label: '担任职务' },
+  ],
+}, blocks, textFields);
+assert.deepEqual(
+  chronologyCandidates,
+  [],
+  'education/work chronology must stay empty when the profile contains only project, paper, competition, and award records',
+);
+
 console.log('profile projection tests passed');

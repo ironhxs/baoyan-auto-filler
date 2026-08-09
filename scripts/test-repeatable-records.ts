@@ -83,4 +83,41 @@ const projectedProjectPlan = planRepeatableRecords([
 assert.equal(projectedProjectPlan.groups['项目经历']?.rowBindings[0], 0, 'merged project groups should bind a research record');
 assert.equal(projectedProjectPlan.groups['项目经历']?.rowsToAdd, 0);
 
+const chronologyPlan = planRepeatableRecords([
+  field(20, { groupLabel: '学习和工作经历', rowIndex: 0, columnLabel: '起始时间' }),
+  field(21, { groupLabel: '学习和工作经历', rowIndex: 0, columnLabel: '结束时间' }),
+  field(22, { groupLabel: '学习和工作经历', rowIndex: 0, columnLabel: '学校或工作单位' }),
+  field(23, { groupLabel: '学习和工作经历', rowIndex: 0, columnLabel: '担任职务' }),
+], [{
+  title: '科研训练',
+  sectionId: 'research_training',
+  items: [{ fields: [
+    { key: '起止时间', value: '2025.07-2026.07' },
+    { key: '项目名称', value: 'PRISM-Net' },
+    { key: '项目级别', value: '科研论文项目' },
+    { key: '排名', value: '第一' },
+  ] }],
+}, {
+  title: '实习实践',
+  sectionId: 'internship_practice',
+  items: [{ fields: [
+    { key: '起止时间', value: '2025年暑期' },
+    { key: '实习实践单位', value: '宣砚文化社会实践团队' },
+    { key: '主要工作内容', value: '项目调研与成果撰写' },
+  ] }],
+}, {
+  title: '社会工作',
+  sectionId: 'social_work',
+  items: [{ fields: [
+    { key: '起止时间', value: '2024.09-至今' },
+    { key: '社会工作名称', value: '班级学习委员' },
+    { key: '主要工作内容', value: '学习资料整理' },
+  ] }],
+}], []);
+assert.equal(
+  chronologyPlan.groups['学习和工作经历'],
+  undefined,
+  'education/work chronology must not be synthesized from research, internship, or social-work project records',
+);
+
 console.log('repeatable records tests passed');
