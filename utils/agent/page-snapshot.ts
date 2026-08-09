@@ -38,8 +38,7 @@ function groupLabelFor(field: FormFieldInfo): string {
 }
 
 export function stableTargetId(pageKey: string, field: FormFieldInfo): string {
-  const identity = [
-    normalizeText(pageKey),
+  const stableParts = [
     groupLabelFor(field),
     field.rowIndex ?? '',
     normalizedColumnLabel(field),
@@ -47,7 +46,11 @@ export function stableTargetId(pageKey: string, field: FormFieldInfo): string {
     normalizeText(field.name),
     normalizeText(field.type),
     normalizeText(field.label),
-    field.index,
+  ];
+  const identity = [
+    normalizeText(pageKey),
+    ...stableParts,
+    ...(stableParts.some((part) => String(part).trim()) ? [] : [field.index]),
   ].join('\u241f');
   return `target_${shortHash(identity)}`;
 }
@@ -203,4 +206,3 @@ export function buildAgentPageSnapshot(input: BuildAgentPageSnapshotInput): Agen
     capturedAt: input.capturedAt ?? Date.now(),
   };
 }
-

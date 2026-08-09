@@ -1,6 +1,8 @@
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
+import { stableTargetId } from '@/utils/agent/page-snapshot';
+import type { AgentExecutionItem, AgentExecutionResult } from '@/utils/agent/executor';
 import {
   MAX_REPEAT_ROW_ADDITIONS_PER_PASS,
   isAddRowLabel,
@@ -127,7 +129,12 @@ interface MarkPreviewMessage {
 interface FocusFieldMessage { type: 'focusField'; index: number }
 interface GetPageMetaMessage { type: 'getPageMeta' }
 interface GetAuditPageSnapshotMessage { type: 'getAuditPageSnapshot' }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage;
+interface ExecuteAgentActionsMessage {
+  type: 'executeAgentActions';
+  pageKey: string;
+  items: AgentExecutionItem[];
+}
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -1680,6 +1687,82 @@ async function fillFields(items: FillItem[]): Promise<FillResult> {
   return { success, failure };
 }
 
+async function executeAgentActions(
+  pageKey: string,
+  items: AgentExecutionItem[],
+): Promise<AgentExecutionResult[]> {
+  const pageMeta = getPageMeta();
+  if (pageMeta.signature !== pageKey) {
+    return items.map((item) => ({
+      actionId: item.actionId,
+      targetId: item.targetId,
+      attempted: false,
+      observed: '',
+      matched: false,
+      reason: 'page-changed',
+    }));
+  }
+
+  const latestFields = scanFields();
+  const targetElements = new Map<string, { index: number; element: HTMLElement }>();
+  for (const result of latestFields) {
+    const targetId = stableTargetId(pageKey, { ...result.field, index: result.index });
+    const element = elementMap.get(result.index);
+    if (element) targetElements.set(targetId, { index: result.index, element });
+  }
+
+  const results: AgentExecutionResult[] = [];
+  for (const item of items) {
+    const target = targetElements.get(item.targetId);
+    if (!target) {
+      results.push({
+        actionId: item.actionId,
+        targetId: item.targetId,
+        attempted: false,
+        observed: '',
+        matched: false,
+        reason: 'target-not-found',
+      });
+      continue;
+    }
+    const current = normalizeText(getCurrentValue(target.element));
+    if (current !== normalizeText(item.expectedCurrentValue)) {
+      results.push({
+        actionId: item.actionId,
+        targetId: item.targetId,
+        attempted: false,
+        observed: current,
+        matched: false,
+        reason: 'manual-value-changed',
+      });
+      continue;
+    }
+    if (protectedIndices.has(target.index)) {
+      results.push({
+        actionId: item.actionId,
+        targetId: item.targetId,
+        attempted: false,
+        observed: current,
+        matched: false,
+        reason: 'protected-target',
+      });
+      continue;
+    }
+    const attempted = await fillElementAsync(target.element, item.value, item.confidence);
+    const observed = normalizeText(getCurrentValue(target.element));
+    const matched = attempted && valueMatches(target.element, item.value);
+    results.push({
+      actionId: item.actionId,
+      targetId: item.targetId,
+      attempted: true,
+      observed,
+      matched,
+      reason: matched ? 'verified' : 'write-readback-mismatch',
+    });
+  }
+  return results;
+}
+
 // ─── Typing animation for streaming fill ────────────────────────────
 
 interface TypingEntry {
@@ -1817,6 +1900,17 @@ export default defineContentScript({
           sendResponse({ ok: focusField(message.index) });
         } else if (message.type === 'fill') {
           fillFields(message.items).then(sendResponse).catch(() => sendResponse({ success: 0, failure: message.items.length }));
+        } else if (message.type === 'executeAgentActions') {
+          executeAgentActions(message.pageKey, message.items)
+            .then(sendResponse)
+            .catch(() => sendResponse(message.items.map((item) => ({
+              actionId: item.actionId,
+              targetId: item.targetId,
+              attempted: false,
+              observed: '',
+              matched: false,
+              reason: 'unexpected-execution-error',
+            }))));
         } else if (message.type === 'fillStreamInit') {
           typingMap.clear();
           for (const item of message.items) {

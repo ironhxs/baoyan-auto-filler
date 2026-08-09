@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { buildAgentPageSnapshot } from '../utils/agent/page-snapshot';
+import { buildAgentPageSnapshot, stableTargetId } from '../utils/agent/page-snapshot';
 import type { FormFieldInfo } from '../utils/matcher';
 
 function awardField(
@@ -96,5 +96,12 @@ assert.deepEqual(singleSnapshot.groups[0].fields[0].options, ['测试同学']);
 assert.equal(singleSnapshot.groups[0].fields[0].placeholder, '请输入姓名');
 assert.equal(singleSnapshot.groups[0].fields[0].maxLength, 20);
 assert.deepEqual(singleSnapshot.groups[0].fields[0].forbiddenCharacters, ['#']);
+
+const stableField = awardField(1, 0, '时间', { id: 'award-time-0' });
+assert.equal(
+  stableTargetId('fudan-awards', stableField),
+  stableTargetId('fudan-awards', { ...stableField, index: 99 }),
+  'targetId must survive scan index changes between planning and execution',
+);
 
 console.log('agent page snapshot tests passed');
