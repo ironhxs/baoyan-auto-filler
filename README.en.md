@@ -39,12 +39,12 @@ When a saved award record has fields such as title, level, date, organizer, desc
 - content combines only relevant saved facts and obeys forbidden-character and length rules;
 - all columns in a record are treated atomically, so a partial row is never reported as complete.
 
-The Agent runs inside the extension and uses the OpenAI-compatible relay configured by the user. No Codex desktop integration or local model is required. Both Responses and Chat Completions are supported, with strict structured output when the relay accepts it and a single plain-JSON fallback when it does not.
+The Agent runs inside the extension and uses the OpenAI-compatible relay configured by the user. No Codex desktop integration or local model is required. Both Responses and Chat Completions are supported. Agent requests use streamed plain JSON and are checked locally against a strict schema, page fingerprint, source evidence, and action allowlist. This avoids relying on inconsistent relay-side structured-output support and never changes endpoints or blindly retries authentication, rate-limit, upstream, or network failures.
 
 ```mermaid
 flowchart LR
   A[Observe the current page] --> B[Retrieve relevant local records]
-  B --> C[Request a structured plan]
+  B --> C[Request a JSON plan]
   C --> D[Validate targets, evidence, and safety]
   D --> E[Execute fields or atomic rows]
   E --> F[Read values back from the page]
@@ -55,6 +55,8 @@ flowchart LR
 ```
 
 The popup reports planned actions, readback-verified values, preserved manual edits, review items, failures, retries, and cache reuse. Users can locate a failed field, retry failed actions only, replan the page, or stop the task.
+
+Large repeatable tables are planned in complete-row batches with visible N/M progress. Chromium builds use a hidden extension model bridge so long requests survive Manifest V3 service-worker suspension.
 
 ## Managed profile data
 
