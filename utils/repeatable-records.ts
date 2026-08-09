@@ -54,6 +54,28 @@ export interface RepeatableRowScanResult<T> {
   preparation: PrepareRepeatRowsResult;
 }
 
+export const MAX_REPEAT_ROW_ADDITIONS_PER_PASS = 24;
+
+export function planRepeatRowPreparation(
+  requiredRows: number,
+  currentRows: number,
+): { targetRows: number; truncated: boolean } {
+  const requested = Math.max(Math.floor(requiredRows), 0);
+  const current = Math.max(Math.floor(currentRows), 0);
+  const targetRows = Math.max(
+    current,
+    Math.min(requested, current + MAX_REPEAT_ROW_ADDITIONS_PER_PASS),
+  );
+  return { targetRows, truncated: requested > targetRows };
+}
+
+export function limitRepeatRecordBatch<T>(
+  records: T[],
+): { records: T[]; truncated: boolean } {
+  const limitedRecords = records.slice(0, MAX_REPEAT_ROW_ADDITIONS_PER_PASS);
+  return { records: limitedRecords, truncated: records.length > limitedRecords.length };
+}
+
 interface RepeatableSourceGroup {
   label: string;
   sectionId?: string;

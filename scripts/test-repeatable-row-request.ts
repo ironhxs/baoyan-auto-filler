@@ -8,6 +8,53 @@ import {
 import type { BlockCategory } from '../utils/db';
 import type { FormFieldInfo } from '../utils/matcher';
 
+const repeatableRecordsModule = await import('../utils/repeatable-records');
+assert.equal(
+  typeof repeatableRecordsModule.planRepeatRowPreparation,
+  'function',
+  'repeat row preparation must expose a safety plan based on rows added, not a hard total-row ceiling',
+);
+const planRepeatRowPreparation = repeatableRecordsModule.planRepeatRowPreparation as (
+  requiredRows: number,
+  currentRows: number,
+) => { targetRows: number; truncated: boolean };
+
+assert.deepEqual(
+  planRepeatRowPreparation(18, 9),
+  { targetRows: 18, truncated: false },
+  'a real award page with 9 existing rows must be allowed to grow to 18 rows',
+);
+assert.deepEqual(
+  planRepeatRowPreparation(18, 0),
+  { targetRows: 18, truncated: false },
+  'a normal profile with 18 award records must not be rejected by the old total-row limit of 10',
+);
+assert.deepEqual(
+  planRepeatRowPreparation(80, 2),
+  { targetRows: 26, truncated: true },
+  'one preparation pass must still cap the number of newly created rows to prevent runaway loops',
+);
+
+assert.equal(
+  typeof repeatableRecordsModule.limitRepeatRecordBatch,
+  'function',
+  'dialog-based repeat records must use the same additions-per-pass safety policy',
+);
+const limitRepeatRecordBatch = repeatableRecordsModule.limitRepeatRecordBatch as <T>(
+  records: T[],
+) => { records: T[]; truncated: boolean };
+const normalDialogRecords = Array.from({ length: 18 }, (_, index) => index);
+assert.deepEqual(
+  limitRepeatRecordBatch(normalDialogRecords),
+  { records: normalDialogRecords, truncated: false },
+  '18 dialog records must no longer be rejected by the legacy limit of 10',
+);
+assert.deepEqual(
+  limitRepeatRecordBatch(Array.from({ length: 40 }, (_, index) => index)),
+  { records: Array.from({ length: 24 }, (_, index) => index), truncated: true },
+  'dialog automation must retain a bounded batch for unexpectedly large profiles',
+);
+
 const AWARDS = '\u5956\u52b1\u60c5\u51b5';
 const AWARD_NAME = '\u5956\u52b1\u540d\u79f0';
 

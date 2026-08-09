@@ -1,7 +1,7 @@
 {
   "name": "baotian",
   "description": "保填",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -28,6 +28,15 @@
     "test:material-audit": "tsx scripts/test-material-audit.ts",
     "test:audit-view-model": "tsx scripts/test-audit-view-model.ts",
     "test:page-identity": "tsx scripts/test-page-identity.ts",
+    "test:agent:snapshot": "tsx scripts/test-agent-page-snapshot.ts",
+    "test:agent:profile": "tsx scripts/test-agent-profile-retriever.ts",
+    "test:agent:response": "tsx scripts/test-agent-planner-response.ts",
+    "test:agent:policy": "tsx scripts/test-agent-policy.ts",
+    "test:agent:api": "tsx scripts/test-agent-api.ts",
+    "test:agent:execution": "tsx scripts/test-agent-execution.ts",
+    "test:agent:cache": "tsx scripts/test-agent-cache.ts",
+    "test:agent:runtime": "tsx scripts/test-agent-runtime.ts",
+    "test:agent:ui": "tsx scripts/test-agent-ui.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {

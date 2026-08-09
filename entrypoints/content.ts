@@ -1,7 +1,12 @@
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
-import { isAddRowLabel } from '@/utils/repeatable-records';
+import {
+  MAX_REPEAT_ROW_ADDITIONS_PER_PASS,
+  isAddRowLabel,
+  limitRepeatRecordBatch,
+  planRepeatRowPreparation,
+} from '@/utils/repeatable-records';
 import {
   classifyRepeatableHeaderSchema,
   classifyRepeatPreparation,
@@ -632,12 +637,15 @@ async function prepareRepeatRows(
       if (classifyRepeatPreparation({ tableMatch: 'none', hasAddControl: false }) === 'skip') continue;
       continue;
     }
-    const requestedRows = Math.max(Math.floor(target.requiredRows), 0);
-    const safeTarget = Math.min(requestedRows, 10);
-    if (requestedRows > safeTarget) {
-      failures.push({ groupLabel: target.groupLabel, reason: 'Requested row count exceeds the safe limit of 10' });
+    const currentRows = repeatDataRows(table).length;
+    const preparationPlan = planRepeatRowPreparation(target.requiredRows, currentRows);
+    if (preparationPlan.truncated) {
+      failures.push({
+        groupLabel: target.groupLabel,
+        reason: `Requested row count requires more than ${MAX_REPEAT_ROW_ADDITIONS_PER_PASS} additions in one pass`,
+      });
     }
-    while (repeatDataRows(table).length < safeTarget) {
+    while (repeatDataRows(table).length < preparationPlan.targetRows) {
       const previousCount = repeatDataRows(table).length;
       const control = findAddRowControl(table);
       if (!control) {
@@ -1301,11 +1309,15 @@ async function prepareRepeatRecords(
   let processed = 0;
   const failures: PrepareRepeatRecordsResult['failures'] = [];
   for (const target of targets) {
-    const safeRecords = target.records.slice(0, 10);
-    if (target.records.length > safeRecords.length) {
-      failures.push({ groupLabel: target.groupLabel, presentation: 'dialog', reason: 'Requested record count exceeds the safe limit of 10' });
+    const recordBatch = limitRepeatRecordBatch(target.records);
+    if (recordBatch.truncated) {
+      failures.push({
+        groupLabel: target.groupLabel,
+        presentation: 'dialog',
+        reason: `Requested record count exceeds the safe batch of ${MAX_REPEAT_ROW_ADDITIONS_PER_PASS}`,
+      });
     }
-    for (const record of safeRecords) {
+    for (const record of recordBatch.records) {
       const table = findRepeatTable(target.groupLabel);
       if (!table) {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Repeatable group table not found' });
