@@ -1396,6 +1396,7 @@ function renderSettingsPage() {
     return `
       <article class="repeat-summary-card${items.length ? '' : ' empty'}">
         <div class="repeat-summary-title"><span>${section.icon} ${section.title}</span><b>${items.length} 条</b></div>
+        <div class="repeat-summary-schema"><span>必填：${escapeHtml(section.fieldKeys.join('、'))}</span>${section.optionalFieldKeys?.length ? `<span>可选：${escapeHtml(section.optionalFieldKeys.join('、'))}</span>` : ''}</div>
         ${preview || '<div class="repeat-summary-empty">暂无条目</div>'}
         ${items.length > 2 ? `<div class="repeat-summary-more">另有 ${items.length - 2} 条</div>` : ''}
       </article>
@@ -1681,7 +1682,7 @@ function downloadProfileTemplate() {
   const templateBlocks = DEFAULT_REPEAT_SECTIONS.map((section) => ({
     title: section.title,
     sectionId: section.id,
-    templateFields: section.fieldKeys,
+    templateFields: [...section.fieldKeys, ...(section.optionalFieldKeys ?? [])],
     items: [],
   }));
   downloadJson('baotian-profile-template.json', stringifyProfileExport(PROFILE_TEMPLATE_FIELDS, new Date(), templateBlocks));
@@ -1701,12 +1702,31 @@ async function importProfileData(event: Event) {
     }
 
     const importedRows = imported.blocks.reduce((count, block) => count + block.items.length, 0);
+    const currentFields = collectProfileFieldsFromForm();
+    const currentFieldKeys = new Set(currentFields.map((field) => field.key));
+    const updatedFieldCount = imported.fields.filter((field) => currentFieldKeys.has(field.key)).length;
+    const newFieldCount = imported.fields.length - updatedFieldCount;
+    const blockIdentity = (block: Pick<BlockCategory, 'title' | 'sectionId'>) => (
+      block.sectionId ? `section:${block.sectionId}` : `title:${block.title}`
+    );
+    const currentBlockIdentities = new Set(blockCategories.map(blockIdentity));
+    const updatedBlockCount = imported.blocks.filter((block) => currentBlockIdentities.has(blockIdentity(block))).length;
+    const newBlockCount = imported.blocks.length - updatedBlockCount;
+    const ignoredEmptyCount = imported.warnings?.filter((warning) => warning.kind === 'empty-record').length ?? 0;
+    const unknownFieldWarnings = imported.warnings?.filter((warning) => warning.kind === 'unknown-field') ?? [];
+    const warningPreview = unknownFieldWarnings.slice(0, 4).map((warning) => warning.fieldKey || warning.message).join('、');
+    const diagnosticText = [
+      `普通字段：${newFieldCount} 个新增，${updatedFieldCount} 个更新`,
+      `资料分组：${newBlockCount} 个新增，${updatedBlockCount} 个更新`,
+      ignoredEmptyCount ? `忽略“无”空记录：${ignoredEmptyCount} 条` : '',
+      unknownFieldWarnings.length ? `未知字段：${unknownFieldWarnings.length} 个${warningPreview ? `（${warningPreview}）` : ''}` : '',
+    ].filter(Boolean).join('；');
 
     const importDescription = profileImportMode === 'append'
       ? '只新增缺少的普通字段，并向多行资料追加非重复条目；现有内容不会覆盖'
       : '同名普通字段会更新，重复资料分组会按文件内容替换；其他现有资料会保留';
     const confirmed = window.confirm(
-      `将处理 ${imported.fields.length} 个字段和 ${importedRows} 条多行资料：${importDescription}。是否继续？`,
+      `将处理 ${imported.fields.length} 个字段和 ${importedRows} 条多行资料。\n${diagnosticText}\n${importDescription}。是否继续？`,
     );
     if (!confirmed) return;
 
@@ -1724,7 +1744,7 @@ async function importProfileData(event: Event) {
     blockCategories = mergedBlocks;
     renderSettingsPage();
     const statusPrefix = profileImportMode === 'append' ? '新增导入完成' : '导入更新完成';
-    showStatus(`${statusPrefix}：已处理 ${imported.fields.length} 个字段和 ${importedRows} 条多行资料`);
+    showStatus(`${statusPrefix}：${diagnosticText}；共处理 ${importedRows} 条多行资料`);
   } catch (err) {
     showStatus(err instanceof Error ? err.message : '导入失败');
   } finally {

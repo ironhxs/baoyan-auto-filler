@@ -73,4 +73,14 @@ assert.deepEqual(existingAwardPlan.groups['本科期间校级以上（含）荣�
 assert.deepEqual(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].missingItemIndexes, [1]);
 assert.equal(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].rowsToAdd, 1, 'a populated matching row must not be added again');
 
+const projectedProjectPlan = planRepeatableRecords([
+  field(10, { groupLabel: '项目经历', rowIndex: 0, columnLabel: '项目名称', value: 'PRISM-Net' }),
+], [{
+  title: '科研训练',
+  sectionId: 'research_training',
+  items: [{ fields: [{ key: '项目名称', value: 'PRISM-Net' }] }],
+}], []);
+assert.equal(projectedProjectPlan.groups['项目经历']?.rowBindings[0], 0, 'merged project groups should bind a research record');
+assert.equal(projectedProjectPlan.groups['项目经历']?.rowsToAdd, 0);
+
 console.log('repeatable records tests passed');

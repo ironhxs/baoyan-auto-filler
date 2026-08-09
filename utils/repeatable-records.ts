@@ -78,6 +78,12 @@ const IDENTITY_KEYS: Record<string, string[]> = {
   granted_patents: ['专利名称', '专利权人'],
   subject_competitions: ['获奖项目名称', '竞赛名称', '获奖人'],
   honors_awards: ['获奖名称'],
+  '项目经历': ['项目名称', '实习实践单位', '社会工作名称', '起止时间'],
+  '论文情况': ['论文标题', '论文名称', '作者'],
+  '获奖情况': ['获奖项目名称', '获奖名称', '竞赛名称', '获奖人'],
+  '学习和工作经历': ['项目名称', '实习实践单位', '社会工作名称', '起止时间'],
+  '学术成果': ['论文标题', '论文名称', '专利名称', '获奖项目名称', '竞赛名称'],
+  '奖励情况': ['获奖项目名称', '获奖名称', '竞赛名称', '获奖人'],
 };
 
 export function getSectionIdentityKeys(sectionId: string | undefined, groupLabel = ''): string[] {
@@ -104,14 +110,63 @@ function sameText(left: string | undefined, right: string | undefined): boolean 
 function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): RepeatableSourceGroup[] {
   const groups = blocks.flatMap((block) => {
     const section = getBlockSection(block);
-    if (!section || section.kind !== 'repeat') return [];
+    if (!section || section.kind !== 'repeat') {
+      return block.items.length > 0 && block.title.trim()
+        ? [{ label: block.title, sectionId: block.sectionId, items: block.items }]
+        : [];
+    }
     return [{ label: section.title, sectionId: section.id, items: block.items }];
   });
   if (!groups.some((group) => group.label === '外语水平')) {
     const inferred = inferLanguageItems(textFields);
     if (inferred.length > 0) groups.push({ label: '外语水平', sectionId: 'language', items: inferred });
   }
-  return groups.filter((group) => group.items.length > 0);
+  const sourceBySection = new Map(groups.filter((group) => group.sectionId).map((group) => [group.sectionId!, group]));
+  const mergedGroups: RepeatableSourceGroup[] = [
+    {
+      label: '项目经历',
+      items: [
+        ...(sourceBySection.get('research_training')?.items ?? []),
+        ...(sourceBySection.get('internship_practice')?.items ?? []),
+        ...(sourceBySection.get('social_work')?.items ?? []),
+      ],
+    },
+    {
+      label: '论文情况',
+      items: [...(sourceBySection.get('published_papers')?.items ?? [])],
+    },
+    {
+      label: '获奖情况',
+      items: [
+        ...(sourceBySection.get('subject_competitions')?.items ?? []),
+        ...(sourceBySection.get('honors_awards')?.items ?? []),
+      ],
+    },
+    {
+      label: '学习和工作经历',
+      items: [
+        ...(sourceBySection.get('research_training')?.items ?? []),
+        ...(sourceBySection.get('internship_practice')?.items ?? []),
+        ...(sourceBySection.get('social_work')?.items ?? []),
+      ],
+    },
+    {
+      label: '学术成果',
+      items: [
+        ...(sourceBySection.get('published_papers')?.items ?? []),
+        ...(sourceBySection.get('granted_patents')?.items ?? []),
+        ...(sourceBySection.get('subject_competitions')?.items ?? []),
+      ],
+    },
+    {
+      label: '奖励情况',
+      items: [
+        ...(sourceBySection.get('subject_competitions')?.items ?? []),
+        ...(sourceBySection.get('honors_awards')?.items ?? []),
+      ],
+    },
+  ];
+  return [...groups, ...mergedGroups].filter((group) => group.items.length > 0);
 }
 
 function rowFieldsForGroup(fields: FormFieldInfo[], groupLabel: string): Map<number, FormFieldInfo[]> {

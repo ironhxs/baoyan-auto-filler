@@ -642,6 +642,15 @@ body {
   font-weight: 600;
 }
 
+.repeat-summary-schema {
+  display: grid;
+  gap: 3px;
+  margin: 7px 0 9px;
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .repeat-summary-row {
   display: flex;
   gap: 7px;

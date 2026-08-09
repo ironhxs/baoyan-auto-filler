@@ -1,6 +1,7 @@
 import type { BlockCategory, TextField } from './db';
 import type { FormFieldInfo, MatchResult } from './matcher';
 import { getBlockSection, inferLanguageItems } from './profile-schema';
+import { projectProfileToTargetSchema, type ProfileProjectionCandidate } from './profile-projections';
 import { getFieldItemBinding, planRepeatableRecords, type RepeatableRecordPlan } from './repeatable-records';
 
 const ALIAS_GROUPS: string[][] = [
@@ -223,12 +224,13 @@ function findStructuredMatch(
   plan: RepeatableRecordPlan,
 ): MatchResult | undefined {
   if (field.rowIndex == null || !field.groupLabel) return undefined;
-  const itemIndex = getFieldItemBinding(field, plan);
-  if (itemIndex == null) return undefined;
   const block = blocks.find((candidate) => {
     const section = getBlockSection(candidate);
     return section?.title === field.groupLabel || normalize(candidate.title) === normalize(field.groupLabel ?? '');
   });
+  if (!block && field.groupLabel !== '外语水平') return findProjectedStructuredMatch(field, blocks, textFields);
+  const itemIndex = getFieldItemBinding(field, plan);
+  if (itemIndex == null) return undefined;
   const inferredLanguageItems = field.groupLabel === '外语水平' ? inferLanguageItems(textFields) : [];
   const item = block?.items[itemIndex] ?? inferredLanguageItems[itemIndex];
   if (!item) return undefined;
@@ -257,6 +259,96 @@ function findBlockForGroup(field: FormFieldInfo, blocks: BlockCategory[]): Block
     const section = getBlockSection(candidate);
     return section?.title === field.groupLabel || normalize(candidate.title) === normalize(field.groupLabel ?? '');
   });
+}
+
+function projectedRecordKey(candidate: ProfileProjectionCandidate): string {
+  return `${candidate.sourceSectionId}:${candidate.sourceItemIndex}`;
+}
+
+function projectedCandidatesForField(
+  field: FormFieldInfo,
+  blocks: BlockCategory[],
+  textFields: TextField[],
+  targetFieldKeys: string[],
+): ProfileProjectionCandidate[] {
+  if (!field.groupLabel) return [];
+  return projectProfileToTargetSchema({
+    groupLabel: field.groupLabel,
+    fields: targetFieldKeys.map((key) => ({ key, label: key })),
+  }, blocks, textFields);
+}
+
+function findProjectedStructuredMatch(
+  field: FormFieldInfo,
+  blocks: BlockCategory[],
+  textFields: TextField[],
+): MatchResult | undefined {
+  if (field.rowIndex == null || !field.groupLabel) return undefined;
+  const targetKey = field.columnLabel || field.label || field.placeholder || '';
+  if (!targetKey.trim()) return undefined;
+  const candidates = projectedCandidatesForField(field, blocks, textFields, [targetKey]);
+  const recordOrder: string[] = [];
+  const byRecord = new Map<string, ProfileProjectionCandidate>();
+  for (const candidate of candidates) {
+    const key = projectedRecordKey(candidate);
+    if (!byRecord.has(key)) recordOrder.push(key);
+    byRecord.set(key, candidate);
+  }
+  const candidate = byRecord.get(recordOrder[field.rowIndex]);
+  if (!candidate) return undefined;
+  return {
+    kind: 'text',
+    index: field.index,
+    fieldKey: `${field.groupLabel}[${field.rowIndex + 1}].${candidate.sourceFieldKeys[0]}`,
+    value: adaptValueToField(candidate.value, field),
+    shortLabel: `${field.groupLabel}·第${field.rowIndex + 1}行·${targetKey}`,
+    confidence: candidate.confidence >= 0.95 ? 'high' : 'medium',
+    fillMode: field.fillMode,
+    source: 'local',
+  };
+}
+
+function findProjectedAggregateMatch(
+  field: FormFieldInfo,
+  blocks: BlockCategory[],
+  textFields: TextField[],
+): MatchResult | undefined {
+  if (field.rowIndex != null || !field.groupLabel || field.fillMode !== 'long') return undefined;
+  const sourceBlocks = blocks.filter((block) => [
+    'research_training', 'internship_practice', 'social_work', 'published_papers',
+    'granted_patents', 'subject_competitions', 'honors_awards',
+  ].includes(block.sectionId ?? ''));
+  const targetFieldKeys = Array.from(new Set(sourceBlocks.flatMap((block) => [
+    ...(block.templateFields ?? []),
+    ...block.items.flatMap((item) => item.fields.map((source) => source.key)),
+  ]).filter(Boolean)));
+  if (!targetFieldKeys.length) return undefined;
+  const candidates = projectedCandidatesForField(field, blocks, textFields, targetFieldKeys);
+  const byRecord = new Map<string, ProfileProjectionCandidate[]>();
+  for (const candidate of candidates) {
+    const key = projectedRecordKey(candidate);
+    const existing = byRecord.get(key) ?? [];
+    existing.push(candidate);
+    byRecord.set(key, existing);
+  }
+  const entries = [...byRecord.values()].map((record) => {
+    const values = targetFieldKeys.flatMap((key) => {
+      const candidate = record.find((item) => item.targetFieldKey === key);
+      return candidate?.value ? [candidate.value] : [];
+    });
+    return values.join('，');
+  }).filter(Boolean);
+  if (!entries.length) return undefined;
+  return {
+    kind: 'text',
+    index: field.index,
+    fieldKey: `${field.groupLabel}.汇总`,
+    value: entries.join('；'),
+    shortLabel: `${field.groupLabel}汇总`,
+    confidence: 'medium',
+    fillMode: field.fillMode,
+    source: 'local',
+  };
 }
 
 function aggregateKeyOrder(field: FormFieldInfo, block: BlockCategory): string[] {
@@ -292,9 +384,11 @@ function cleanAggregateValue(value: string): string {
 function findAggregateBlockMatch(
   field: FormFieldInfo,
   blocks: BlockCategory[],
+  textFields: TextField[],
 ): MatchResult | undefined {
   if (field.rowIndex != null || !field.groupLabel) return undefined;
   const block = findBlockForGroup(field, blocks);
+  if (!block) return findProjectedAggregateMatch(field, blocks, textFields);
   if (!block?.items.length) return undefined;
 
   const order = aggregateKeyOrder(field, block);
@@ -355,7 +449,7 @@ export function matchFieldsLocally(
     if (field.kind === 'file' || (field.protected && !isReadOnlyAudit)) return [];
     const structured = findStructuredMatch(field, blocks, textFields, plan);
     if (structured) return [structured];
-    const aggregate = findAggregateBlockMatch(field, blocks);
+    const aggregate = findAggregateBlockMatch(field, blocks, textFields);
     if (aggregate) return [aggregate];
     const flat = findFlatMatch(field, textFields);
     return flat ? [flat] : [];
@@ -375,6 +469,9 @@ export function mergeLocalAndAiMatches(
     const aiMatch = aiByIndex.get(localMatch.index);
     if (!aiMatch) return localMatch;
     const field = fieldByIndex.get(localMatch.index);
+    if (field && isMeaningfullyFilled(field) && !/只读|锁定/.test(field.protectionReason ?? '')) {
+      return { ...localMatch, source: 'ai_reviewed' as const };
+    }
     const identityBoundRepeatField = field?.rowIndex != null
       && Boolean(field.groupLabel)
       && /\[\d+\]\./.test(localMatch.fieldKey);
@@ -383,7 +480,11 @@ export function mergeLocalAndAiMatches(
     if (localMatch.confidence === 'medium' && aiMatch.confidence === 'high') return aiMatch;
     return { ...localMatch, source: 'ai_reviewed' as const };
   });
-  const aiOnlyMatches = aiMatches.filter((match) => !localByIndex.has(match.index));
+  const aiOnlyMatches = aiMatches.filter((match) => {
+    if (localByIndex.has(match.index)) return false;
+    const field = fieldByIndex.get(match.index);
+    return !field || !isMeaningfullyFilled(field) || /只读|锁定/.test(field.protectionReason ?? '');
+  });
   return [...reviewedMatches, ...aiOnlyMatches];
 }
 

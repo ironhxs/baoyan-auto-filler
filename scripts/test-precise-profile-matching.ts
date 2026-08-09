@@ -48,5 +48,21 @@ const aggregate = matchFieldsLocally([
 ], [], blocks);
 assert.equal(aggregate[0]?.value, '贺鑫帅等（队长），OopsOS：基于xv6-RISCV的小型操作系统内核扩展，全国大学生计算机系统能力大赛操作系统设计赛，华东区域赛三等奖，2026年1月');
 
-console.log('precise profile matching tests passed');
+const projected = matchFieldsLocally([
+  field(6, { groupLabel: '项目经历', rowIndex: 0, columnLabel: '项目名称' }),
+  field(7, { groupLabel: '项目经历', rowIndex: 0, columnLabel: '项目描述' }),
+], [], [{
+  title: '科研训练',
+  sectionId: 'research_training',
+  items: [{ fields: [
+    { key: '起止时间', value: '2025.07-2026.07' },
+    { key: '项目名称', value: 'PRISM-Net' },
+    { key: '项目级别', value: '科研论文项目' },
+    { key: '排名', value: '第一' },
+    { key: '项目描述', value: '面向缺失模态脑肿瘤分割' },
+  ] }],
+}]);
+assert.equal(projected.find((match) => match.index === 6)?.value, 'PRISM-Net');
+assert.equal(projected.find((match) => match.index === 7)?.value, '面向缺失模态脑肿瘤分割');
 
+console.log('precise profile matching tests passed');

@@ -1,4 +1,11 @@
 import type { ApiConfig, ApiMode } from './storage';
+import {
+  buildLongQuestionPrompt,
+  chunkLongQuestionContext,
+  mergeLongQuestionDrafts,
+  type LongQuestionDraft,
+  type LongQuestionRequest,
+} from './long-question';
 
 export interface FormFieldInfo {
   kind?: 'text' | 'file';
@@ -400,6 +407,109 @@ export async function requestModelText(apiConfig: ApiConfig, prompt: string): Pr
   );
 }
 
+function buildLongQuestionRecords(textFields: { key: string; value: string }[]): LongQuestionRequest['relevantRecords'] {
+  const records = new Map<string, LongQuestionRequest['relevantRecords'][number]>();
+  for (const field of textFields) {
+    const value = field.value.trim();
+    if (!value) continue;
+    const structured = field.key.match(/^(.+?)\[(\d+)\]\.(.+)$/);
+    if (!structured) {
+      const key = 'flat:0';
+      const record = records.get(key) ?? { sectionId: 'flat', itemIndex: 0, fields: {} };
+      record.fields[field.key] = value;
+      records.set(key, record);
+      continue;
+    }
+    const [, sectionId, rawIndex, fieldKey] = structured;
+    const itemIndex = Math.max(Number(rawIndex) - 1, 0);
+    const key = `${sectionId}:${itemIndex}`;
+    const record = records.get(key) ?? { sectionId, itemIndex, fields: {} };
+    record.fields[fieldKey] = value;
+    records.set(key, record);
+  }
+  return [...records.values()];
+}
+
+function parseLongQuestionDraft(content: string, request: LongQuestionRequest): LongQuestionDraft {
+  const objectMatch = content.match(/\{[\s\S]*\}/);
+  if (objectMatch) {
+    try {
+      const raw = JSON.parse(objectMatch[0]) as Partial<LongQuestionDraft>;
+      if (typeof raw.text === 'string' && raw.text.trim()) {
+        return {
+          text: raw.text.trim(),
+          sourceRefs: Array.isArray(raw.sourceRefs) ? raw.sourceRefs.flatMap((ref) => {
+            if (!ref || typeof ref !== 'object') return [];
+            const candidate = ref as Record<string, unknown>;
+            return typeof candidate.sectionId === 'string' && Number.isFinite(Number(candidate.itemIndex))
+              ? [{
+                sectionId: candidate.sectionId,
+                itemIndex: Number(candidate.itemIndex),
+                fieldKeys: Array.isArray(candidate.fieldKeys) ? candidate.fieldKeys.map(String) : [],
+              }]
+              : [];
+          }) : [],
+          missingFacts: Array.isArray(raw.missingFacts) ? raw.missingFacts.map(String).filter(Boolean) : [],
+          needsReview: true,
+        };
+      }
+    } catch {
+      // Fall through to a conservative raw-text draft.
+    }
+  }
+  return {
+    text: content.trim(),
+    sourceRefs: request.relevantRecords.map((record) => ({
+      sectionId: record.sectionId,
+      itemIndex: record.itemIndex,
+      fieldKeys: Object.keys(record.fields),
+    })),
+    missingFacts: ['模型未按 JSON 格式返回，需人工核对草稿内容'],
+    needsReview: true,
+  };
+}
+
+async function requestLongQuestionMatch(
+  field: FormFieldInfo,
+  apiConfig: ApiConfig,
+  textFields: { key: string; value: string }[],
+): Promise<MatchResult | undefined> {
+  const context = textFields.map(({ key, value }) => `${key}：${value}`).join('\n\n');
+  const maxInputChars = 9000;
+  const chunks = chunkLongQuestionContext(context, maxInputChars);
+  if (!chunks.length) return undefined;
+  const request: LongQuestionRequest = {
+    question: [field.label, field.placeholder, field.ariaLabel, field.hint, field.context]
+      .filter(Boolean)
+      .join('；')
+      .slice(0, 800),
+    targetField: field.columnLabel || field.label || field.placeholder || '长文本字段',
+    pageContext: [field.groupLabel, field.context, field.html].filter(Boolean).join('；').slice(0, 1600),
+    relevantRecords: buildLongQuestionRecords(textFields),
+    mode: apiConfig.fastMode ? 'fast' : 'standard',
+    maxInputChars,
+    maxOutputChars: 4000,
+  };
+  const drafts: LongQuestionDraft[] = [];
+  const selectedChunks = apiConfig.fastMode ? chunks.slice(0, 1) : chunks.slice(0, 6);
+  for (const chunk of selectedChunks) {
+    const content = await requestModelText(apiConfig, buildLongQuestionPrompt(request, chunk));
+    drafts.push(parseLongQuestionDraft(content, request));
+  }
+  const merged = mergeLongQuestionDrafts(drafts, request.maxOutputChars);
+  if (!merged.text) return undefined;
+  return {
+    kind: 'text',
+    index: field.index,
+    fieldKey: 'generated_long_text',
+    value: merged.text,
+    shortLabel: fallbackShortLabel(field, 'generated_long_text', field.index),
+    confidence: 'high',
+    fillMode: 'long',
+    source: 'ai',
+  };
+}
+
 export async function matchFields(
   fields: FormFieldInfo[],
   apiConfig: ApiConfig,
@@ -410,6 +520,21 @@ export async function matchFields(
   const textLikeFields = fields.filter((field) => field.kind !== 'file');
   if (textLikeFields.length === 0) return [];
   if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
+
+  const longFields = textLikeFields.filter((field) => field.fillMode === 'long');
+  if (longFields.length > 0) {
+    const shortMatches = await matchFields(
+      textLikeFields.filter((field) => field.fillMode !== 'long'),
+      apiConfig,
+      textFields,
+    );
+    const longMatches: MatchResult[] = [];
+    for (const field of longFields) {
+      const match = await requestLongQuestionMatch(field, apiConfig, textFields);
+      if (match) longMatches.push(match);
+    }
+    return [...shortMatches, ...longMatches];
+  }
 
   const prompt = buildPrompt(textLikeFields, textFields);
   const url = getRequestUrl(apiConfig);

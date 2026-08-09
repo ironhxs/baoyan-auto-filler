@@ -193,6 +193,40 @@ assert.equal(isSemanticallyCompatibleMatch({ label: '固定电话', fillMode: 's
 assert.equal(isSemanticallyCompatibleMatch({ label: '固定电话', fillMode: 'short' }, '手机号'), false);
 assert.equal(isSemanticallyCompatibleMatch({ label: '通讯地址', fillMode: 'short' }, '手机号'), false);
 assert.equal(isSemanticallyCompatibleMatch({ label: '考生电子邮箱', fillMode: 'short' }, '邮箱'), true);
+
+const longBodies = [];
+globalThis.fetch = async (_url, init) => {
+  longBodies.push(JSON.parse(init.body));
+  return new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({
+      text: '我参与了 PRISM-Net 项目，排名第一。',
+      sourceRefs: [{ sectionId: '科研训练', itemIndex: 0, fieldKeys: ['项目名称', '排名'] }],
+      missingFacts: [],
+      needsReview: true,
+    }) } }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+};
+const longMatches = await matchFields([{
+  index: 30,
+  kind: 'text',
+  tag: 'textarea',
+  type: 'textarea',
+  name: '',
+  id: '',
+  label: '请简述科研训练经历及个人贡献',
+  placeholder: '',
+  ariaLabel: '',
+  context: '项目经历表单，500字以内',
+  groupLabel: '项目经历',
+  fillMode: 'long',
+}], { ...chatConfig, fastMode: true }, [
+  { key: '科研训练[1].项目名称', value: 'PRISM-Net' },
+  { key: '科研训练[1].排名', value: '第一' },
+]);
+assert.equal(longMatches[0]?.fieldKey, 'generated_long_text');
+assert.equal(longMatches[0]?.value, '我参与了 PRISM-Net 项目，排名第一。');
+assert.equal(longBodies.length, 1);
+assert.match(longBodies[0].messages[0].content, /fast\/快速模式/);
 globalThis.fetch = originalFetch;
 
 console.log('LLM API protocol tests passed');

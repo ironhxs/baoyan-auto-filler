@@ -164,6 +164,13 @@ assert.equal(
   'ai',
   'AI enhancement must remain available for non-repeatable ambiguous fields',
 );
+const filledField = field(32, { label: '姓名', value: '用户手动修改值' });
+const filledAiOnly = { ...flatLocal, index: 32, fieldKey: '姓名', value: 'AI旧值', confidence: 'high' as const, source: 'ai' as const };
+assert.equal(
+  mergeLocalAndAiMatches([], [filledAiOnly], [filledField], true).length,
+  0,
+  'AI must not overwrite a manually filled field when no local expected value exists',
+);
 assert.match(reversed.find((match) => match.index === 1)?.fieldKey ?? '', /外语水平\[2\]/);
 assert.equal(byIndex.get(0)?.value, '测试学生');
 assert.equal(byIndex.get(1)?.value, '测试父亲');

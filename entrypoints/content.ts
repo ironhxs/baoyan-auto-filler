@@ -406,9 +406,19 @@ function detectProfileGroup(text: string): string {
   const normalized = normalizeText(text);
   const aliases: Array<[string, RegExp]> = [
     ['家庭成员', /家庭|社会关系|父亲|母亲|家长/],
+    ['科研训练', /科研训练|科研项目|研究项目/],
+    ['实习实践', /实习实践|实习经历|实践经历/],
+    ['社会工作', /社会工作|学生工作|社会职务/],
+    ['已发表论文', /已发表论文|论文情况|论文成果|发表论文/],
+    ['已取得专利', /已取得专利|专利情况|专利成果/],
+    ['学科竞赛', /学科竞赛|专业竞赛|竞赛成果|竞赛经历|比赛经历/],
+    ['本科期间校级以上（含）荣誉奖励', /本科期间.*荣誉奖励|校级以上.*荣誉|荣誉奖励/],
+    ['项目经历', /项目经历|项目经验|科研实践/],
+    ['论文情况', /论文情况|论文成果/],
+    ['获奖情况', /获奖情况|奖励情况|奖惩情况|获奖经历/],
     ['学习和工作经历', /学习.{0,3}工作经历|教育经历|工作经历|学习经历/],
-    ['学术成果', /学术成果|科研成果|论文|专利|著作|竞赛成果/],
-    ['奖励情况', /奖励|获奖|荣誉|奖惩|学科竞赛|专业竞赛|竞赛经历|比赛经历/],
+    ['学术成果', /学术成果|科研成果|论文|专利|著作/],
+    ['奖励情况', /奖励|获奖|荣誉|奖惩/],
     ['外语水平', /外语|英语|四六级|雅思|托福/],
     ['学习信息', /学习信息|学籍|教育信息|本科信息|成绩信息/],
     ['基本信息', /基本信息|个人信息/],
@@ -447,10 +457,16 @@ function inferProfileGroupFromTable(table: HTMLTableElement): string {
   }
   if (/(外语|考试|等级)/.test(headerText) && /成绩/.test(headerText)) return '外语水平';
   if (/(获奖|奖励|奖项|竞赛)/.test(headerText) && /(名称|等级|级别|时间|日期)/.test(headerText)) {
-    return '奖励情况';
+    return '获奖情况';
   }
-  if (/(论文|专利|成果|项目)/.test(headerText) && /(名称|类型|时间|排序)/.test(headerText)) {
-    return '学术成果';
+  if (/论文/.test(headerText) && /(名称|标题|类型|时间|排序|发表)/.test(headerText)) {
+    return '论文情况';
+  }
+  if (/专利/.test(headerText) && /(名称|标题|类型|时间|授权|受理)/.test(headerText)) {
+    return '已取得专利';
+  }
+  if (/(项目|实践|工作)/.test(headerText) && /(描述|时间|期间|角色|单位|名称)/.test(headerText)) {
+    return '项目经历';
   }
   if (/(开始|起始)/.test(headerText) && /(结束|终止)/.test(headerText) && /(学校|单位|职务|专业)/.test(headerText)) {
     return '学习和工作经历';
@@ -501,7 +517,11 @@ function getRepeatFieldMeta(el: HTMLElement): RepeatFieldMeta {
   const groupLabel = table
     ? inferProfileGroupFromTable(table) || detectProfileGroup(nearestHeading)
     : detectProfileGroup(nearestHeading || groupText);
-  const repeatProfileGroups = new Set(['家庭成员', '外语水平', '学习和工作经历', '学术成果', '奖励情况']);
+  const repeatProfileGroups = new Set([
+    '家庭成员', '外语水平', '学习和工作经历', '学术成果', '奖励情况',
+    '科研训练', '实习实践', '社会工作', '已发表论文', '已取得专利',
+    '学科竞赛', '本科期间校级以上（含）荣誉奖励', '项目经历', '论文情况', '获奖情况',
+  ]);
 
   if (!row || !table || !repeatProfileGroups.has(groupLabel)) {
     return {
