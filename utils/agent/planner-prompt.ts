@@ -18,55 +18,29 @@ const plannedValueSchema = {
   properties: plannedValueProperties,
 };
 
-const actionSchemas = [
-  {
-    type: 'object', additionalProperties: false,
-    required: ['actionId', 'type', 'groupId', 'count', 'confidence', 'reason'],
-    properties: {
-      actionId: { type: 'string', minLength: 1 },
-      type: { const: 'add_rows' },
-      groupId: { type: 'string', minLength: 1 },
-      count: { type: 'integer', minimum: 1, maximum: 24 },
-      confidence: { type: 'number', minimum: 0, maximum: 1 },
-      reason: { type: 'string', minLength: 1 },
-    },
-  },
-  ...(['fill_field', 'select'] as const).map((type) => ({
-    type: 'object', additionalProperties: false,
-    required: ['actionId', 'type', 'sourceRecordId', ...Object.keys(plannedValueProperties)],
-    properties: {
-      actionId: { type: 'string', minLength: 1 },
-      type: { const: type },
-      sourceRecordId: { type: 'string', minLength: 1 },
-      ...plannedValueProperties,
-    },
-  })),
-  {
-    type: 'object', additionalProperties: false,
-    required: ['actionId', 'type', 'groupId', 'rowIndex', 'sourceRecordId', 'values'],
-    properties: {
-      actionId: { type: 'string', minLength: 1 },
-      type: { const: 'fill_row' },
-      groupId: { type: 'string', minLength: 1 },
-      rowIndex: { type: 'integer', minimum: 0 },
-      sourceRecordId: { type: 'string', minLength: 1 },
-      values: { type: 'array', minItems: 1, items: plannedValueSchema },
-    },
-  },
-  {
-    type: 'object', additionalProperties: false,
-    required: ['actionId', 'type', 'targetId', 'fileRecordId', 'confidence', 'needsReview', 'reason'],
-    properties: {
-      actionId: { type: 'string', minLength: 1 },
-      type: { const: 'upload' },
-      targetId: { type: 'string', minLength: 1 },
-      fileRecordId: { type: 'string', minLength: 1 },
-      confidence: { type: 'number', minimum: 0, maximum: 1 },
-      needsReview: { const: true },
-      reason: { type: 'string', minLength: 1 },
-    },
-  },
-];
+const unifiedActionProperties = {
+  actionId: { type: 'string', minLength: 1 },
+  type: { enum: ['add_rows', 'fill_field', 'fill_row', 'select', 'upload'] },
+  groupId: { type: 'string' },
+  count: { type: 'integer', minimum: 0, maximum: 24 },
+  sourceRecordId: { type: 'string' },
+  targetId: { type: 'string' },
+  fileRecordId: { type: 'string' },
+  rowIndex: { type: 'integer', minimum: -1 },
+  value: { type: 'string' },
+  evidenceFields: { type: 'array', items: { type: 'string', minLength: 1 } },
+  confidence: { type: 'number', minimum: 0, maximum: 1 },
+  needsReview: { type: 'boolean' },
+  reason: { type: 'string', minLength: 1 },
+  values: { type: 'array', items: plannedValueSchema },
+} as const;
+
+const unifiedActionSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: Object.keys(unifiedActionProperties),
+  properties: unifiedActionProperties,
+};
 
 export const BAOTIAN_PAGE_PLAN_SCHEMA: ModelJsonSchema = {
   name: 'baotian_page_plan',
@@ -82,7 +56,7 @@ export const BAOTIAN_PAGE_PLAN_SCHEMA: ModelJsonSchema = {
       pageKey: { type: 'string', minLength: 1 },
       snapshotFingerprint: { type: 'string', minLength: 1 },
       profileFingerprint: { type: 'string', minLength: 1 },
-      actions: { type: 'array', items: { anyOf: actionSchemas } },
+      actions: { type: 'array', items: unifiedActionSchema },
       reviewItems: {
         type: 'array',
         items: {
@@ -109,6 +83,10 @@ export interface AgentPlannerPromptInput {
   fileRecordIds?: string[];
 }
 
+export interface AgentPlannerPromptOptions {
+  includeSchema?: boolean;
+}
+
 function safeField(field: AgentPageSnapshot['groups'][number]['fields'][number]): Record<string, unknown> {
   const sensitive = /密码|口令|验证码|支付密码|短信码/i.test(field.label);
   return {
@@ -128,21 +106,27 @@ function safeField(field: AgentPageSnapshot['groups'][number]['fields'][number])
   };
 }
 
-export function buildAgentPlannerPrompt(input: AgentPlannerPromptInput): string {
+export function buildAgentPlannerPrompt(
+  input: AgentPlannerPromptInput,
+  options: AgentPlannerPromptOptions = {},
+): string {
   const page = {
     pageKey: input.snapshot.pageKey,
     url: input.snapshot.url,
     title: input.snapshot.title,
     stepText: input.snapshot.stepText,
     instructions: input.snapshot.instructions,
-    groups: input.snapshot.groups.map((group) => ({
-      groupId: group.groupId,
-      label: group.label,
-      kind: group.kind,
-      columns: group.columns,
-      fields: group.fields.map(safeField),
-      rows: group.rows.map((row) => ({ rowIndex: row.rowIndex, fields: row.fields.map(safeField) })),
-    })),
+    groups: input.snapshot.groups.map((group) => {
+      const rowTargetIds = new Set(group.rows.flatMap((row) => row.fields.map((field) => field.targetId)));
+      return {
+        groupId: group.groupId,
+        label: group.label,
+        kind: group.kind,
+        columns: group.columns,
+        fields: group.fields.filter((field) => !rowTargetIds.has(field.targetId)).map(safeField),
+        rows: group.rows.map((row) => ({ rowIndex: row.rowIndex, fields: row.fields.map(safeField) })),
+      };
+    }),
   };
   const records = input.sourceRecords.map((record) => ({
     recordId: record.recordId,
@@ -151,9 +135,10 @@ export function buildAgentPlannerPrompt(input: AgentPlannerPromptInput): string 
     fields: record.fields,
   }));
 
-  return [
+  const sections = [
     '你是“保填 Agent”的页面规划器。请根据网页实际字段、填写规则与候选资料生成严格 JSON 计划。',
     '只规划，不执行网页操作。只允许 add_rows、fill_field、fill_row、select、upload；绝不提交、确认报名、勾选承诺书、选择导师/志愿、处理验证码、支付或删除。',
+    'actions 使用统一字段结构，所有字段都必须返回。未被当前动作使用的字符串填空字符串，count 填 0，rowIndex 填 -1，evidenceFields/values 填空数组；fill_row 的 values 必须包含该行要写入的全部子字段。',
     '每个值必须绑定一个真实 sourceRecordId，并在 evidenceFields 中列出该记录中真实存在且支撑该值的字段。不得凭空补造事实。',
     '重复表格必须按“同一网页行对应同一资料记录”规划。若一行包含时间、地点、内容，必须完整理解整行并使用 fill_row；不可只填时间留下半行。',
     '可以按网页要求组合、拆分、改写格式和去除禁用字符，但不得改变事实；不确定时 needsReview=true。',
@@ -162,7 +147,9 @@ export function buildAgentPlannerPrompt(input: AgentPlannerPromptInput): string 
     `页面语义快照：\n${JSON.stringify(page)}`,
     `候选资料记录：\n${JSON.stringify(records)}`,
     `可用材料记录 ID：\n${JSON.stringify(input.fileRecordIds ?? [])}`,
-    `输出 JSON Schema：\n${JSON.stringify(BAOTIAN_PAGE_PLAN_SCHEMA.schema)}`,
-  ].join('\n\n');
+  ];
+  if (options.includeSchema) {
+    sections.push(`输出 JSON Schema：\n${JSON.stringify(BAOTIAN_PAGE_PLAN_SCHEMA.schema)}`);
+  }
+  return sections.join('\n\n');
 }
-

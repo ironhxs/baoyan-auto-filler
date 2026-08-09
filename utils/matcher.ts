@@ -459,6 +459,71 @@ async function extractModelResponse(response: Response, apiMode: ApiMode): Promi
   return content;
 }
 
+async function extractStreamingModelResponse(
+  response: Response,
+  apiMode: ApiMode,
+  timeoutMs = MODEL_REQUEST_TIMEOUT_MS,
+): Promise<string> {
+  if (!response.ok) await throwApiError(response);
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!contentType.includes('text/event-stream')) return extractModelResponse(response, apiMode);
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('Stream reader not available');
+  const decoder = new TextDecoder();
+  let partialLine = '';
+  let output = '';
+  let done = false;
+  let timedOut = false;
+  const effectiveTimeout = Math.max(1, timeoutMs);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void reader.cancel('model stream timed out');
+  }, effectiveTimeout);
+
+  const consumeLine = (line: string): void => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const payload = trimmed.slice(5).trimStart();
+    if (payload === '[DONE]') {
+      done = true;
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    const streamError = extractStreamError(parsed);
+    if (streamError) throw new Error(`LLM stream error: ${streamError}`);
+    output += extractStreamText(parsed, apiMode);
+  };
+
+  try {
+    while (!done) {
+      const result = await reader.read();
+      if (result.done) break;
+      const text = partialLine + decoder.decode(result.value, { stream: true });
+      const lines = text.split('\n');
+      partialLine = lines.pop() ?? '';
+      for (const line of lines) {
+        consumeLine(line);
+        if (done) break;
+      }
+    }
+    if (!done && partialLine.trim()) consumeLine(partialLine);
+  } finally {
+    clearTimeout(timer);
+    reader.releaseLock();
+  }
+  if (timedOut) {
+    throw new Error(`LLM API 请求超过 ${Math.ceil(effectiveTimeout / 1000)} 秒，已安全暂停`);
+  }
+  if (!output) throw new Error('模型返回了空内容');
+  return output;
+}
+
 export async function requestAuditModel(
   apiConfig: ApiConfig,
   prompt: string,
@@ -508,10 +573,10 @@ export async function requestModelText(
 ): Promise<string> {
   if (!apiConfig.model.trim()) throw new Error('请先在设置中填写模型名称');
   const apiMode = getApiMode(apiConfig);
-  return extractModelResponse(
-    await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, options), options.timeoutMs),
-    apiMode,
-  );
+  const response = await postModelRequest(apiConfig, getRequestBody(apiConfig, prompt, options), options.timeoutMs);
+  return options.stream
+    ? extractStreamingModelResponse(response, apiMode, options.timeoutMs)
+    : extractModelResponse(response, apiMode);
 }
 
 function buildLongQuestionRecords(textFields: { key: string; value: string }[]): LongQuestionRequest['relevantRecords'] {

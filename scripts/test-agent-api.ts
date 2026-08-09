@@ -98,14 +98,12 @@ const originalFetch = globalThis.fetch;
 try {
   const requests: Array<Record<string, unknown>> = [];
   globalThis.fetch = async (_input, init) => {
-    requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-    if (requests.length === 1) {
-      return new Response(JSON.stringify({ error: { message: 'unsupported parameter: text.format json_schema' } }), {
-        status: 400,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    return new Response(JSON.stringify({ output_text: JSON.stringify(planObject) }), {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push(body);
+    const wirePageKey = String(body.input ?? '').match(/"pageKey":"(page_fp_[^"]+)"/)?.[1] ?? '';
+    return new Response(JSON.stringify({
+      output_text: JSON.stringify({ ...planObject, pageKey: wirePageKey }),
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -113,9 +111,41 @@ try {
 
   const plan = await requestAgentPagePlan({ snapshot, sourceRecords: records }, responsesConfig);
   assert.equal(plan.actions.length, 1);
-  assert.equal(requests.length, 2, 'unsupported structured output must fall back exactly once');
-  assert.equal('text' in requests[0], true);
-  assert.equal('text' in requests[1], false, 'fallback must request plain JSON without structured-output parameters');
+  assert.equal(requests.length, 1, 'Agent planning must use one relay request');
+  assert.equal('text' in requests[0], false, 'Agent planning must avoid relay-side structured output');
+  assert.equal(requests[0].stream, true, 'Agent planning must stream so MV3 receives response headers promptly');
+  assert.match(
+    String(requests[0].input ?? ''),
+    /输出 JSON Schema/,
+    'plain JSON planning must include the strict schema for local validation',
+  );
+
+  const longPageKeySnapshot: AgentPageSnapshot = {
+    ...snapshot,
+    pageKey: `https://example.test/form::${'INPUT::|'.repeat(80)}`,
+  };
+  let longKeyPrompt = '';
+  globalThis.fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as { input?: string };
+    longKeyPrompt = body.input ?? '';
+    const wirePageKey = longKeyPrompt.match(/"pageKey":"(page_fp_[^"]+)"/)?.[1] ?? 'missing-page-alias';
+    return new Response(JSON.stringify({
+      output_text: JSON.stringify({
+        version: 1,
+        pageKey: wirePageKey,
+        snapshotFingerprint: agentFingerprint(longPageKeySnapshot),
+        profileFingerprint: agentFingerprint(records),
+        actions: [],
+        reviewItems: [],
+      }),
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const longKeyPlan = await requestAgentPagePlan({
+    snapshot: longPageKeySnapshot,
+    sourceRecords: records,
+  }, responsesConfig);
+  assert.equal(longKeyPlan.pageKey, longPageKeySnapshot.pageKey, 'the full local page key must be restored after validation');
+  assert.equal(longKeyPrompt.includes(longPageKeySnapshot.pageKey), false, 'the relay prompt must use a compact page alias');
 
   for (const status of [401, 403, 429, 502]) {
     let attempts = 0;
@@ -143,6 +173,83 @@ try {
     /network down/,
   );
   assert.equal(networkAttempts, 1, 'network errors must not trigger a second mode');
+
+  const largeRows = Array.from({ length: 18 }, (_, rowIndex) => ({
+    rowIndex,
+    fields: ['时间', '地点', '内容'].map((label, columnIndex) => ({
+      targetId: `large:${rowIndex}:${columnIndex}`,
+      index: rowIndex * 3 + columnIndex,
+      rowIndex,
+      columnId: `column-${columnIndex}`,
+      label,
+      currentValue: '',
+      required: true,
+      protected: false,
+      kind: 'text' as const,
+      options: [],
+      placeholder: '',
+      formatHints: [],
+      forbiddenCharacters: [],
+    })),
+  }));
+  const largeSnapshot: AgentPageSnapshot = {
+    ...snapshot,
+    pageKey: 'large-award-page',
+    title: '奖励情况',
+    groups: [{
+      groupId: 'large-awards',
+      label: '奖励情况',
+      kind: 'repeatable',
+      columns: [
+        { columnId: 'column-0', label: '时间' },
+        { columnId: 'column-1', label: '地点' },
+        { columnId: 'column-2', label: '内容' },
+      ],
+      rows: largeRows,
+      fields: largeRows.flatMap((row) => row.fields),
+    }],
+  };
+  const largeRecords: AgentSourceRecord[] = Array.from({ length: 18 }, (_, index) => ({
+    recordId: `honors_awards:${index}`,
+    categoryId: 'honors_awards',
+    categoryLabel: '荣誉奖励',
+    itemIndex: index,
+    fields: { 获奖名称: `奖励 ${index + 1}` },
+    searchText: `奖励 ${index + 1}`,
+  }));
+  let chunkRequests = 0;
+  globalThis.fetch = async (_input, init) => {
+    chunkRequests += 1;
+    const body = JSON.parse(String(init?.body)) as { input?: string };
+    const prompt = body.input ?? '';
+    const pageKey = prompt.match(/"pageKey":"(page_fp_[^"]+)"/)?.[1] ?? '';
+    const snapshotFingerprint = prompt.match(/snapshotFingerprint=(fp_[a-z0-9]+)/)?.[1] ?? '';
+    const profileFingerprint = prompt.match(/profileFingerprint=(fp_[a-z0-9]+)/)?.[1] ?? '';
+    return new Response(JSON.stringify({
+      output_text: JSON.stringify({
+        version: 1,
+        pageKey,
+        snapshotFingerprint,
+        profileFingerprint,
+        actions: [],
+        reviewItems: [],
+      }),
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  const chunkProgress: Array<[number, number]> = [];
+  const largePlan = await requestAgentPagePlan({
+    snapshot: largeSnapshot,
+    sourceRecords: largeRecords,
+  }, responsesConfig, {
+    onChunkProgress: (completed, total) => { chunkProgress.push([completed, total]); },
+  });
+  assert.equal(chunkRequests, 9, 'large repeatable pages must stay within relay-safe two-row chunks');
+  assert.deepEqual(chunkProgress, Array.from({ length: 9 }, (_, index) => [index + 1, 9]));
+  assert.equal(largePlan.snapshotFingerprint, agentFingerprint(largeSnapshot));
+  assert.equal(largePlan.profileFingerprint, agentFingerprint(largeRecords));
 
   let receivedSignal = false;
   globalThis.fetch = async (_input, init) => {

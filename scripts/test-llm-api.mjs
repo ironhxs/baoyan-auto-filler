@@ -7,6 +7,7 @@ import {
   getRequestBody,
   getRequestUrl,
   requestAuditModel,
+  requestModelText,
   isSemanticallyCompatibleMatch,
   matchFields,
 } from '../utils/matcher.ts';
@@ -104,6 +105,22 @@ assert.equal(extractStreamError({
 }), 'upstream failed');
 
 const originalFetch = globalThis.fetch;
+let streamedRequestBody;
+globalThis.fetch = async (_url, init) => {
+  streamedRequestBody = JSON.parse(init.body);
+  return new Response([
+    'data: {"type":"response.output_text.delta","delta":"{\\"ok\\":"}\n\n',
+    'data: {"type":"response.output_text.delta","delta":"true}"}\n\n',
+    'data: [DONE]\n\n',
+  ].join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+};
+const streamedText = await requestModelText(responsesConfig, 'agent plan', { stream: true });
+assert.equal(streamedText, '{"ok":true}');
+assert.equal(streamedRequestBody.stream, true, 'streaming planner requests must ask the relay for SSE');
+
 const auditBodies = [];
 let auditAttempt = 0;
 globalThis.fetch = async (_url, init) => {

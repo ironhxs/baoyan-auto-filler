@@ -2,9 +2,11 @@ import { requestModelText } from '../matcher';
 import type { ApiConfig } from '../storage';
 import { parseAgentPagePlan } from './planner-response';
 import {
-  BAOTIAN_PAGE_PLAN_SCHEMA,
-  buildAgentPlannerPrompt,
-} from './planner-prompt';
+  createAgentPlanningChunks,
+  mergeAgentChunkPlans,
+  type AgentPlanningInput,
+} from './planner-chunks';
+import { buildAgentPlannerPrompt } from './planner-prompt';
 import type { AgentSourceRecord } from './profile-retriever';
 import type { AgentPagePlan, AgentPageSnapshot } from './types';
 
@@ -12,6 +14,11 @@ export interface RequestAgentPagePlanInput {
   snapshot: AgentPageSnapshot;
   sourceRecords: AgentSourceRecord[];
   fileRecordIds?: string[];
+}
+
+export interface RequestAgentPagePlanOptions {
+  requestText?: typeof requestModelText;
+  onChunkProgress?(completed: number, total: number): void | Promise<void>;
 }
 
 function canonicalJson(value: unknown): string {
@@ -38,13 +45,6 @@ export function agentFingerprint(value: unknown): string {
   return `fp_${(left >>> 0).toString(36)}${(right >>> 0).toString(36)}`;
 }
 
-export function isUnsupportedStructuredOutputError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  const status = Number(message.match(/LLM API error\s+(\d+)/i)?.[1] ?? 0);
-  if (![400, 404, 415, 422].includes(status)) return false;
-  return /response_format|text\.format|json_schema|structured output|unsupported parameter|unknown parameter|not supported/i.test(message);
-}
-
 function validateFingerprints(
   plan: AgentPagePlan,
   snapshotFingerprint: string,
@@ -59,35 +59,68 @@ function validateFingerprints(
   return plan;
 }
 
-export async function requestAgentPagePlan(
-  input: RequestAgentPagePlanInput,
+async function requestSingleAgentPagePlan(
+  input: AgentPlanningInput,
   apiConfig: ApiConfig,
+  requestText: typeof requestModelText,
 ): Promise<AgentPagePlan> {
   const snapshotFingerprint = agentFingerprint(input.snapshot);
   const profileFingerprint = agentFingerprint(input.sourceRecords);
+  const wireSnapshot: AgentPageSnapshot = {
+    ...input.snapshot,
+    pageKey: `page_${snapshotFingerprint}`,
+  };
   const prompt = buildAgentPlannerPrompt({
     ...input,
+    snapshot: wireSnapshot,
     snapshotFingerprint,
     profileFingerprint,
-  });
-  let text: string;
-  try {
-    text = await requestModelText(apiConfig, prompt, {
-      stream: false,
-      jsonSchema: BAOTIAN_PAGE_PLAN_SCHEMA,
-    });
-  } catch (error) {
-    if (!isUnsupportedStructuredOutputError(error)) throw error;
-    text = await requestModelText(
-      apiConfig,
-      `${prompt}\n\n当前中转不支持结构化输出参数。请仍严格按照上述 Schema 只返回一个 JSON 对象，不要使用 Markdown。`,
-      { stream: false },
-    );
-  }
-  return validateFingerprints(parseAgentPagePlan(text, {
-    snapshot: input.snapshot,
+  }, { includeSchema: true });
+  const text = await requestText(apiConfig, prompt, { stream: true });
+  const parsed = validateFingerprints(parseAgentPagePlan(text, {
+    snapshot: wireSnapshot,
     sourceRecords: input.sourceRecords,
     fileRecordIds: input.fileRecordIds,
   }), snapshotFingerprint, profileFingerprint);
+  return { ...parsed, pageKey: input.snapshot.pageKey };
 }
 
+export async function requestAgentPagePlan(
+  input: RequestAgentPagePlanInput,
+  apiConfig: ApiConfig,
+  options: RequestAgentPagePlanOptions = {},
+): Promise<AgentPagePlan> {
+  const snapshotFingerprint = agentFingerprint(input.snapshot);
+  const profileFingerprint = agentFingerprint(input.sourceRecords);
+  const chunks = createAgentPlanningChunks(input);
+  if (chunks.length === 0) {
+    return {
+      version: 1,
+      pageKey: input.snapshot.pageKey,
+      snapshotFingerprint,
+      profileFingerprint,
+      actions: [],
+      reviewItems: [],
+    };
+  }
+  if (chunks.length === 1) {
+    const plan = await requestSingleAgentPagePlan(chunks[0], apiConfig, options.requestText ?? requestModelText);
+    await options.onChunkProgress?.(1, 1);
+    return validateFingerprints({
+      ...plan,
+      snapshotFingerprint,
+      profileFingerprint,
+    }, snapshotFingerprint, profileFingerprint);
+  }
+
+  const plans: AgentPagePlan[] = [];
+  for (const chunk of chunks) {
+    plans.push(await requestSingleAgentPagePlan(chunk, apiConfig, options.requestText ?? requestModelText));
+    await options.onChunkProgress?.(plans.length, chunks.length);
+  }
+  return validateFingerprints(
+    mergeAgentChunkPlans(chunks, plans, snapshotFingerprint, profileFingerprint),
+    snapshotFingerprint,
+    profileFingerprint,
+  );
+}

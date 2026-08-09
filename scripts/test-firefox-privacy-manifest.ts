@@ -22,5 +22,7 @@ assert.equal(
   undefined,
   'Chrome manifest should not contain Firefox-only data permissions',
 );
+assert.equal(chrome.permissions.includes('offscreen'), true, 'Chromium must include the durable Agent model bridge');
+assert.equal(firefox.permissions.includes('offscreen'), false, 'Firefox must not declare the Chromium-only offscreen permission');
 
 console.log('Firefox privacy manifest tests passed');

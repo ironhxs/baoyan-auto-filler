@@ -133,6 +133,11 @@ function resetForPage(checkpoint: AgentCheckpoint, pageKey: string): AgentCheckp
   };
 }
 
+function manualReviewReason(validated: AgentValidatedRunPlan): string {
+  const count = validated.reviewItems.length + validated.rejectedActionIds.length;
+  return `Agent plan contains ${count} item(s) requiring manual review`;
+}
+
 export async function runAgentPage(
   deps: AgentRuntimeDeps,
   existingCheckpoint?: AgentCheckpoint,
@@ -161,8 +166,8 @@ export async function runAgentPage(
     for (;;) {
       const pending = pendingValidatedPlan(validated, checkpoint.results);
       if (pending.executableActions.length === 0) {
-        if (validated.rejectedActionIds.length > 0) {
-          const reason = 'Agent plan contains actions that require manual review';
+        if (validated.rejectedActionIds.length > 0 || validated.reviewItems.length > 0) {
+          const reason = manualReviewReason(validated);
           checkpoint = await persist(deps, checkpoint, 'paused', { error: reason });
           return { status: 'paused', checkpoint, canAdvance: false, reason };
         }
@@ -188,6 +193,11 @@ export async function runAgentPage(
         updatedAt: Date.now(),
       });
       if (verification.complete) {
+        if (validated.reviewItems.length > 0) {
+          const reason = manualReviewReason(validated);
+          checkpoint = await persist(deps, checkpoint, 'paused', { error: reason });
+          return { status: 'paused', checkpoint, canAdvance: false, reason };
+        }
         checkpoint = await persist(deps, checkpoint, 'complete', { error: undefined });
         return { status: 'complete', checkpoint, canAdvance: verification.canAdvance };
       }
@@ -232,4 +242,3 @@ export async function runAgentPage(
     return { status: 'paused', checkpoint, canAdvance: false, reason };
   }
 }
-

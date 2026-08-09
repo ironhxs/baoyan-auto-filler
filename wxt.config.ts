@@ -20,7 +20,10 @@ export default defineConfig({
   },
   manifest: ({ browser }) => ({
     name: '保填',
-    permissions: ['storage', 'activeTab', 'scripting', 'alarms'],
+    permissions: [
+      'storage', 'activeTab', 'scripting', 'alarms',
+      ...(browser === 'firefox' ? [] : ['offscreen']),
+    ],
     host_permissions: ['<all_urls>'],
     ...(browser === 'firefox' ? {
       browser_specific_settings: {

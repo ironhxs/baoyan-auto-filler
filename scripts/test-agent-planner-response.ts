@@ -4,6 +4,7 @@ import {
   AgentPlanValidationError,
   parseAgentPagePlan,
 } from '../utils/agent/planner-response';
+import { BAOTIAN_PAGE_PLAN_SCHEMA } from '../utils/agent/planner-prompt';
 import type { AgentPageSnapshot } from '../utils/agent/types';
 import type { AgentSourceRecord } from '../utils/agent/profile-retriever';
 
@@ -89,6 +90,27 @@ assert.equal(plan.actions[0].values.length, 3);
 
 const fencedPlan = parseAgentPagePlan(`\n\`\`\`json\n${JSON.stringify(basePlan)}\n\`\`\`\n`, context);
 assert.equal(fencedPlan.actions.length, 1);
+
+const actionItems = (BAOTIAN_PAGE_PLAN_SCHEMA.schema as any).properties.actions.items;
+assert.equal('anyOf' in actionItems, false, 'relay wire schema must avoid expensive anyOf action branches');
+
+const unifiedWirePlan = structuredClone(basePlan) as any;
+unifiedWirePlan.actions[0] = {
+  ...unifiedWirePlan.actions[0],
+  targetId: '',
+  fileRecordId: '',
+  count: 0,
+  value: '',
+  evidenceFields: [],
+  confidence: 0.95,
+  needsReview: false,
+  reason: '整行字段由同一条奖励记录生成',
+};
+const unifiedParsed = parseAgentPagePlan(JSON.stringify(unifiedWirePlan), context);
+assert.equal(unifiedParsed.actions[0].type, 'fill_row');
+assert.deepEqual(Object.keys(unifiedParsed.actions[0]).sort(), [
+  'actionId', 'groupId', 'rowIndex', 'sourceRecordId', 'type', 'values',
+].sort(), 'unused wire placeholders must be removed before policy validation and execution');
 
 function expectInvalid(mutator: (value: Record<string, unknown>) => void, message: string): void {
   const value = structuredClone(basePlan) as unknown as Record<string, unknown>;

@@ -8,7 +8,7 @@ import {
 } from '@/utils/db';
 import { matchFields, requestModelText } from '@/utils/matcher';
 import type { Category, FileRecord } from '@/utils/db';
-import type { MatchResult, FormFieldInfo, MaterialRole } from '@/utils/matcher';
+import type { MatchResult, FormFieldInfo, MaterialRole, ModelRequestOptions } from '@/utils/matcher';
 import { flattenProfileValues } from '@/utils/profile-schema';
 import {
   adaptValueToField,
@@ -81,6 +81,8 @@ import { runAgentPage } from '@/utils/agent/runtime';
 import { applyAgentControl } from '@/utils/agent/control';
 import type { AgentControlCommand } from '@/utils/agent/control';
 import { shouldPreferPageAgent } from '@/utils/agent/activation';
+import { requestAgentModelThroughBridge } from '@/utils/agent/model-bridge';
+import { accountAgentRun } from '@/utils/agent/run-accounting';
 import type {
   AgentActionResult,
   AgentCheckpoint,
@@ -281,6 +283,50 @@ const pageRestoreGenerations = new Map<number, number>();
 const pageRestoreTails = new Map<number, Promise<void>>();
 const AI_MATCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const AI_MATCH_CACHE_LIMIT = 40;
+
+const AGENT_OFFSCREEN_PATH = 'offscreen.html';
+let creatingAgentOffscreen: Promise<void> | null = null;
+
+function supportsAgentOffscreen(): boolean {
+  return typeof (chrome as any).offscreen?.createDocument === 'function';
+}
+
+async function ensureAgentOffscreen(): Promise<void> {
+  if (!supportsAgentOffscreen()) return;
+  const documentUrl = chrome.runtime.getURL(AGENT_OFFSCREEN_PATH);
+  const runtime = chrome.runtime as any;
+  if (typeof runtime.getContexts === 'function') {
+    const contexts = await runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [documentUrl],
+    });
+    if (contexts.length > 0) return;
+  }
+  if (creatingAgentOffscreen) return creatingAgentOffscreen;
+  creatingAgentOffscreen = (chrome as any).offscreen.createDocument({
+    url: AGENT_OFFSCREEN_PATH,
+    reasons: ['WORKERS'],
+    justification: 'Run user-initiated Agent model requests without MV3 service-worker interruption',
+  });
+  try {
+    await creatingAgentOffscreen;
+  } finally {
+    creatingAgentOffscreen = null;
+  }
+}
+
+async function requestAgentModelDurably(
+  apiConfig: Awaited<ReturnType<typeof getApiConfig>>,
+  prompt: string,
+  options: ModelRequestOptions = {},
+): Promise<string> {
+  return requestAgentModelThroughBridge(apiConfig, prompt, options, {
+    supportsOffscreen: supportsAgentOffscreen(),
+    ensureOffscreen: ensureAgentOffscreen,
+    sendToOffscreen: (message) => chrome.runtime.sendMessage(message),
+    directRequest: requestModelText,
+  });
+}
 const aiMatchCache = new Map<string, { expiresAt: number; matches: MatchResult[] }>();
 
 function shortStableHash(input: string): string {
@@ -1171,7 +1217,12 @@ export default defineBackground(() => {
     seedDevData();
   }
 
-  chrome.runtime.onMessage.addListener((request: Request, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((request: Request & { target?: string }, _sender, sendResponse) => {
+    if (request.target === 'baotian-offscreen') return false;
+    if (request.target === 'baotian-background' && (request as any).type === 'agentModelHeartbeat') {
+      sendResponse({ ok: true });
+      return false;
+    }
     handleMessage(request)
       .then(sendResponse)
       .catch((err) => sendResponse(errorResponse(err.message)));
@@ -2023,7 +2074,13 @@ async function runAgentForScan(
         cached = true;
         return existing.plan;
       }
-      const plan = await requestAgentPagePlan({ snapshot, sourceRecords }, apiConfig);
+      const plan = await requestAgentPagePlan({ snapshot, sourceRecords }, apiConfig, {
+        requestText: requestAgentModelDurably,
+        onChunkProgress: async (completed, total) => {
+          state.message = `保填 Agent 已完成 ${completed}/${total} 批页面规划`;
+          await saveAutoRunState(state);
+        },
+      });
       await saveAgentPlanCache(key, snapshot.pageKey, plan);
       return plan;
     },
@@ -2328,13 +2385,43 @@ async function processAutoRun(tabId: number): Promise<void> {
       historyEntry.aiCached = agentRun.cached;
       historyEntry.aiReviewed += agentRun.reviewed;
       if (agentRun.status === 'paused') {
+        const accounting = accountAgentRun(state.filledCount, agentRun.success);
+        state.filledCount = accounting.totalFilled;
+        historyEntry.filled = accounting.pageFilled;
+        const afterResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(
+          tabId,
+          { type: 'scan' },
+        ).catch(() => []);
+        const afterFields = (afterResults ?? []).map((item) => ({ ...item.field, index: item.index }));
+        const afterScan = { ...scan, fields: afterFields };
+        const afterMarkers = buildPageMarkers(afterScan);
+        historyEntry.verified = afterMarkers.filter((marker) => marker.status === 'verified').length;
+        historyEntry.conflicts = afterMarkers.filter((marker) => marker.status === 'mismatch').length;
         state.status = 'paused';
         state.pauseReason = /LLM API error|API|502|401|403|429/i.test(agentRun.reason ?? '') ? 'error' : 'required';
         state.message = agentRun.reason || '保填 Agent 需要人工确认后继续';
         historyEntry.status = 'paused';
         historyEntry.message = state.message;
         historyEntry.updatedAt = Date.now();
-        await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
+        await Promise.all([
+          saveAutoRunState(state),
+          rememberPageMarkers(tabId, {
+            url: scan.pageUrl,
+            label: scan.pageLabel,
+            signature: scan.pageSignature,
+          }, afterMarkers),
+          sendToContentScript(tabId, { type: 'markPreview', items: afterMarkers }).catch(() => undefined),
+          persistScanSnapshot(state, afterScan),
+          state.taskId
+            ? savePageAnalysis(
+                state.taskId,
+                afterScan,
+                afterMarkers,
+                defaultCheckedIndexes(afterScan),
+                scan.repeatPlan,
+              )
+            : Promise.resolve(),
+        ]);
         return;
       }
       result = { success: agentRun.success, failure: 0 };

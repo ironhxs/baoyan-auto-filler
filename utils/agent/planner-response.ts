@@ -157,9 +157,69 @@ function plannedValue(
   };
 }
 
+const UNIFIED_ACTION_KEYS = [
+  'actionId', 'type', 'groupId', 'count', 'sourceRecordId', 'targetId', 'fileRecordId',
+  'rowIndex', 'value', 'evidenceFields', 'confidence', 'needsReview', 'reason', 'values',
+];
+
+function normalizeUnifiedAction(
+  action: Record<string, unknown>,
+  type: string,
+  path: string,
+): Record<string, unknown> {
+  if (!UNIFIED_ACTION_KEYS.every((key) => key in action)) return action;
+  assertExactKeys(action, UNIFIED_ACTION_KEYS, path);
+  if (type === 'add_rows') {
+    return {
+      actionId: action.actionId,
+      type: action.type,
+      groupId: action.groupId,
+      count: action.count,
+      confidence: action.confidence,
+      reason: action.reason,
+    };
+  }
+  if (type === 'fill_field' || type === 'select') {
+    return {
+      actionId: action.actionId,
+      type: action.type,
+      targetId: action.targetId,
+      sourceRecordId: action.sourceRecordId,
+      value: action.value,
+      evidenceFields: action.evidenceFields,
+      confidence: action.confidence,
+      needsReview: action.needsReview,
+      reason: action.reason,
+    };
+  }
+  if (type === 'fill_row') {
+    return {
+      actionId: action.actionId,
+      type: action.type,
+      groupId: action.groupId,
+      rowIndex: action.rowIndex,
+      sourceRecordId: action.sourceRecordId,
+      values: action.values,
+    };
+  }
+  if (type === 'upload') {
+    return {
+      actionId: action.actionId,
+      type: action.type,
+      targetId: action.targetId,
+      fileRecordId: action.fileRecordId,
+      confidence: action.confidence,
+      needsReview: action.needsReview,
+      reason: action.reason,
+    };
+  }
+  return action;
+}
+
 function parseAction(raw: unknown, path: string, indexes: ValidationIndexes): AgentPlannedAction {
-  const action = object(raw, path);
-  const type = string(action.type, `${path}.type`);
+  const rawAction = object(raw, path);
+  const type = string(rawAction.type, `${path}.type`);
+  const action = normalizeUnifiedAction(rawAction, type, path);
   const actionId = string(action.actionId, `${path}.actionId`);
 
   if (type === 'add_rows') {

@@ -184,4 +184,77 @@ function validated(plan: AgentPagePlan): AgentValidatedRunPlan {
   assert.equal(outcome.checkpoint.results.some((result) => result.actionId === 'old'), false);
 }
 
+{
+  const { snapshot, records, plan } = fixture('review-page');
+  plan.actions = [];
+  plan.reviewItems = [{
+    reviewId: 'review-1',
+    targetId: 't1',
+    message: '页面字段含义不明确，需要人工确认',
+  }];
+  let executed = false;
+  const deps: AgentRuntimeDeps = {
+    observe: async () => snapshot,
+    retrieve: async () => records,
+    plan: async () => plan,
+    validate: (value) => ({
+      ...validated(value),
+      reviewItems: value.reviewItems,
+    }),
+    execute: async () => {
+      executed = true;
+      return { results: [] };
+    },
+    verify: async () => ({
+      results: [], complete: true, needsRepair: false, failedActionIds: [], canAdvance: true,
+    }),
+    save: async () => undefined,
+  };
+  const outcome = await runAgentPage(deps);
+  assert.equal(outcome.status, 'paused', 'review-only plans must stop for manual confirmation');
+  assert.equal(outcome.canAdvance, false);
+  assert.equal(executed, false);
+  assert.match(outcome.reason ?? '', /manual review/i);
+}
+
+{
+  const { snapshot, records, plan } = fixture('filled-review-page');
+  plan.reviewItems = [{
+    reviewId: 'review-after-fill',
+    targetId: 't2',
+    message: '已填字段仍需人工核对',
+  }];
+  let executed = 0;
+  const deps: AgentRuntimeDeps = {
+    observe: async () => snapshot,
+    retrieve: async () => records,
+    plan: async () => plan,
+    validate: (value) => ({
+      ...validated(value),
+      reviewItems: value.reviewItems,
+    }),
+    execute: async (value) => {
+      executed += 1;
+      return {
+        results: value.executableActions.map((action) => ({
+          actionId: action.actionId,
+          targetId: action.type === 'fill_field' ? action.targetId : undefined,
+          status: 'verified' as const,
+          observed: action.type === 'fill_field' ? action.value : '',
+          reason: 'readback matched',
+          updatedAt: 1,
+        })),
+      };
+    },
+    verify: async (_value, report) => ({
+      results: report.results, complete: true, needsRepair: false, failedActionIds: [], canAdvance: true,
+    }),
+    save: async () => undefined,
+  };
+  const outcome = await runAgentPage(deps);
+  assert.equal(executed, 1, 'safe actions should still execute before review pause');
+  assert.equal(outcome.status, 'paused', 'completed writes must not suppress outstanding review items');
+  assert.equal(outcome.canAdvance, false);
+}
+
 console.log('agent runtime tests passed');
