@@ -35,8 +35,9 @@ Version 2.0 introduces a page-level form Agent. Instead of matching keywords in 
 When a saved award record has fields such as title, level, date, organizer, description, and personal rank, but a school asks for only **Date / Place / Content**, the Agent plans one complete row:
 
 - dates are adapted to the page example;
-- place uses an organizer or another grounded location-like field when available;
-- content combines only relevant saved facts and obeys forbidden-character and length rules;
+- place is rewritten as a geographic range or a verifiable awarding institution. For example, a source label equivalent to “East China regional round” becomes “East China”, and “Anhui division” becomes “Anhui Province”, instead of treating the competition stage as a literal place;
+- content first distinguishes a research project, competition entry, team award, and personal honor, then writes a natural sentence instead of applying one fixed bracket template;
+- sibling columns are planned together to avoid repeating the same fact. If the source contains only a year but the page requires a month, the Agent requests review rather than inventing one;
 - all columns in a record are treated atomically, so a partial row is never reported as complete.
 
 The Agent runs inside the extension and uses the OpenAI-compatible relay configured by the user. No Codex desktop integration or local model is required. Both Responses and Chat Completions are supported. Agent requests use streamed plain JSON and are checked locally against a strict schema, page fingerprint, source evidence, and action allowlist. This avoids relying on inconsistent relay-side structured-output support and never changes endpoints or blindly retries authentication, rate-limit, upstream, or network failures.
@@ -106,6 +107,7 @@ A separate **Education and employment chronology** compatibility group maps star
 - Store and preview JPG, PNG, WebP, and PDF files locally; categorize, rename, and merge PDFs.
 - Recommend files from the upload prompt, filename, description, and category.
 - A high-confidence candidate may be attached before pausing, but the prompt title and filename are shown for human preview before navigation continues.
+- Files and photos already uploaded on the website are preserved and enter the same preview gate. If the site serves an image with a generic binary MIME type, Baotian previews it only after its file signature identifies a supported image format.
 - Final audit is manually triggered and read-only. It reviews selected task pages, material records, and deterministic PDF samples through the configured model.
 
 > AI import of profile data from Word/PDF is intentionally not included in 2.0. JSON profile import, document management, and PDF synthesis remain available.
