@@ -30,14 +30,14 @@ const textFields: TextField[] = [
 ];
 
 const awardBlocks: BlockCategory[] = [{
-  title: '奖励情况',
-  sectionId: 'awards',
+  title: '本科期间校级以上（含）荣誉奖励',
+  sectionId: 'honors_awards',
   items: [{ fields: [
-    { key: '奖励名称', value: '程序设计竞赛一等奖' },
-    { key: '奖励级别', value: '省级' },
+    { key: '获奖名称', value: '程序设计竞赛一等奖' },
+    { key: '获奖等级', value: '省级' },
   ] }, { fields: [
-    { key: '奖励名称', value: '数学建模二等奖' },
-    { key: '奖励级别', value: '校级' },
+    { key: '获奖名称', value: '数学建模二等奖' },
+    { key: '获奖等级', value: '校级' },
   ] }],
 }];
 
@@ -58,19 +58,19 @@ assert.equal(reversedLanguagePlan.groups['外语水平'].rowsToAdd, 0);
 
 const emptyAwardPlan = planRepeatableRecords([], awardBlocks, []);
 assert.deepEqual(
-  emptyAwardPlan.groups['奖励情况'].missingItemIndexes,
+  emptyAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].missingItemIndexes,
   [0, 1],
   'an empty award table requires rows for every saved award',
 );
-assert.equal(emptyAwardPlan.groups['奖励情况'].rowsToAdd, 2);
+assert.equal(emptyAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].rowsToAdd, 2);
 
 const existingAwardFields = [
-  field(0, { groupLabel: '奖励情况', rowIndex: 0, columnLabel: '获奖名称', value: '程序设计竞赛一等奖' }),
-  field(1, { groupLabel: '奖励情况', rowIndex: 0, columnLabel: '获奖等级', value: '省级' }),
+  field(0, { groupLabel: '本科期间校级以上（含）荣誉奖励', rowIndex: 0, columnLabel: '获奖名称', value: '程序设计竞赛一等奖' }),
+  field(1, { groupLabel: '本科期间校级以上（含）荣誉奖励', rowIndex: 0, columnLabel: '获奖等级', value: '省级' }),
 ];
 const existingAwardPlan = planRepeatableRecords(existingAwardFields, awardBlocks, []);
-assert.deepEqual(existingAwardPlan.groups['奖励情况'].rowBindings, [0]);
-assert.deepEqual(existingAwardPlan.groups['奖励情况'].missingItemIndexes, [1]);
-assert.equal(existingAwardPlan.groups['奖励情况'].rowsToAdd, 1, 'a populated matching row must not be added again');
+assert.deepEqual(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].rowBindings, [0]);
+assert.deepEqual(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].missingItemIndexes, [1]);
+assert.equal(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].rowsToAdd, 1, 'a populated matching row must not be added again');
 
 console.log('repeatable records tests passed');

@@ -56,6 +56,7 @@ export interface RepeatableRowScanResult<T> {
 
 interface RepeatableSourceGroup {
   label: string;
+  sectionId?: string;
   items: BlockItem[];
 }
 
@@ -68,12 +69,20 @@ export function isAddRowLabel(value: string | undefined): boolean {
 }
 
 const IDENTITY_KEYS: Record<string, string[]> = {
-  外语水平: ['考试名称', '外语考试', '外语水平', '外语等级', '考试类型'],
-  家庭成员: ['姓名', '成员姓名', '家庭成员姓名'],
-  学术成果: ['成果名称', '论文名称', '专利名称', '项目名称'],
-  奖励情况: ['奖励名称', '获奖名称', '奖项名称', '竞赛名称', '比赛名称', '荣誉名称'],
-  学习和工作经历: ['学校或单位', '学习或工作单位', '所在单位', '开始日期', '开始时间'],
+  language: ['考试名称', '外语考试', '外语水平', '外语等级', '考试类型'],
+  family: ['姓名', '成员姓名', '家庭成员姓名'],
+  research_training: ['项目名称', '起止时间'],
+  internship_practice: ['实习实践单位', '起止时间'],
+  social_work: ['社会工作名称', '起止时间'],
+  published_papers: ['论文标题', '论文名称', '作者'],
+  granted_patents: ['专利名称', '专利权人'],
+  subject_competitions: ['获奖项目名称', '竞赛名称', '获奖人'],
+  honors_awards: ['获奖名称'],
 };
+
+export function getSectionIdentityKeys(sectionId: string | undefined, groupLabel = ''): string[] {
+  return [...(IDENTITY_KEYS[sectionId ?? ''] ?? IDENTITY_KEYS[groupLabel] ?? ['姓名', '名称', '项目名称'])];
+}
 
 function normalize(text: string | undefined): string {
   return (text ?? '')
@@ -96,11 +105,11 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
   const groups = blocks.flatMap((block) => {
     const section = getBlockSection(block);
     if (!section || section.kind !== 'repeat') return [];
-    return [{ label: section.title, items: block.items }];
+    return [{ label: section.title, sectionId: section.id, items: block.items }];
   });
   if (!groups.some((group) => group.label === '外语水平')) {
     const inferred = inferLanguageItems(textFields);
-    if (inferred.length > 0) groups.push({ label: '外语水平', items: inferred });
+    if (inferred.length > 0) groups.push({ label: '外语水平', sectionId: 'language', items: inferred });
   }
   return groups.filter((group) => group.items.length > 0);
 }
@@ -116,14 +125,14 @@ function rowFieldsForGroup(fields: FormFieldInfo[], groupLabel: string): Map<num
   return new Map([...rows.entries()].sort(([left], [right]) => left - right));
 }
 
-function identityValueFromRow(groupLabel: string, fields: FormFieldInfo[]): string {
-  const keys = IDENTITY_KEYS[groupLabel] ?? [];
+function identityValueFromRow(sectionId: string | undefined, groupLabel: string, fields: FormFieldInfo[]): string {
+  const keys = getSectionIdentityKeys(sectionId, groupLabel);
   const identityField = fields.find((field) => keys.some((key) => sameText(field.columnLabel || field.label, key)));
   return identityField?.value?.trim() ?? '';
 }
 
-function identityValueFromItem(groupLabel: string, item: BlockItem): string {
-  const keys = IDENTITY_KEYS[groupLabel] ?? [];
+function identityValueFromItem(sectionId: string | undefined, groupLabel: string, item: BlockItem): string {
+  const keys = getSectionIdentityKeys(sectionId, groupLabel);
   const identityField = item.fields.find((field) => keys.some((key) => sameText(field.key, key)));
   return identityField?.value.trim() ?? '';
 }
@@ -132,10 +141,16 @@ function rowHasValue(fields: FormFieldInfo[]): boolean {
   return fields.some((field) => Boolean(field.value?.trim()));
 }
 
-function findMatchingItem(groupLabel: string, rowIdentity: string, items: BlockItem[], claimed: Set<number>): number | undefined {
+function findMatchingItem(
+  sectionId: string | undefined,
+  groupLabel: string,
+  rowIdentity: string,
+  items: BlockItem[],
+  claimed: Set<number>,
+): number | undefined {
   if (!rowIdentity) return undefined;
   const candidates = items
-    .map((item, index) => ({ index, identity: identityValueFromItem(groupLabel, item) }))
+    .map((item, index) => ({ index, identity: identityValueFromItem(sectionId, groupLabel, item) }))
     .filter((candidate) => !claimed.has(candidate.index) && sameText(candidate.identity, rowIdentity));
   return candidates.length === 1 ? candidates[0].index : undefined;
 }
@@ -154,8 +169,8 @@ export function planRepeatableRecords(
     const unmatchedRowIndexes: number[] = [];
 
     for (const [rowIndex, rowFields] of pageRows) {
-      const rowIdentity = identityValueFromRow(source.label, rowFields);
-      const matchingItem = findMatchingItem(source.label, rowIdentity, source.items, claimed);
+      const rowIdentity = identityValueFromRow(source.sectionId, source.label, rowFields);
+      const matchingItem = findMatchingItem(source.sectionId, source.label, rowIdentity, source.items, claimed);
       if (matchingItem != null) {
         claimed.add(matchingItem);
         rowBindings[rowIndex] = matchingItem;
