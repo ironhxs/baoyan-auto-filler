@@ -1,4 +1,5 @@
 import type { BlockCategory } from './db';
+import { getOptionalSectionFieldKeys, getSectionDefinition, getSectionFieldKeys } from './profile-schema';
 
 export interface ProfileFieldData {
   key: string;
@@ -15,6 +16,14 @@ export interface ProfileBlockData {
 export interface ProfileImportBundle {
   fields: ProfileFieldData[];
   blocks: ProfileBlockData[];
+  warnings?: ProfileImportWarning[];
+}
+
+export interface ProfileImportWarning {
+  kind: 'unknown-section' | 'unknown-field' | 'empty-record';
+  sectionId?: string;
+  fieldKey?: string;
+  message: string;
 }
 
 export interface ProfileExportData extends ProfileImportBundle {
@@ -30,9 +39,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function normalizeValue(value: unknown): string {
+export function normalizeValue(value: unknown): string {
   if (value == null) return '';
   return String(value);
+}
+
+const FIELD_ALIASES: Record<string, string> = {
+  '奖项名称': '获奖名称',
+  '奖项等级': '获奖等级',
+  '获奖级别': '获奖等级',
+  '奖项级别': '获奖等级',
+  '获奖日期': '获奖时间',
+  '论文名称': '论文标题',
+  '刊物/会议': '刊物/会议名称',
+  '论文发表时间': '发表时间',
+  '项目时间段': '起止时间',
+  '开始日期-结束日期': '起止时间',
+  '项目描述': '主要工作内容',
+  '本人职务': '本人角色',
+  '获奖项目': '获奖项目名称',
+  '比赛名称': '竞赛名称',
+};
+
+function canonicalFieldKey(key: string): string {
+  return FIELD_ALIASES[key.trim()] ?? key.trim();
 }
 
 export function normalizeProfileFields(fields: Iterable<Partial<ProfileFieldData>>): ProfileFieldData[] {
@@ -53,7 +83,10 @@ export function normalizeProfileFields(fields: Iterable<Partial<ProfileFieldData
   return normalized;
 }
 
-export function normalizeProfileBlocks(blocks: Iterable<Partial<ProfileBlockData>>): ProfileBlockData[] {
+export function normalizeProfileBlocks(
+  blocks: Iterable<Partial<ProfileBlockData>>,
+  warnings: ProfileImportWarning[] = [],
+): ProfileBlockData[] {
   const normalized: ProfileBlockData[] = [];
   const seen = new Set<string>();
 
@@ -61,24 +94,52 @@ export function normalizeProfileBlocks(blocks: Iterable<Partial<ProfileBlockData
     const title = normalizeValue(block.title).trim();
     if (!title) continue;
     const sectionId = normalizeValue(block.sectionId).trim() || undefined;
+    const section = getSectionDefinition(sectionId);
+    if (sectionId && !section) {
+      warnings.push({ kind: 'unknown-section', sectionId, message: `未识别资料分组：${sectionId}` });
+    }
     const identity = sectionId ? `section:${sectionId}` : `title:${title}`;
     if (seen.has(identity)) continue;
 
+    const allowedFields = section
+      ? new Set([...getSectionFieldKeys(section.id), ...getOptionalSectionFieldKeys(section.id)])
+      : undefined;
     const templateFields = Array.from(new Set(
       (Array.isArray(block.templateFields) ? block.templateFields : [])
-        .map((field) => normalizeValue(field).trim())
+        .map((field) => canonicalFieldKey(normalizeValue(field)))
+        .filter((field) => {
+          if (!allowedFields || allowedFields.has(field)) return Boolean(field);
+          warnings.push({ kind: 'unknown-field', sectionId, fieldKey: field, message: `未识别字段：${field}` });
+          return false;
+        })
         .filter(Boolean),
     ));
     const items = (Array.isArray(block.items) ? block.items : []).flatMap((item) => {
       if (!isRecord(item) || !Array.isArray(item.fields)) return [];
-      const fields = normalizeProfileFields(item.fields.filter(isRecord));
+      const fields = normalizeProfileFields(item.fields.filter(isRecord).map((field) => ({
+        ...field,
+        key: canonicalFieldKey(normalizeValue(field.key)),
+      })).filter((field) => {
+        const key = normalizeValue(field.key).trim();
+        if (!allowedFields || allowedFields.has(key)) return Boolean(key);
+        warnings.push({ kind: 'unknown-field', sectionId, fieldKey: key, message: `未识别字段：${key}` });
+        return false;
+      }));
+      const meaningfulValues = fields.map((field) => field.value.trim()).filter(Boolean);
+      if (sectionId && ['published_papers', 'granted_patents'].includes(sectionId) &&
+        meaningfulValues.length > 0 && meaningfulValues.every((value) => value === '无')) {
+        warnings.push({ kind: 'empty-record', sectionId, message: `${title}中的“无”记录已忽略` });
+        return [];
+      }
       return fields.length ? [{ fields }] : [];
     });
 
     normalized.push({
       title,
       ...(sectionId ? { sectionId } : {}),
-      ...(templateFields.length ? { templateFields } : {}),
+      ...(templateFields.length ? { templateFields } : section
+        ? { templateFields: [...getSectionFieldKeys(section.id), ...getOptionalSectionFieldKeys(section.id)] }
+        : {}),
       items,
     });
     seen.add(identity);
@@ -110,6 +171,7 @@ export function stringifyProfileExport(
 }
 
 export function parseProfileImportBundle(rawJson: string): ProfileImportBundle {
+  const warnings: ProfileImportWarning[] = [];
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJson);
@@ -118,7 +180,7 @@ export function parseProfileImportBundle(rawJson: string): ProfileImportBundle {
   }
 
   if (Array.isArray(parsed)) {
-    return { fields: normalizeProfileFields(parsed.filter(isRecord)), blocks: [] };
+    return { fields: normalizeProfileFields(parsed.filter(isRecord)), blocks: [], warnings };
   }
 
   if (!isRecord(parsed)) {
@@ -137,7 +199,8 @@ export function parseProfileImportBundle(rawJson: string): ProfileImportBundle {
   if (Array.isArray(parsed.fields) || Array.isArray(parsed.blocks)) {
     return {
       fields: normalizeProfileFields((Array.isArray(parsed.fields) ? parsed.fields : []).filter(isRecord)),
-      blocks: normalizeProfileBlocks((Array.isArray(parsed.blocks) ? parsed.blocks : []).filter(isRecord)),
+      blocks: normalizeProfileBlocks((Array.isArray(parsed.blocks) ? parsed.blocks : []).filter(isRecord), warnings),
+      warnings,
     };
   }
 
@@ -148,6 +211,7 @@ export function parseProfileImportBundle(rawJson: string): ProfileImportBundle {
         .map(([key, value]) => ({ key, value: normalizeValue(value) })),
     ),
     blocks: [],
+    warnings,
   };
 }
 

@@ -13,7 +13,7 @@
     "zip:firefox": "wxt zip -b firefox",
     "compile": "tsc --noEmit --project .wxt/tsconfig.json",
     "test:llm-api": "node scripts/test-llm-api.mjs",
-    "test:profile": "node scripts/test-profile-data.mjs",
+    "test:profile": "tsx scripts/test-profile-data.ts",
     "test:local-matcher": "tsx scripts/test-local-matcher.ts",
     "test:repeatable-records": "tsx scripts/test-repeatable-records.ts",
     "test:repeatable-row-request": "tsx scripts/test-repeatable-row-request.ts",
