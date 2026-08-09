@@ -7,7 +7,7 @@ const blocks: BlockCategory[] = [
     title: '已发表论文',
     sectionId: 'published_papers',
     items: [{ fields: [
-      { key: '作者', value: '贺鑫帅等' },
+      { key: '作者', value: '测试同学等' },
       { key: '论文标题', value: '缺失模态脑肿瘤分割研究' },
       { key: '刊物/会议名称', value: '医学影像会议' },
       { key: '发表时间', value: '2026年6月' },
@@ -28,7 +28,7 @@ const blocks: BlockCategory[] = [
     title: '学科竞赛',
     sectionId: 'subject_competitions',
     items: [{ fields: [
-      { key: '获奖人', value: '贺鑫帅等（队长）' },
+      { key: '获奖人', value: '测试同学等（队长）' },
       { key: '获奖项目名称', value: 'OopsOS 内核扩展' },
       { key: '竞赛名称', value: '操作系统设计赛' },
       { key: '获奖等级', value: '华东区域赛三等奖' },

@@ -43,7 +43,7 @@ const checkpoint: AgentCheckpoint = {
   retries: { 'failed-1': 2 },
   manualOverrides: { 'target-20': '用户手动填写' },
   cached: true,
-  error: 'API key sk-test-secret failed for 身份证 370724200501081419; password=abc123; raw response: hidden',
+  error: 'API key sk-test-secret failed for 身份证 110101200001010015; password=abc123; raw response: hidden',
   updatedAt: 200,
 };
 
@@ -61,7 +61,7 @@ assert.equal(view.canRetry, true);
 assert.equal(view.canAcceptManual, true);
 assert.equal(view.canReplan, true);
 assert.equal(view.error.includes('sk-test-secret'), false);
-assert.equal(view.error.includes('370724200501081419'), false);
+assert.equal(view.error.includes('110101200001010015'), false);
 assert.equal(view.error.includes('abc123'), false);
 assert.match(view.error, /已隐藏敏感信息/);
 

@@ -15,7 +15,7 @@ const blocks: BlockCategory[] = [{
   sectionId: 'subject_competitions',
   items: [{
     fields: [
-      { key: '获奖人', value: '贺鑫帅等（队长）' },
+      { key: '获奖人', value: '测试同学等（队长）' },
       { key: '获奖项目名称', value: 'OopsOS：基于xv6-RISCV的小型操作系统内核扩展' },
       { key: '竞赛名称', value: '全国大学生计算机系统能力大赛操作系统设计赛' },
       { key: '获奖等级', value: '华东区域赛三等奖' },
@@ -36,7 +36,7 @@ assert.equal(byIndex.get(0), '全国大学生计算机系统能力大赛操作�
 assert.equal(byIndex.get(1), 'OopsOS：基于xv6-RISCV的小型操作系统内核扩展');
 assert.equal(byIndex.get(2), '华东区域赛三等奖');
 assert.equal(byIndex.get(3), '2026年1月');
-assert.equal(byIndex.get(4), '贺鑫帅等（队长）');
+assert.equal(byIndex.get(4), '测试同学等（队长）');
 
 const aggregate = matchFieldsLocally([
   field(5, {
@@ -46,7 +46,7 @@ const aggregate = matchFieldsLocally([
     label: '学科竞赛（获奖人、获奖项目名称、竞赛名称、获奖等级、获奖时间）',
   }),
 ], [], blocks);
-assert.equal(aggregate[0]?.value, '贺鑫帅等（队长），OopsOS：基于xv6-RISCV的小型操作系统内核扩展，全国大学生计算机系统能力大赛操作系统设计赛，华东区域赛三等奖，2026年1月');
+assert.equal(aggregate[0]?.value, '测试同学等（队长），OopsOS：基于xv6-RISCV的小型操作系统内核扩展，全国大学生计算机系统能力大赛操作系统设计赛，华东区域赛三等奖，2026年1月');
 
 const projected = matchFieldsLocally([
   field(6, { groupLabel: '项目经历', rowIndex: 0, columnLabel: '项目名称' }),

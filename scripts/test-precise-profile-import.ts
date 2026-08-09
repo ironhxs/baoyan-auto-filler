@@ -10,7 +10,7 @@ const bundle = parseProfileImportBundle(JSON.stringify({
       sectionId: 'subject_competitions',
       items: [{
         fields: [
-          { key: '获奖人', value: '贺鑫帅等（队长）' },
+          { key: '获奖人', value: '测试同学等（队长）' },
           { key: '获奖项目名称', value: 'OopsOS：基于xv6-RISCV的小型操作系统内核扩展' },
           { key: '竞赛名称', value: '全国大学生计算机系统能力大赛操作系统设计赛' },
           { key: '奖项等级', value: '华东区域赛三等奖' },
@@ -53,4 +53,3 @@ assert.equal(appended.find((block) => block.sectionId === 'subject_competitions'
 assert.equal(appended.find((block) => block.sectionId === 'honors_awards')?.items.length, 1);
 
 console.log('precise profile import tests passed');
-
