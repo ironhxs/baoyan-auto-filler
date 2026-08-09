@@ -36,6 +36,7 @@
     "test:agent:execution": "tsx scripts/test-agent-execution.ts",
     "test:agent:cache": "tsx scripts/test-agent-cache.ts",
     "test:agent:runtime": "tsx scripts/test-agent-runtime.ts",
+    "test:agent:activation": "tsx scripts/test-agent-activation.ts",
     "test:agent:ui": "tsx scripts/test-agent-ui.ts",
     "postinstall": "wxt prepare"
   },

@@ -80,6 +80,7 @@ import { verifyAgentExecution } from '@/utils/agent/verifier';
 import { runAgentPage } from '@/utils/agent/runtime';
 import { applyAgentControl } from '@/utils/agent/control';
 import type { AgentControlCommand } from '@/utils/agent/control';
+import { shouldPreferPageAgent } from '@/utils/agent/activation';
 import type {
   AgentActionResult,
   AgentCheckpoint,
@@ -1606,7 +1607,11 @@ async function handleConfirmMaterialsAndResume(): Promise<Response> {
   return autoRunResponse(previous);
 }
 
-async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSuccessResponse> {
+async function collectTabScan(
+  tabId: number,
+  allowAi = true,
+  deferFieldAiToAgent = false,
+): Promise<ScanSuccessResponse> {
   const [textFields, blocks, apiConfig, textApiReady, fileRecords, categories] = await Promise.all([
     getAllTextFields(),
     getAllBlockCategories(),
@@ -1687,9 +1692,17 @@ async function collectTabScan(tabId: number, allowAi = true): Promise<ScanSucces
   const repeatPlan = planRepeatableRecords(fieldInfos, blocks, textFields);
   const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
   const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
-  const aiFields = apiConfig.aiEnhanced
-    ? textFieldInfos.filter((field) => !field.protected || /只读|锁定/.test(field.protectionReason ?? ''))
-    : getAiEligibleFields(textFieldInfos, localMatches);
+  const pageAgentPreferred = deferFieldAiToAgent && shouldPreferPageAgent(
+    fieldInfos,
+    localMatches,
+    textApiReady,
+    apiConfig.aiEnhanced,
+  );
+  const aiFields = pageAgentPreferred
+    ? []
+    : apiConfig.aiEnhanced
+      ? textFieldInfos.filter((field) => !field.protected || /只读|锁定/.test(field.protectionReason ?? ''))
+      : getAiEligibleFields(textFieldInfos, localMatches);
   const profileValues = flattenProfileValues(textFields, blocks);
   const fieldByIndex = new Map(textFieldInfos.map((field) => [field.index, field]));
   let aiMatches: MatchResult[] = [];
@@ -1915,21 +1928,7 @@ async function retryAutoRunAfterPageChange(state: AutoRunState): Promise<void> {
 }
 
 function shouldUsePageAgent(scan: ScanSuccessResponse, configured: boolean, enhanced: boolean): boolean {
-  if (!configured || !enhanced) return false;
-  const textFields = scan.fields.filter((field) => field.kind !== 'file' && !field.protected);
-  if (textFields.length === 0) return false;
-  const repeatGroups = new Map<string, Set<string>>();
-  for (const field of textFields) {
-    const group = (field.repeatGroup || field.groupLabel || '').trim();
-    if (!group || field.rowIndex == null) continue;
-    const columns = repeatGroups.get(group) ?? new Set<string>();
-    columns.add((field.columnLabel || field.label || `field-${field.index}`).trim());
-    repeatGroups.set(group, columns);
-  }
-  if ([...repeatGroups.values()].some((columns) => columns.size >= 2)) return true;
-  if (textFields.some((field) => field.fillMode === 'long')) return true;
-  const locallyCovered = new Set(scan.matches.filter((match) => match.kind !== 'file').map((match) => match.index));
-  return textFields.filter((field) => !isMeaningfullyFilled(field) && !locallyCovered.has(field.index)).length >= 2;
+  return shouldPreferPageAgent(scan.fields, scan.matches, configured, enhanced);
 }
 
 function agentInstructions(fields: FormFieldInfo[]): string[] {
@@ -2216,10 +2215,10 @@ async function processAutoRun(tabId: number): Promise<void> {
       // has finished its first DOM pass. Give the page a short settling window.
       await new Promise((resolve) => setTimeout(resolve, 600));
     }
-    let scan = await collectTabScan(tabId);
+    let scan = await collectTabScan(tabId, true, true);
     if (scan.total === 0 && state.pageCount > 0) {
       await new Promise((resolve) => setTimeout(resolve, 600));
-      scan = await collectTabScan(tabId);
+      scan = await collectTabScan(tabId, true, true);
     }
     if (!(await isSamePage(tabId, scan))) {
       await retryAutoRunAfterPageChange(state);
