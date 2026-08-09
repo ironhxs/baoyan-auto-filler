@@ -271,16 +271,35 @@ export async function deleteBlockCategory(id: number): Promise<void> {
 }
 
 export async function ensureProfileBlocksSeeded(): Promise<BlockCategory[]> {
-  const { DEFAULT_REPEAT_SECTIONS } = await import('./profile-schema');
+  const { DEFAULT_REPEAT_SECTIONS, getSectionFieldKeys, getOptionalSectionFieldKeys } = await import('./profile-schema');
   const blocks = await getAllBlockCategories();
 
+  const legacyIds = new Set(['experience', 'academic', 'awards']);
+  const legacyTitles = new Set(['学习和工作经历', '学术成果', '奖励情况']);
+  const legacyBlocks = blocks.filter((block) =>
+    (block.sectionId && legacyIds.has(block.sectionId)) ||
+    (!block.sectionId && legacyTitles.has(block.title)),
+  );
+  for (const block of legacyBlocks) {
+    if (block.id != null) await deleteBlockCategory(block.id);
+  }
+
+  const activeBlocks = blocks.filter((block) => !legacyBlocks.includes(block));
+
   for (const section of DEFAULT_REPEAT_SECTIONS) {
-    const existing = blocks.find((block) => block.sectionId === section.id || block.title === section.title);
+    const existing = activeBlocks.find((block) => block.sectionId === section.id || block.title === section.title);
+    const templateFields = [
+      ...getSectionFieldKeys(section.id),
+      ...getOptionalSectionFieldKeys(section.id),
+    ];
     if (existing) {
-      const needsUpdate = existing.sectionId !== section.id || !existing.templateFields?.length;
+      const needsUpdate = existing.sectionId !== section.id ||
+        existing.title !== section.title ||
+        JSON.stringify(existing.templateFields ?? []) !== JSON.stringify(templateFields);
       if (needsUpdate) {
+        existing.title = section.title;
         existing.sectionId = section.id;
-        existing.templateFields = [...section.fieldKeys];
+        existing.templateFields = templateFields;
         await saveBlockCategory(existing);
       }
       continue;
@@ -289,14 +308,14 @@ export async function ensureProfileBlocksSeeded(): Promise<BlockCategory[]> {
     const block: BlockCategory = {
       title: section.title,
       sectionId: section.id,
-      templateFields: [...section.fieldKeys],
+      templateFields,
       items: [],
     };
     block.id = await saveBlockCategory(block);
-    blocks.push(block);
+    activeBlocks.push(block);
   }
 
-  return blocks;
+  return activeBlocks;
 }
 
 // ── Categories ──

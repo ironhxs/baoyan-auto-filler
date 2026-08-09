@@ -5,9 +5,13 @@ export type ProfileSectionId =
   | 'family'
   | 'education'
   | 'language'
-  | 'experience'
-  | 'academic'
-  | 'awards';
+  | 'research_training'
+  | 'internship_practice'
+  | 'social_work'
+  | 'published_papers'
+  | 'granted_patents'
+  | 'subject_competitions'
+  | 'honors_awards';
 
 export interface ProfileSectionDefinition {
   id: ProfileSectionId;
@@ -15,6 +19,7 @@ export interface ProfileSectionDefinition {
   icon: string;
   kind: 'flat' | 'repeat';
   fieldKeys: string[];
+  optionalFieldKeys?: string[];
 }
 
 export interface ProfileSourceValue {
@@ -64,25 +69,60 @@ export const PROFILE_SECTIONS: ProfileSectionDefinition[] = [
     fieldKeys: ['考试名称', '成绩', '考试日期', '备注', '证书编号'],
   },
   {
-    id: 'experience',
-    title: '学习和工作经历',
-    icon: '💼',
+    id: 'research_training',
+    title: '科研训练',
+    icon: '🔬',
     kind: 'repeat',
-    fieldKeys: ['开始日期', '结束日期', '学校或单位', '专业或职务', '经历说明'],
+    fieldKeys: ['起止时间', '项目名称', '项目级别', '排名'],
+    optionalFieldKeys: ['项目描述', '本人角色'],
   },
   {
-    id: 'academic',
-    title: '学术成果',
-    icon: '📄',
+    id: 'internship_practice',
+    title: '实习实践',
+    icon: '🧭',
     kind: 'repeat',
-    fieldKeys: ['成果名称', '成果类型', '发表或完成时间', '本人排序', '成果说明'],
+    fieldKeys: ['起止时间', '实习实践单位', '主要工作内容'],
+    optionalFieldKeys: ['实践类型', '本人角色'],
   },
   {
-    id: 'awards',
-    title: '奖励情况',
+    id: 'social_work',
+    title: '社会工作',
+    icon: '🤝',
+    kind: 'repeat',
+    fieldKeys: ['起止时间', '社会工作名称', '主要工作内容'],
+    optionalFieldKeys: ['本人角色', '组织/单位'],
+  },
+  {
+    id: 'published_papers',
+    title: '已发表论文',
+    icon: '📝',
+    kind: 'repeat',
+    fieldKeys: ['作者', '论文标题', '刊物/会议名称', '发表时间'],
+    optionalFieldKeys: ['论文类型', '发表状态', '分区', '本人排名'],
+  },
+  {
+    id: 'granted_patents',
+    title: '已取得专利',
+    icon: '💡',
+    kind: 'repeat',
+    fieldKeys: ['专利权人', '专利名称', '授权或受理时间'],
+    optionalFieldKeys: ['专利类型', '专利状态', '专利号', '本人排名'],
+  },
+  {
+    id: 'subject_competitions',
+    title: '学科竞赛',
+    icon: '🏅',
+    kind: 'repeat',
+    fieldKeys: ['获奖人', '获奖项目名称', '竞赛名称', '获奖等级', '获奖时间'],
+    optionalFieldKeys: ['主办单位', '描述', '本人排名'],
+  },
+  {
+    id: 'honors_awards',
+    title: '本科期间校级以上（含）荣誉奖励',
     icon: '🏆',
     kind: 'repeat',
-    fieldKeys: ['奖励名称', '奖励级别', '获奖时间', '本人排名', '颁发单位'],
+    fieldKeys: ['获奖名称', '获奖等级', '获奖时间'],
+    optionalFieldKeys: ['主办单位', '描述', '本人排名'],
   },
 ];
 
@@ -92,6 +132,14 @@ const FLAT_LANGUAGE_KEYS = new Set(['外语考试成绩', '英语四级成绩', 
 
 export function getSectionDefinition(id: string | undefined): ProfileSectionDefinition | undefined {
   return PROFILE_SECTIONS.find((section) => section.id === id);
+}
+
+export function getSectionFieldKeys(id: string | undefined): string[] {
+  return [...(getSectionDefinition(id)?.fieldKeys ?? [])];
+}
+
+export function getOptionalSectionFieldKeys(id: string | undefined): string[] {
+  return [...(getSectionDefinition(id)?.optionalFieldKeys ?? [])];
 }
 
 export function getFlatSectionId(key: string): Extract<ProfileSectionId, 'basic' | 'education' | 'language'> | 'custom' {
