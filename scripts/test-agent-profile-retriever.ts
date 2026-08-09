@@ -40,12 +40,24 @@ const blocks: BlockCategory[] = [
   {
     title: '荣誉奖励',
     sectionId: 'honors_awards',
-    items: [{ fields: [
-      { key: '获奖名称', value: '一等奖学金' },
-      { key: '获奖等级', value: '校级' },
-      { key: '获奖时间', value: '2025-12' },
-      { key: '空字段', value: '   ' },
-    ] }],
+    items: [
+      { fields: [
+        { key: '获奖名称', value: '一等奖学金' },
+        { key: '获奖等级', value: '校级' },
+        { key: '获奖时间', value: '2025-12' },
+        { key: '空字段', value: '   ' },
+      ] },
+      { fields: [
+        { key: '获奖名称', value: '暑期社会实践“十大典型案例”' },
+        { key: '获奖等级', value: '市级' },
+        { key: '获奖时间', value: '2025-09' },
+      ] },
+      { fields: [
+        { key: '获奖名称', value: '“大学生看宣城”优秀资政报告' },
+        { key: '获奖等级', value: '市级' },
+        { key: '获奖时间', value: '2025-09' },
+      ] },
+    ],
   },
   {
     title: '学习与工作履历',
@@ -74,7 +86,10 @@ const blocks: BlockCategory[] = [
   {
     title: '实习实践',
     sectionId: 'internship_practice',
-    items: [{ fields: [{ key: '实习实践单位', value: '社会实践团队' }] }],
+    items: [{ fields: [
+      { key: '实习实践单位', value: '社会实践团队' },
+      { key: '主要工作内容', value: '项目获校级一等奖、宣城市十大典型案例、宣城市优秀资政报告' },
+    ] }],
   },
   {
     title: '社会工作',
@@ -85,13 +100,21 @@ const blocks: BlockCategory[] = [
 
 const awardSnapshot = snapshot('奖励情况（本科期间）', ['时间', '地点', '内容']);
 assert.equal(inferAgentPageIntent(awardSnapshot), 'award');
-const awardRecords = retrieveAgentSourceRecords(awardSnapshot, blocks, []);
+const awardRecords = retrieveAgentSourceRecords(awardSnapshot, blocks, [
+  { key: '学校', value: '合肥工业大学' },
+]);
 assert.deepEqual([...new Set(awardRecords.map((record) => record.categoryId))], [
   'subject_competitions',
   'honors_awards',
 ]);
 assert.equal(awardRecords[0].recordId, 'subject_competitions:0');
 assert.equal('空字段' in awardRecords[1].fields, false);
+assert.equal(awardRecords[0].fields.地点语义证据, '华东地区');
+assert.equal('网页内容候选' in awardRecords[0].fields, false, 'Agent should compose content for the actual page instead of copying a fixed bracket template');
+assert.equal(awardRecords[1].fields.地点语义证据, '合肥工业大学');
+assert.equal('网页内容候选' in awardRecords[1].fields, false);
+assert.equal(awardRecords[2].fields.地点语义证据, '宣城市', 'a generic 市级 must be resolved from a related factual record, not written as the place');
+assert.equal(awardRecords[3].fields.地点语义证据, '宣城市', 'related evidence can resolve a location through a distinctive award type, not only an exact full title');
 
 const careerSnapshot = snapshot(
   '学习和工作经历',

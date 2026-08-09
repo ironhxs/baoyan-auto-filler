@@ -19,6 +19,7 @@ import {
 } from '@/utils/local-matcher';
 import { isPageValueConsistent } from '@/utils/value-compare';
 import { fieldFingerprint } from '@/utils/field-fingerprint';
+import { materialFieldDisplayLabel, materialFieldRoleTexts } from '@/utils/material-field-context';
 import { aiRequestQueue } from '@/utils/ai-request-queue';
 import {
   APPLICATION_TASK_BINDINGS_KEY,
@@ -73,7 +74,7 @@ import {
   getAgentPlanCache,
   saveAgentPlanCache,
 } from '@/utils/agent/cache';
-import { canAgentAdvance, validateAgentPlan } from '@/utils/agent/policy';
+import { blockingAgentReviewItems, canAgentAdvance, validateAgentPlan } from '@/utils/agent/policy';
 import { buildAgentExecutionBatch } from '@/utils/agent/executor';
 import type { AgentExecutionResult } from '@/utils/agent/executor';
 import { verifyAgentExecution } from '@/utils/agent/verifier';
@@ -114,6 +115,7 @@ interface MessageMap {
   getAutoRunStatus: undefined;
   stopAutoRun: undefined;
   confirmMaterialsAndResume: undefined;
+  previewExistingMaterial: { index: number };
   getCurrentApplicationTask: undefined;
   getCurrentPageAnalysis: undefined;
   savePageAnalysis: {
@@ -185,6 +187,14 @@ interface InspectSuccessResponse {
 interface PageActionSuccessResponse {
   ok: true;
   type: 'pageAction';
+}
+
+interface ExistingMaterialPreviewSuccessResponse {
+  ok: true;
+  type: 'existingMaterialPreview';
+  dataUrl: string;
+  mimeType: string;
+  evidence: string;
 }
 
 type AutoRunStatus = 'running' | 'paused' | 'complete' | 'stopped';
@@ -266,7 +276,7 @@ interface FinalAuditSuccessResponse {
   degradedReason?: string;
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | PageAnalysisSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | ExistingMaterialPreviewSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | PageAnalysisSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
   | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
@@ -740,7 +750,13 @@ async function refreshAnalysisFromTab(
     tabId,
     { type: 'scan' },
   ).catch(() => []);
-  const currentFields = scanResults.map((result) => ({ ...result.field, index: result.index }));
+  const currentFields = scanResults.map((result) => {
+    const field = { ...result.field, index: result.index };
+    if (field.kind === 'file') {
+      field.label = materialFieldDisplayLabel(field, analysis.pageLabel, field.index);
+    }
+    return field;
+  });
   if (currentFields.length === 0) return null;
 
   const currentByFingerprint = new Map<string, FormFieldInfo[]>();
@@ -1023,28 +1039,18 @@ function hasSpecificRecordOverlap(field: FormFieldInfo, record: FileRecord): boo
   return candidates.some((text) => fieldText.includes(text) || text.includes(fieldText));
 }
 
-function detectFileFieldRole(field: FormFieldInfo): RoleScore | null {
-  const directRole = detectBestRole([
-    field.label,
-    field.hint,
-    field.placeholder,
-    field.ariaLabel,
-    field.title,
-    field.name,
-    field.id,
-  ].filter(Boolean).join(' '));
+function detectFileFieldRole(field: FormFieldInfo, pageLabel = ''): RoleScore | null {
+  const roleTexts = materialFieldRoleTexts(field, pageLabel);
+  const directRole = detectBestRole(roleTexts.direct);
   if (directRole) return directRole;
-
-  return detectBestRole([
-    field.context,
-    field.html,
-  ].filter(Boolean).join(' '));
+  return detectBestRole(roleTexts.fallback);
 }
 
 function matchFileFields(
   fields: FormFieldInfo[],
   fileRecords: FileRecord[],
   categories: Category[],
+  pageLabel = '',
 ): MatchResult[] {
   const categoryById = new Map(categories.flatMap((category) => (
     category.id == null ? [] : [[category.id, category] as const]
@@ -1053,7 +1059,7 @@ function matchFileFields(
   const availableRecords = fileRecords.filter((record) => record.id != null && record.fileBody.size > 0);
 
   return fileFields.flatMap((field) => {
-    const fieldRole = detectFileFieldRole(field);
+    const fieldRole = detectFileFieldRole(field, pageLabel);
     if (!fieldRole) return [];
     const maxFileBytes = maxFileBytesFromField(field);
 
@@ -1365,6 +1371,9 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'confirmMaterialsAndResume') {
     return handleConfirmMaterialsAndResume();
   }
+  if (request.type === 'previewExistingMaterial') {
+    return handlePreviewExistingMaterial(request.payload!.index);
+  }
   if (request.type === 'getCurrentApplicationTask') {
     return handleGetCurrentApplicationTask();
   }
@@ -1550,6 +1559,26 @@ async function handleFocusPageField(index: number): Promise<Response> {
   if (!tab?.id) return errorResponse('No active tab found');
   await sendToContentScript(tab.id, { type: 'focusField', index });
   return { ok: true, type: 'pageAction' };
+}
+
+async function handlePreviewExistingMaterial(index: number): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const result = await sendToContentScript<{
+    ok: boolean;
+    dataUrl?: string;
+    mimeType?: string;
+    evidence?: string;
+    error?: string;
+  }>(tab.id, { type: 'getExistingMaterialPreview', index });
+  if (!result?.ok) return errorResponse(result?.error || '无法读取网页现有材料预览');
+  return {
+    ok: true,
+    type: 'existingMaterialPreview',
+    dataUrl: result.dataUrl || '',
+    mimeType: result.mimeType || '',
+    evidence: result.evidence || '网页已有材料',
+  };
 }
 
 async function handleFocusAgentTarget(payload: { pageKey: string; targetId: string }): Promise<Response> {
@@ -1739,7 +1768,13 @@ async function collectTabScan(
     };
   }
 
-  const fieldInfos = scanResults.map((result) => ({ ...result.field, index: result.index }));
+  const fieldInfos = scanResults.map((result) => {
+    const field = { ...result.field, index: result.index };
+    if (field.kind === 'file') {
+      field.label = materialFieldDisplayLabel(field, pageMeta?.label || '', field.index);
+    }
+    return field;
+  });
   const repeatPlan = planRepeatableRecords(fieldInfos, blocks, textFields);
   const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
   const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
@@ -1792,7 +1827,7 @@ async function collectTabScan(
       }
     }
   }
-  let fileMatches = matchFileFields(fieldInfos, readableFileRecords, categories);
+  let fileMatches = matchFileFields(fieldInfos, readableFileRecords, categories, pageMeta?.label || '');
   if (allowAi && textApiReady && fileMatches.length > 0) {
     const materialReview = await reviewFileMatchesWithAi(
       pageMeta?.signature || pageMeta?.url || '',
@@ -2076,6 +2111,24 @@ async function runAgentForScan(
       }
       const plan = await requestAgentPagePlan({ snapshot, sourceRecords }, apiConfig, {
         requestText: requestAgentModelDurably,
+        loadChunkPlan: async (chunk) => {
+          const chunkKey = createAgentPlanCacheKey({
+            snapshot: chunk.snapshot,
+            sourceRecords: chunk.sourceRecords,
+            apiConfig,
+          });
+          const record = await getAgentPlanCache(chunkKey);
+          if (record) cached = true;
+          return record?.plan ?? null;
+        },
+        saveChunkPlan: async (chunk, chunkPlan) => {
+          const chunkKey = createAgentPlanCacheKey({
+            snapshot: chunk.snapshot,
+            sourceRecords: chunk.sourceRecords,
+            apiConfig,
+          });
+          await saveAgentPlanCache(chunkKey, `${snapshot.pageKey}::${chunk.chunkId}`, chunkPlan);
+        },
         onChunkProgress: async (completed, total) => {
           state.message = `保填 Agent 已完成 ${completed}/${total} 批页面规划`;
           await saveAutoRunState(state);
@@ -2095,7 +2148,24 @@ async function runAgentForScan(
         lastAgentValues: previousAgentValues,
       });
       reviewed = validated.reviewItems.length;
-      return { plan, ...validated };
+      const executableTargetIds = new Set(validated.executableActions.flatMap((action) => {
+        if (action.type === 'fill_row') return action.values.map((value) => value.targetId);
+        if (action.type === 'fill_field' || action.type === 'select' || action.type === 'upload') {
+          return [action.targetId];
+        }
+        return [];
+      }));
+      return {
+        plan,
+        ...validated,
+        reviewItems: blockingAgentReviewItems(
+          plan,
+          snapshot,
+          validated.reviewItems,
+          new Set(validated.executableActions.map((action) => action.actionId)),
+          executableTargetIds,
+        ),
+      };
     },
     prepare: async (validated) => {
       preparedResults = [];

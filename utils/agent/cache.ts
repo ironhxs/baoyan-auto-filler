@@ -14,7 +14,7 @@ import type {
   AgentPlannedAction,
 } from './types';
 
-export const AGENT_PROTOCOL_VERSION = 1;
+export const AGENT_PROTOCOL_VERSION = 4;
 export const AGENT_PLAN_CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 
 export interface AgentPlanCacheIdentityInput {
@@ -111,4 +111,3 @@ export function updateAgentCheckpoint(
   updated.nextActionIndex = nextPendingAgentActionIndex(updated);
   return updated;
 }
-

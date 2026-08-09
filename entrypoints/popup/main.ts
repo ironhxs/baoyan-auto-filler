@@ -13,6 +13,8 @@ import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
 import type { RepeatableRecordPlan } from '@/utils/repeatable-records';
 import { buildPopupTaskSummary } from '@/utils/audit-view-model';
 import { buildAgentViewModel } from '@/utils/agent/view-model';
+import { materialFieldDisplayLabel } from '@/utils/material-field-context';
+import { computeMaterialReviewState } from '@/utils/material-review';
 
 const app = document.getElementById('app')!;
 
@@ -95,6 +97,14 @@ interface AutoRunResponse {
   }>;
 }
 
+interface ExistingMaterialPreviewResponse {
+  ok: true;
+  type: 'existingMaterialPreview';
+  dataUrl: string;
+  mimeType: string;
+  evidence: string;
+}
+
 interface ApplicationTaskListResponse {
   ok: true;
   type: 'applicationTasks';
@@ -127,6 +137,7 @@ let apiAvailable = false;
 let autoRunStatus: AutoRunResponse | null = null;
 let materialFileRecords: FileRecord[] = [];
 const previewedMaterialByField = new Map<number, number>();
+const previewedExistingMaterialFields = new Set<number>();
 let lastFillIncludedFiles = false;
 let applicationTasks: ApplicationTask[] = [];
 let currentTaskId: string | undefined;
@@ -755,6 +766,8 @@ function previewMaterial(
   const fileType = (record.fileType || '').toLowerCase();
   const isImage = fileType.startsWith('image/') || /\.(?:png|jpe?g|gif|webp)$/i.test(record.filename);
   const isPdf = fileType === 'application/pdf' || /\.pdf$/i.test(record.filename);
+  const field = fields.find((candidate) => candidate.index === fieldIndex);
+  const questionTitle = materialFieldDisplayLabel(field ?? {}, currentScan?.pageLabel || '', fieldIndex);
   const position = Math.max(0, queue.findIndex((item) => item.index === fieldIndex && item.fileRecordId === fileRecordId));
   const overlay = document.createElement('div');
   overlay.className = 'material-preview-overlay';
@@ -771,7 +784,8 @@ function previewMaterial(
         <div><strong>预览材料</strong><span>${queue.length > 1 ? `${position + 1} / ${queue.length}` : '上传前核对'}</span></div>
         <button type="button" class="material-preview-close" aria-label="关闭预览">&times;</button>
       </div>
-      <div class="material-preview-name" title="${escapeAttr(record.filename)}">${escapeHtml(record.filename)}</div>
+      <div class="material-preview-question"><span>当前上传项</span><strong>${escapeHtml(questionTitle)}</strong></div>
+      <div class="material-preview-name" title="${escapeAttr(record.filename)}"><span>候选文件</span>${escapeHtml(record.filename)}</div>
       <div class="material-preview-body">${previewBody}</div>
       <div class="material-preview-actions">
         <button type="button" class="secondary-btn material-preview-cancel">稍后检查</button>
@@ -796,8 +810,64 @@ function previewMaterial(
   });
 }
 
+async function previewExistingMaterial(fieldIndex: number): Promise<void> {
+  try {
+    const response = await sendRuntimeMessage<ExistingMaterialPreviewResponse | ErrorResponse>({
+      type: 'previewExistingMaterial',
+      payload: { index: fieldIndex },
+    });
+    if (!response.ok) throw new Error(response.error);
+
+    document.querySelector('.material-preview-overlay')?.remove();
+    const field = fields.find((candidate) => candidate.index === fieldIndex);
+    const questionTitle = materialFieldDisplayLabel(field ?? {}, currentScan?.pageLabel || '', fieldIndex);
+    const previewBody = response.dataUrl
+      ? `<img class="material-preview-image" src="${escapeAttr(response.dataUrl)}" alt="${escapeAttr(questionTitle)}" />`
+      : `<div class="material-preview-unsupported"><strong>网页已有材料</strong><span>该网站没有提供可读取的小窗预览，请同时查看报名网页中的现有文件或缩略图后再确认。</span></div>`;
+    const overlay = document.createElement('div');
+    overlay.className = 'material-preview-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.innerHTML = `
+      <div class="material-preview-dialog">
+        <div class="material-preview-head">
+          <div><strong>预览网页现有材料</strong><span>继续前核对</span></div>
+          <button type="button" class="material-preview-close" aria-label="关闭预览">&times;</button>
+        </div>
+        <div class="material-preview-question"><span>当前上传项</span><strong>${escapeHtml(questionTitle)}</strong></div>
+        <div class="material-preview-name"><span>网页状态</span>${escapeHtml(response.evidence || '网页已有材料')}</div>
+        <div class="material-preview-body">${previewBody}</div>
+        <div class="material-preview-actions">
+          <button type="button" class="secondary-btn material-preview-cancel">稍后检查</button>
+          <button type="button" class="fill-btn material-preview-confirm">已检查此材料</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const close = () => overlay.remove();
+    overlay.querySelector('.material-preview-close')?.addEventListener('click', close);
+    overlay.querySelector('.material-preview-cancel')?.addEventListener('click', close);
+    overlay.querySelector('.material-preview-confirm')?.addEventListener('click', () => {
+      previewedExistingMaterialFields.add(fieldIndex);
+      const row = document.querySelector<HTMLElement>(`.field-item[data-index="${fieldIndex}"]`);
+      row?.classList.add('material-previewed');
+      const status = row?.querySelector<HTMLElement>('.field-status');
+      if (status) status.innerHTML = '<span class="status-tag verified">已预览</span>';
+      close();
+      updateFooterButton();
+    });
+  } catch (error) {
+    showError(error instanceof Error ? error.message : '无法读取网页现有材料预览');
+  }
+}
+
 function renderResult(scanResp: ScanResponse) {
   viewState = 'result';
+  if (currentScan?.pageSignature !== scanResp.pageSignature) {
+    previewedMaterialByField.clear();
+    previewedExistingMaterialFields.clear();
+  }
   currentScan = scanResp;
   fields = scanResp.fields;
   displayItems = buildDisplayItems(scanResp);
@@ -834,7 +904,7 @@ function renderResult(scanResp: ScanResponse) {
     ${materialItems.length > 0 ? `
       <div class="material-review-card">
         <div class="material-review-title"><strong>材料上传核对</strong><span>${uploadedMaterialCount}/${materialItems.length} 已写入</span></div>
-        <p>保填已按 AI 与本地语义选择候选并自动上传。请在进入下一步前检查实际文件；低置信候选不会自动上传。</p>
+        <p>保填会保留网页已有材料，并为新材料按页面题目选择候选。进入下一步前，请逐项核对“上传项名称”和实际文件；低置信候选不会自动上传。</p>
         <div class="material-review-meta">
           <span>${materialCandidates.length} 组候选</span>
           <span>${requiredMaterialMissing > 0 ? `${requiredMaterialMissing} 个必填项待补齐` : '必填项已齐'}</span>
@@ -892,12 +962,18 @@ function renderResult(scanResp: ScanResponse) {
     li.title = '点击定位网页字段';
 
     const selectedFileId = item.match?.fileRecordId;
+    const itemField = scanResp.fields.find((candidate) => candidate.index === item.index);
+    const existingWebsiteMaterial = item.kind === 'file'
+      && selectedFileId == null
+      && Boolean(itemField && isMeaningfullyFilled(itemField));
     const materialPreviewed = item.kind !== 'file' || (selectedFileId != null && previewedMaterialByField.get(item.index) === selectedFileId);
     const checkboxHtml = item.status === 'matched' || item.status === 'pending'
       ? `<input type="checkbox" data-idx="${item.index}" ${item.checked ? 'checked' : ''} ${materialPreviewed ? '' : 'disabled'} />`
       : `<input type="checkbox" data-idx="${item.index}" disabled />`;
 
-    const statusHtml = getStatusHtml(item);
+    const statusHtml = existingWebsiteMaterial && previewedExistingMaterialFields.has(item.index)
+      ? '<span class="status-tag verified">已预览</span>'
+      : getStatusHtml(item);
     const candidates = item.match?.fileCandidates ?? [];
     const valueHtml = item.kind === 'file'
       ? `<span class="field-value material-match-value">
@@ -907,6 +983,7 @@ function renderResult(scanResp: ScanResponse) {
               </select>`
             : `<span title="${escapeAttr(item.value)}">${escapeHtml(item.value)}</span>`}
           ${item.match?.fileRecordId != null ? `<button type="button" class="material-preview-btn" data-index="${item.index}" data-file-id="${item.match.fileRecordId}">预览材料</button>` : ''}
+          ${existingWebsiteMaterial ? `<button type="button" class="material-preview-btn material-existing-preview-btn" data-index="${item.index}">预览网页现有材料</button>` : ''}
         </span>`
       : `<span class="field-value" title="${escapeAttr(item.value)}">${escapeHtml(item.value)}</span>`;
 
@@ -956,7 +1033,15 @@ function renderResult(scanResp: ScanResponse) {
   list.querySelectorAll<HTMLButtonElement>('.material-preview-btn').forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
+      if (button.classList.contains('material-existing-preview-btn')) return;
       previewMaterial(Number(button.dataset.index), Number(button.dataset.fileId));
+    });
+  });
+
+  list.querySelectorAll<HTMLButtonElement>('.material-existing-preview-btn').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void previewExistingMaterial(Number(button.dataset.index));
     });
   });
 
@@ -1076,24 +1161,20 @@ function getMaterialReviewState(): {
   unpreviewed: number;
   canConfirm: boolean;
 } {
-  const materialItems = displayItems.filter((item) => item.kind === 'file');
-  const missingRequired = fields.filter((field) => (
-    field.kind === 'file' && field.required && !isMeaningfullyFilled(field)
-  )).length;
-  const reviewTargets = materialItems.filter((item) => {
-    if (item.match?.fileRecordId == null) return false;
-    const field = fields.find((candidate) => candidate.index === item.index);
-    return Boolean(field && isMeaningfullyFilled(field));
-  });
-  const unpreviewed = reviewTargets.filter((item) => (
-    previewedMaterialByField.get(item.index) !== item.match?.fileRecordId
-  )).length;
-  return {
-    materialMode: materialItems.length > 0,
-    missingRequired,
-    unpreviewed,
-    canConfirm: isMaterialReviewPause(autoRunStatus) && missingRequired === 0 && unpreviewed === 0,
-  };
+  const items = fields
+    .filter((field) => field.kind === 'file')
+    .map((field) => ({
+      index: field.index,
+      required: Boolean(field.required),
+      filled: isMeaningfullyFilled(field),
+      fileRecordId: displayItems.find((item) => item.index === field.index)?.match?.fileRecordId,
+    }));
+  return computeMaterialReviewState(
+    items,
+    previewedMaterialByField,
+    previewedExistingMaterialFields,
+    isMaterialReviewPause(autoRunStatus),
+  );
 }
 
 async function confirmMaterialsAndResume(): Promise<void> {

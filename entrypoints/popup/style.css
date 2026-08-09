@@ -473,7 +473,11 @@ body {
   cursor: pointer;
 }
 
+.material-preview-question,
 .material-preview-name {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   overflow: hidden;
   padding: 7px 10px;
   color: #52667d;
@@ -481,6 +485,24 @@ body {
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.material-preview-question {
+  border-bottom: 1px solid #e6ebf2;
+  color: #1f3147;
+  background: #fff;
+  white-space: normal;
+}
+
+.material-preview-question span,
+.material-preview-name span {
+  flex: 0 0 auto;
+  color: #7b8a9d;
+  font-size: 10px;
+}
+
+.material-preview-question strong {
+  overflow-wrap: anywhere;
 }
 
 .material-preview-body {

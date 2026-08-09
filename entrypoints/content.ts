@@ -1,6 +1,8 @@
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
+import { waitForPageTransition } from '@/utils/navigation-wait';
+import { inferImageMimeType } from '@/utils/image-mime';
 import { stableTargetId } from '@/utils/agent/page-snapshot';
 import type { AgentExecutionItem, AgentExecutionResult } from '@/utils/agent/executor';
 import { classifyObservedRepeatTable, extractAgentFieldRules } from '@/utils/agent/field-rules';
@@ -131,6 +133,7 @@ interface MarkPreviewMessage {
 }
 interface FocusFieldMessage { type: 'focusField'; index: number }
 interface FocusAgentTargetMessage { type: 'focusAgentTarget'; pageKey: string; targetId: string }
+interface GetExistingMaterialPreviewMessage { type: 'getExistingMaterialPreview'; index: number }
 interface GetPageMetaMessage { type: 'getPageMeta' }
 interface GetAuditPageSnapshotMessage { type: 'getAuditPageSnapshot' }
 interface ExecuteAgentActionsMessage {
@@ -138,7 +141,7 @@ interface ExecuteAgentActionsMessage {
   pageKey: string;
   items: AgentExecutionItem[];
 }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetExistingMaterialPreviewMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -761,16 +764,15 @@ function findSafeNextControl(): HTMLElement | null {
 async function advanceToNextStep(): Promise<{ clicked: boolean; advanced: boolean; reason: string }> {
   const control = findSafeNextControl();
   if (!control) return { clicked: false, advanced: false, reason: '已到最终审核页或未找到安全的下一步按钮' };
-  const before = nextPageSignature();
+  const before = { url: location.href, signature: nextPageSignature() };
   control.scrollIntoView({ behavior: 'smooth', block: 'center' });
   control.click();
 
-  for (let attempt = 0; attempt < 20; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    if (nextPageSignature() !== before) {
-      return { clicked: true, advanced: true, reason: '已进入下一页' };
-    }
-  }
+  const transition = await waitForPageTransition({
+    initial: before,
+    readCurrent: () => ({ url: location.href, signature: nextPageSignature() }),
+  });
+  if (transition.changed) return { clicked: true, advanced: true, reason: '已进入下一页' };
   return { clicked: true, advanced: false, reason: '页面没有切换，可能仍有校验项需要本人处理' };
 }
 
@@ -820,6 +822,65 @@ function getSemanticContainer(el: HTMLElement): HTMLElement {
   return findNearestSingleFieldContainer(el, findContextRoot(el));
 }
 
+function findExistingPreviewImage(input: HTMLInputElement): HTMLImageElement | undefined {
+  const container = getSemanticContainer(input);
+  return Array.from(container.querySelectorAll<HTMLImageElement>('img[src]')).find((image) => {
+    if (!isVisible(image)) return false;
+    const descriptor = `${image.alt} ${image.className} ${image.src}`.toLowerCase();
+    if (/logo|icon|captcha|verify|qrcode|二维码|验证码/.test(descriptor)) return false;
+    const rect = image.getBoundingClientRect();
+    const width = image.naturalWidth || rect.width;
+    const height = image.naturalHeight || rect.height;
+    return width >= 60 && height >= 60;
+  });
+}
+
+async function getExistingMaterialPreview(index: number): Promise<{
+  ok: boolean;
+  dataUrl: string;
+  mimeType: string;
+  evidence: string;
+  error?: string;
+}> {
+  if (!elementMap.has(index)) scanFields();
+  const input = elementMap.get(index);
+  if (!(input instanceof HTMLInputElement) || input.type !== 'file') {
+    return { ok: false, dataUrl: '', mimeType: '', evidence: '', error: '上传项已不在当前页面' };
+  }
+  const evidence = findExistingFileEvidence(input);
+  const image = findExistingPreviewImage(input);
+  if (!image) {
+    return { ok: true, dataUrl: '', mimeType: '', evidence: evidence || '网页已有材料' };
+  }
+  const source = image.currentSrc || image.src;
+  if (source.startsWith('data:image/')) {
+    return { ok: true, dataUrl: source, mimeType: source.slice(5, source.indexOf(';')) || 'image/*', evidence };
+  }
+  try {
+    const response = await fetch(source, { credentials: 'include', cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    if (blob.size > 3 * 1024 * 1024) {
+      return { ok: true, dataUrl: '', mimeType: blob.type, evidence };
+    }
+    const declaredType = blob.type.toLowerCase();
+    const mimeType = declaredType.startsWith('image/')
+      ? declaredType
+      : inferImageMimeType(new Uint8Array(await blob.slice(0, 16).arrayBuffer()));
+    if (!mimeType) return { ok: true, dataUrl: '', mimeType: blob.type, evidence };
+    const previewBlob = blob.type === mimeType ? blob : new Blob([blob], { type: mimeType });
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(previewBlob);
+    });
+    return { ok: true, dataUrl, mimeType, evidence };
+  } catch {
+    return { ok: true, dataUrl: '', mimeType: '', evidence };
+  }
+}
+
 function findExistingFileEvidence(input: HTMLInputElement): string {
   const selectedName = Array.from(input.files ?? []).map((file) => file.name).filter(Boolean).join(', ');
   if (selectedName) return selectedName;
@@ -836,15 +897,7 @@ function findExistingFileEvidence(input: HTMLInputElement): string {
   const explicitStatus = text.match(/(?:文件|材料|附件)?已上传|上传成功/);
   if (explicitStatus) return explicitStatus[0];
 
-  const previewImage = Array.from(container.querySelectorAll<HTMLImageElement>('img[src]')).find((image) => {
-    if (!isVisible(image)) return false;
-    const descriptor = `${image.alt} ${image.className} ${image.src}`.toLowerCase();
-    if (/logo|icon|captcha|verify|qrcode|二维码|验证码/.test(descriptor)) return false;
-    const rect = image.getBoundingClientRect();
-    const width = image.naturalWidth || rect.width;
-    const height = image.naturalHeight || rect.height;
-    return width >= 60 && height >= 60;
-  });
+  const previewImage = findExistingPreviewImage(input);
   return previewImage ? '已上传图片' : '';
 }
 
@@ -1960,6 +2013,14 @@ export default defineContentScript({
           sendResponse({ ok: focusField(message.index) });
         } else if (message.type === 'focusAgentTarget') {
           sendResponse({ ok: focusAgentTarget(message.pageKey, message.targetId) });
+        } else if (message.type === 'getExistingMaterialPreview') {
+          getExistingMaterialPreview(message.index).then(sendResponse).catch(() => sendResponse({
+            ok: false,
+            dataUrl: '',
+            mimeType: '',
+            evidence: '',
+            error: '无法读取网页现有材料',
+          }));
         } else if (message.type === 'fill') {
           fillFields(message.items).then(sendResponse).catch(() => sendResponse({ success: 0, failure: message.items.length }));
         } else if (message.type === 'executeAgentActions') {

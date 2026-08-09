@@ -199,6 +199,9 @@ assert.equal(byIndex.get(22)?.value, '202706');
 assert.equal(isPageValueConsistent('138****0000', '13800000000'), true);
 assert.equal(isPageValueConsistent('2005-01-08', '20050108'), true);
 assert.equal(isPageValueConsistent('202706', '2027年6月'), true);
+assert.equal(isPageValueConsistent('2025-12', '2025年十二月'), true);
+assert.equal(isPageValueConsistent('2025-04', '2025年四月'), true);
+assert.equal(isPageValueConsistent('2025-11', '2025年十一月'), true);
 assert.equal(isPageValueConsistent('156****5006', '15900005006'), false);
 assert.equal(isPageValueConsistent('370724 山东省测试县', '山东省测试县', true), true);
 assert.equal(

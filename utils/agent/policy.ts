@@ -1,4 +1,5 @@
 import type { AgentSourceRecord } from './profile-retriever';
+import { isPageValueConsistent } from '../value-compare';
 import type {
   AgentFieldRow,
   AgentPagePlan,
@@ -46,6 +47,18 @@ function normalized(value: string | undefined): string {
   return (value ?? '').replace(/\s+/g, ' ').trim();
 }
 
+function isOptionalRepeatField(field: AgentTargetField): boolean {
+  if (field.required) return false;
+  const label = normalized(field.label || field.columnId)
+    .replace(/[（(].*?[)）]/g, '')
+    .replace(/[：:＊*]+$/g, '');
+  return /^(?:备注|附注|说明|补充(?:说明|信息)?|其他(?:说明|信息)?)$/.test(label);
+}
+
+function rowCompletenessFields(row: AgentFieldRow): AgentTargetField[] {
+  return row.fields.filter((field) => !field.protected && !isOptionalRepeatField(field));
+}
+
 export function deriveAgentFieldStatus(
   field: AgentTargetField,
   plannedValue: string | undefined,
@@ -60,10 +73,10 @@ export function deriveAgentFieldStatus(
     return { status: 'review', marker: 'review', canOverwrite: false, observedValue: observed, plannedValue: planned };
   }
   if (observed) {
-    if (planned && observed === planned) {
+    if (planned && isPageValueConsistent(observed, planned)) {
       return { status: 'verified', marker: 'verified', canOverwrite: true, observedValue: observed, plannedValue: planned };
     }
-    if (previous && observed === previous) {
+    if (previous && isPageValueConsistent(observed, previous)) {
       return { status: 'verified', marker: 'verified', canOverwrite: true, observedValue: observed, plannedValue: planned };
     }
     return { status: 'manual', marker: 'manual', canOverwrite: false, observedValue: observed, plannedValue: planned };
@@ -79,7 +92,7 @@ export function deriveAgentRowStatus(
   plannedValues: Record<string, string>,
   observedValues: Record<string, string>,
 ): AgentRowStatus {
-  const usableFields = row.fields.filter((field) => !field.protected);
+  const usableFields = rowCompletenessFields(row);
   const values = usableFields.map((field) => normalized(observedValues[field.targetId] || plannedValues[field.targetId]));
   const populated = values.filter(Boolean).length;
   const missingTargetIds = usableFields
@@ -124,9 +137,12 @@ function targetIndex(snapshot: AgentPageSnapshot): Map<string, TargetLocation> {
   return result;
 }
 
+function expectsYearMonth(field: AgentTargetField): boolean {
+  return field.formatHints.some((hint) => /\d{4}-\d{1,2}|yyyy-mm/i.test(hint));
+}
+
 function normalizeDateForField(value: string, field: AgentTargetField): string | null {
-  const expectsYearMonth = field.formatHints.some((hint) => /\d{4}-\d{1,2}|yyyy-mm/i.test(hint));
-  if (!expectsYearMonth) return value;
+  if (!expectsYearMonth(field)) return value;
   const match = value.match(/(\d{4})\D{0,3}(\d{1,2})(?:\D|$)/);
   if (!match) return null;
   const month = Number(match[2]);
@@ -136,6 +152,18 @@ function normalizeDateForField(value: string, field: AgentTargetField): string |
 
 function normalizePlannedValue(value: AgentPlannedValue, field: AgentTargetField): string | null {
   let result = normalized(value.value);
+  const semanticLabel = normalized(field.label || field.columnId).replace(/[（(].*$/, '');
+  if (/^地点$/.test(semanticLabel)) {
+    if (/^(?:市级|省级|校级|院级|国家级|国际级|全国级)$/.test(result)) return null;
+    const directional = result.match(/^(华东|华北|华南|东北|西北|西南|中南)(?:区域赛|地区赛|赛区|区域)$/)?.[1];
+    if (directional) result = `${directional}地区`;
+    const province = result.match(/^(北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|内蒙古|广西|西藏|宁夏|新疆|香港|澳门|台湾)赛区$/)?.[1];
+    if (province) {
+      result = ['北京', '天津', '上海', '重庆', '香港', '澳门'].includes(province)
+        ? `${province}市`
+        : `${province}省`;
+    }
+  }
   for (const character of field.forbiddenCharacters) result = result.split(character).join('');
   result = normalized(result);
   const dateValue = normalizeDateForField(result, field);
@@ -183,6 +211,7 @@ export function validateAgentPlan(
     const values = actionValues(action);
     let rejected = !source;
     const normalizedValues: AgentPlannedValue[] = [];
+    const preservedTargetIds = new Set<string>();
 
     if (!source) reviewItems.push(reviewItem(action.actionId, undefined, '计划引用的资料记录不存在'));
     for (const value of values) {
@@ -206,6 +235,13 @@ export function validateAgentPlan(
       }
       const normalizedValue = normalizePlannedValue(value, location.field);
       if (normalizedValue == null) {
+        const observed = normalized(context.observedValues[value.targetId]);
+        if (action.type === 'fill_row' && observed && expectsYearMonth(location.field)) {
+          preservedTargetIds.add(value.targetId);
+          manualTargets.add(value.targetId);
+          reviewItems.push(reviewItem(action.actionId, value.targetId, '网页已有日期缺少月份，保留现值并在最终审核中确认'));
+          continue;
+        }
         rejected = true;
         reviewItems.push(reviewItem(action.actionId, value.targetId, '计划值不符合网页格式、选项或长度限制'));
         continue;
@@ -231,21 +267,26 @@ export function validateAgentPlan(
     if (action.type === 'fill_row') {
       const group = context.snapshot.groups.find((item) => item.groupId === action.groupId);
       const row = group?.rows.find((item) => item.rowIndex === action.rowIndex);
-      const expectedTargetIds = row?.fields.filter((field) => !field.protected).map((field) => field.targetId) ?? [];
+      const expectedTargetIds = row ? rowCompletenessFields(row).map((field) => field.targetId) : [];
       const plannedTargetIds = new Set(values.map((value) => value.targetId));
-      const missingColumns = expectedTargetIds.filter((targetId) => !plannedTargetIds.has(targetId));
+      const missingColumns = expectedTargetIds.filter((targetId) => (
+        !plannedTargetIds.has(targetId) && !normalized(context.observedValues[targetId])
+      ));
       if (missingColumns.length > 0) {
         rejected = true;
         reviewItems.push(reviewItem(action.actionId, undefined, `整行计划缺少 ${missingColumns.length} 个列值`));
       }
     }
 
-    if (rejected || normalizedValues.length !== values.length) {
+    if (rejected || normalizedValues.length + preservedTargetIds.size !== values.length) {
       rejectedActionIds.push(action.actionId);
       continue;
     }
-    if (action.type === 'fill_row') executableActions.push({ ...action, values: normalizedValues });
-    else executableActions.push({ ...action, ...normalizedValues[0] });
+    if (action.type === 'fill_row') {
+      if (normalizedValues.length > 0) executableActions.push({ ...action, values: normalizedValues });
+    } else {
+      executableActions.push({ ...action, ...normalizedValues[0] });
+    }
   }
 
   return {
@@ -254,6 +295,32 @@ export function validateAgentPlan(
     manualTargets: [...manualTargets],
     rejectedActionIds,
   };
+}
+
+export function blockingAgentReviewItems(
+  plan: AgentPagePlan,
+  snapshot: AgentPageSnapshot,
+  reviewItems: AgentReviewItem[],
+  executableActionIds: ReadonlySet<string> = new Set(),
+  executableTargetIds: ReadonlySet<string> = new Set(),
+): AgentReviewItem[] {
+  if (reviewItems.length === 0) return [];
+  const fields = snapshot.groups.flatMap((group) => group.fields);
+  const populatedTargetIds = new Set(fields
+    .filter((field) => normalized(field.currentValue))
+    .map((field) => field.targetId));
+  const blockingItems = reviewItems.filter((item) => (
+    (!item.actionId || !executableActionIds.has(item.actionId))
+    && (!item.targetId || !executableTargetIds.has(item.targetId))
+    && (!item.targetId || !populatedTargetIds.has(item.targetId))
+  ));
+  if (blockingItems.length === 0) return [];
+  const isBlankOptionalPage = (
+    plan.actions.length === 0 &&
+    blockingItems.every((item) => !item.targetId) &&
+    fields.every((field) => !field.required && !normalized(field.currentValue))
+  );
+  return isBlankOptionalPage ? [] : blockingItems;
 }
 
 export interface CanAgentAdvanceInput {
@@ -277,4 +344,3 @@ export function canAgentAdvance(input: CanAgentAdvanceInput): boolean {
   }
   return /下一步|继续|保存并继续|保存并下一步/.test(normalized(input.nextActionLabel));
 }
-

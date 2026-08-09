@@ -5,7 +5,7 @@ import {
   agentFingerprint,
   requestAgentPagePlan,
 } from '../utils/agent/planner';
-import { BAOTIAN_PAGE_PLAN_SCHEMA } from '../utils/agent/planner-prompt';
+import { BAOTIAN_PAGE_PLAN_SCHEMA, buildAgentPlannerPrompt } from '../utils/agent/planner-prompt';
 import type { AgentPageSnapshot } from '../utils/agent/types';
 import type { AgentSourceRecord } from '../utils/agent/profile-retriever';
 import type { ApiConfig } from '../utils/storage';
@@ -75,6 +75,18 @@ const records: AgentSourceRecord[] = [{
   searchText: '姓名: 测试同学',
 }];
 
+const naturalCompositionPrompt = buildAgentPlannerPrompt({
+  snapshot,
+  sourceRecords: records,
+  snapshotFingerprint: agentFingerprint(snapshot),
+  profileFingerprint: agentFingerprint(records),
+});
+assert.match(naturalCompositionPrompt, /先理解整道题和同一行各列的分工/);
+assert.match(naturalCompositionPrompt, /不要套用固定的括号拼接模板/);
+assert.match(naturalCompositionPrompt, /避免重复已经写入同一行其他列的信息/);
+assert.match(naturalCompositionPrompt, /先判断名称表示项目、作品、团队、个人奖项还是荣誉称号/);
+assert.match(naturalCompositionPrompt, /队名不要强行添加“项目”/);
+
 const planObject = {
   version: 1,
   pageKey: snapshot.pageKey,
@@ -119,6 +131,28 @@ try {
     /输出 JSON Schema/,
     'plain JSON planning must include the strict schema for local validation',
   );
+
+  let semanticPlanAttempts = 0;
+  const repairedPlan = await requestAgentPagePlan(
+    { snapshot, sourceRecords: records },
+    responsesConfig,
+    {
+      requestText: async (_config, prompt) => {
+        semanticPlanAttempts += 1;
+        const wirePageKey = prompt.match(/"pageKey":"(page_fp_[^"]+)"/)?.[1] ?? '';
+        return JSON.stringify({
+          ...planObject,
+          pageKey: wirePageKey,
+          actions: [{
+            ...planObject.actions[0],
+            sourceRecordId: semanticPlanAttempts === 1 ? 'missing-record:9' : 'basic_fields:0',
+          }],
+        });
+      },
+    },
+  );
+  assert.equal(semanticPlanAttempts, 2, 'a semantically invalid model plan must receive one focused repair attempt');
+  assert.equal(repairedPlan.actions[0].type, 'fill_field');
 
   const longPageKeySnapshot: AgentPageSnapshot = {
     ...snapshot,
@@ -250,6 +284,41 @@ try {
   assert.deepEqual(chunkProgress, Array.from({ length: 9 }, (_, index) => [index + 1, 9]));
   assert.equal(largePlan.snapshotFingerprint, agentFingerprint(largeSnapshot));
   assert.equal(largePlan.profileFingerprint, agentFingerprint(largeRecords));
+
+  const savedChunks = new Map<string, any>();
+  let durableChunkRequests = 0;
+  const durableRequest = async (_config: ApiConfig, prompt: string): Promise<string> => {
+    durableChunkRequests += 1;
+    if (durableChunkRequests === 3) throw new Error('relay overloaded');
+    return JSON.stringify({
+      version: 1,
+      pageKey: prompt.match(/"pageKey":"(page_fp_[^"]+)"/)?.[1] ?? '',
+      snapshotFingerprint: prompt.match(/snapshotFingerprint=(fp_[a-z0-9]+)/)?.[1] ?? '',
+      profileFingerprint: prompt.match(/profileFingerprint=(fp_[a-z0-9]+)/)?.[1] ?? '',
+      actions: [],
+      reviewItems: [],
+    });
+  };
+  const durableOptions = {
+    requestText: durableRequest,
+    loadChunkPlan: async (chunk: { chunkId: string }) => savedChunks.get(chunk.chunkId) ?? null,
+    saveChunkPlan: async (chunk: { chunkId: string }, chunkPlan: unknown) => {
+      savedChunks.set(chunk.chunkId, structuredClone(chunkPlan));
+    },
+  };
+  await assert.rejects(
+    () => requestAgentPagePlan({ snapshot: largeSnapshot, sourceRecords: largeRecords }, responsesConfig, durableOptions),
+    /relay overloaded/,
+  );
+  assert.equal(savedChunks.size, 2, 'completed planning chunks must be saved before a later relay failure');
+  const resumedLargePlan = await requestAgentPagePlan(
+    { snapshot: largeSnapshot, sourceRecords: largeRecords },
+    responsesConfig,
+    durableOptions,
+  );
+  assert.equal(resumedLargePlan.actions.length, 0);
+  assert.equal(durableChunkRequests, 10, 'resuming nine chunks after the third request fails must reuse the first two chunks');
+  assert.equal(savedChunks.size, 9);
 
   let receivedSignal = false;
   globalThis.fetch = async (_input, init) => {

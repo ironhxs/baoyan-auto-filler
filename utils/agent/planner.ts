@@ -1,9 +1,10 @@
 import { requestModelText } from '../matcher';
 import type { ApiConfig } from '../storage';
-import { parseAgentPagePlan } from './planner-response';
+import { AgentPlanValidationError, parseAgentPagePlan } from './planner-response';
 import {
   createAgentPlanningChunks,
   mergeAgentChunkPlans,
+  type AgentPlanningChunk,
   type AgentPlanningInput,
 } from './planner-chunks';
 import { buildAgentPlannerPrompt } from './planner-prompt';
@@ -19,6 +20,8 @@ export interface RequestAgentPagePlanInput {
 export interface RequestAgentPagePlanOptions {
   requestText?: typeof requestModelText;
   onChunkProgress?(completed: number, total: number): void | Promise<void>;
+  loadChunkPlan?(chunk: AgentPlanningChunk, index: number, total: number): Promise<AgentPagePlan | null>;
+  saveChunkPlan?(chunk: AgentPlanningChunk, plan: AgentPagePlan, index: number, total: number): Promise<void>;
 }
 
 function canonicalJson(value: unknown): string {
@@ -70,19 +73,32 @@ async function requestSingleAgentPagePlan(
     ...input.snapshot,
     pageKey: `page_${snapshotFingerprint}`,
   };
-  const prompt = buildAgentPlannerPrompt({
+  const basePrompt = buildAgentPlannerPrompt({
     ...input,
     snapshot: wireSnapshot,
     snapshotFingerprint,
     profileFingerprint,
   }, { includeSchema: true });
-  const text = await requestText(apiConfig, prompt, { stream: true });
-  const parsed = validateFingerprints(parseAgentPagePlan(text, {
-    snapshot: wireSnapshot,
-    sourceRecords: input.sourceRecords,
-    fileRecordIds: input.fileRecordIds,
-  }), snapshotFingerprint, profileFingerprint);
-  return { ...parsed, pageKey: input.snapshot.pageKey };
+  let prompt = basePrompt;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const text = await requestText(apiConfig, prompt, { stream: true });
+    try {
+      const parsed = validateFingerprints(parseAgentPagePlan(text, {
+        snapshot: wireSnapshot,
+        sourceRecords: input.sourceRecords,
+        fileRecordIds: input.fileRecordIds,
+      }), snapshotFingerprint, profileFingerprint);
+      return { ...parsed, pageKey: input.snapshot.pageKey };
+    } catch (error) {
+      if (!(error instanceof AgentPlanValidationError) || attempt > 0) throw error;
+      prompt = [
+        basePrompt,
+        '上一版计划未通过本地语义校验。只修正 JSON 计划，不要解释，也不要放宽事实证据或安全边界。',
+        `校验错误：${error.message.slice(0, 500)}`,
+      ].join('\n\n');
+    }
+  }
+  throw new Error('Agent plan repair attempt did not return a valid plan');
 }
 
 export async function requestAgentPagePlan(
@@ -114,8 +130,17 @@ export async function requestAgentPagePlan(
   }
 
   const plans: AgentPagePlan[] = [];
-  for (const chunk of chunks) {
-    plans.push(await requestSingleAgentPagePlan(chunk, apiConfig, options.requestText ?? requestModelText));
+  for (const [index, chunk] of chunks.entries()) {
+    const cachedChunk = await options.loadChunkPlan?.(chunk, index, chunks.length) ?? null;
+    const plan = cachedChunk
+      ? validateFingerprints(
+          cachedChunk,
+          agentFingerprint(chunk.snapshot),
+          agentFingerprint(chunk.sourceRecords),
+        )
+      : await requestSingleAgentPagePlan(chunk, apiConfig, options.requestText ?? requestModelText);
+    plans.push(plan);
+    if (!cachedChunk) await options.saveChunkPlan?.(chunk, plan, index, chunks.length);
     await options.onChunkProgress?.(plans.length, chunks.length);
   }
   return validateFingerprints(

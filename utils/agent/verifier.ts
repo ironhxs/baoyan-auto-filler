@@ -2,6 +2,7 @@ import type { AgentExecutionResult } from './executor';
 import { deriveAgentRowStatus } from './policy';
 import type { AgentFieldStatusName, AgentRowStatus } from './policy';
 import type { AgentPagePlan, AgentPageSnapshot, AgentPlannedValue } from './types';
+import { isPageValueConsistent } from '../value-compare';
 
 export interface VerifyAgentExecutionInput {
   plan: AgentPagePlan;
@@ -55,12 +56,14 @@ export function verifyAgentExecution(input: VerifyAgentExecutionInput): AgentVer
       if (/target-not-found|page-changed|stale-target/.test(execution.reason)) retryableTargetIds.push(targetId);
       continue;
     }
-    if (after === expectedValue && expectedValue) {
+    if (expectedValue && isPageValueConsistent(after, expectedValue)) {
       fieldStatuses[targetId] = 'verified';
       continue;
     }
-    const preservedManualValue = before && after === before && before !== expectedValue
-      && (!previous || before !== previous);
+    const preservedManualValue = before
+      && isPageValueConsistent(after, before)
+      && !isPageValueConsistent(before, expectedValue)
+      && (!previous || !isPageValueConsistent(before, previous));
     if (preservedManualValue) {
       fieldStatuses[targetId] = 'manual';
       continue;

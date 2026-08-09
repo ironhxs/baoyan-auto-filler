@@ -88,6 +88,19 @@ const verified = verifyAgentExecution({
 assert.deepEqual(Object.values(verified.fieldStatuses), ['verified', 'verified', 'verified']);
 assert.equal(verified.rowStatuses[0].status, 'complete');
 
+const formattedDateVerified = verifyAgentExecution({
+  plan,
+  snapshot,
+  beforeValues: { ...expected, 'time-target': '2026年1月' },
+  afterValues: { ...expected, 'time-target': '2026年1月' },
+  lastAgentValues: {},
+});
+assert.equal(
+  formattedDateVerified.fieldStatuses['time-target'],
+  'verified',
+  'readback using the website date display format must verify against the normalized plan value',
+);
+
 const partial = verifyAgentExecution({
   plan,
   snapshot,
