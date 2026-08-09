@@ -144,6 +144,7 @@ export interface AgentCheckpoint {
   results: AgentActionResult[];
   retries: Record<string, number>;
   manualOverrides: Record<string, string>;
+  cached?: boolean;
   error?: string;
   updatedAt: number;
 }

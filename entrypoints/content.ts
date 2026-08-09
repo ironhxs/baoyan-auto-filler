@@ -130,6 +130,7 @@ interface MarkPreviewMessage {
   items: Array<{ index: number; fingerprint?: string; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
 }
 interface FocusFieldMessage { type: 'focusField'; index: number }
+interface FocusAgentTargetMessage { type: 'focusAgentTarget'; pageKey: string; targetId: string }
 interface GetPageMetaMessage { type: 'getPageMeta' }
 interface GetAuditPageSnapshotMessage { type: 'getAuditPageSnapshot' }
 interface ExecuteAgentActionsMessage {
@@ -137,7 +138,7 @@ interface ExecuteAgentActionsMessage {
   pageKey: string;
   items: AgentExecutionItem[];
 }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
+type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -1737,6 +1738,15 @@ async function fillFields(items: FillItem[]): Promise<FillResult> {
   return { success, failure };
 }
 
+function focusAgentTarget(pageKey: string, targetId: string): boolean {
+  if (getPageMeta().signature !== pageKey) return false;
+  const latestFields = scanFields();
+  const target = latestFields.find((result) => (
+    stableTargetId(pageKey, { ...result.field, index: result.index }) === targetId
+  ));
+  return target ? focusField(target.index) : false;
+}
+
 async function executeAgentActions(
   pageKey: string,
   items: AgentExecutionItem[],
@@ -1948,6 +1958,8 @@ export default defineContentScript({
           sendResponse({ ok: true, marked: markPreviewFields(message.items) });
         } else if (message.type === 'focusField') {
           sendResponse({ ok: focusField(message.index) });
+        } else if (message.type === 'focusAgentTarget') {
+          sendResponse({ ok: focusAgentTarget(message.pageKey, message.targetId) });
         } else if (message.type === 'fill') {
           fillFields(message.items).then(sendResponse).catch(() => sendResponse({ success: 0, failure: message.items.length }));
         } else if (message.type === 'executeAgentActions') {

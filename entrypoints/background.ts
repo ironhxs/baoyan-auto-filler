@@ -78,6 +78,8 @@ import { buildAgentExecutionBatch } from '@/utils/agent/executor';
 import type { AgentExecutionResult } from '@/utils/agent/executor';
 import { verifyAgentExecution } from '@/utils/agent/verifier';
 import { runAgentPage } from '@/utils/agent/runtime';
+import { applyAgentControl } from '@/utils/agent/control';
+import type { AgentControlCommand } from '@/utils/agent/control';
 import type {
   AgentActionResult,
   AgentCheckpoint,
@@ -103,6 +105,8 @@ interface MessageMap {
     items: PageMarkerItem[];
   };
   focusPageField: { index: number };
+  focusAgentTarget: { pageKey: string; targetId: string };
+  controlPageAgent: { command: AgentControlCommand };
   startAutoRun: undefined;
   getAutoRunStatus: undefined;
   stopAutoRun: undefined;
@@ -1291,6 +1295,12 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'focusPageField') {
     return handleFocusPageField(request.payload!.index);
   }
+  if (request.type === 'focusAgentTarget') {
+    return handleFocusAgentTarget(request.payload!);
+  }
+  if (request.type === 'controlPageAgent') {
+    return handleControlPageAgent(request.payload!.command);
+  }
   if (request.type === 'startAutoRun') {
     return handleStartAutoRun();
   }
@@ -1490,6 +1500,31 @@ async function handleFocusPageField(index: number): Promise<Response> {
   return { ok: true, type: 'pageAction' };
 }
 
+async function handleFocusAgentTarget(payload: { pageKey: string; targetId: string }): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const result = await sendToContentScript<{ ok: boolean }>(tab.id, {
+    type: 'focusAgentTarget',
+    pageKey: payload.pageKey,
+    targetId: payload.targetId,
+  });
+  return result?.ok ? { ok: true, type: 'pageAction' } : errorResponse('Agent target is no longer on this page');
+}
+
+async function handleControlPageAgent(command: AgentControlCommand): Promise<Response> {
+  const tab = await getCurrentTab();
+  if (!tab?.id) return errorResponse('No active tab found');
+  const state = await getAutoRunState(tab.id);
+  if (!state?.agent) return errorResponse('Current page has no Agent checkpoint');
+  state.agent = applyAgentControl(state.agent, command);
+  state.status = 'running';
+  state.pauseReason = undefined;
+  state.message = command === 'replan_page' ? 'Agent 正在重新读取并规划本页' : 'Agent 正在重试失败项';
+  await saveAutoRunState(state);
+  void processAutoRun(tab.id);
+  return autoRunResponse(state);
+}
+
 async function handleGetAutoRunStatus(): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
@@ -1525,6 +1560,7 @@ async function handleStartAutoRun(): Promise<Response> {
     updatedAt: Date.now(),
     history: previous?.status === 'paused' ? previous.history : [],
     confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
+    agent: previous?.status === 'paused' ? previous.agent : undefined,
   };
   await saveAutoRunState(state);
   void processAutoRun(tab.id);
@@ -1546,6 +1582,7 @@ async function handleStopAutoRun(): Promise<Response> {
     updatedAt: Date.now(),
     history: previous?.history ?? [],
     confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
+    agent: previous?.agent,
   };
   await saveAutoRunState(state);
   return autoRunResponse(state);
@@ -2126,7 +2163,7 @@ async function runAgentForScan(
     },
   }, state.agent);
 
-  state.agent = outcome.checkpoint;
+  state.agent = { ...outcome.checkpoint, cached };
   const targetActions = outcome.checkpoint.plan ? agentPlanTargetActions(outcome.checkpoint.plan) : new Map();
   const fieldsByTarget = new Map(lastAfterSnapshot.groups.flatMap((group) => group.fields)
     .map((field) => [field.targetId, field]));

@@ -12,6 +12,7 @@ import type { ApplicationTask } from '@/utils/application-tasks';
 import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
 import type { RepeatableRecordPlan } from '@/utils/repeatable-records';
 import { buildPopupTaskSummary } from '@/utils/audit-view-model';
+import { buildAgentViewModel } from '@/utils/agent/view-model';
 
 const app = document.getElementById('app')!;
 
@@ -314,6 +315,61 @@ function auditSummary(task: ApplicationTask | undefined): string {
   return `${critical} 个严重问题 · ${warning} 个需确认问题`;
 }
 
+function renderAgentTaskPanel(task: ApplicationTask | undefined): string {
+  const checkpoint = task?.runner?.agent;
+  const view = buildAgentViewModel(checkpoint);
+  if (!checkpoint || !view) return '';
+  const actionLabels = {
+    add_rows: '新增表格行',
+    fill_field: '填写字段',
+    fill_row: '整行填写',
+    select: '选择选项',
+    upload: '匹配材料',
+  } as const;
+  const actionCounts = new Map<string, number>();
+  for (const action of checkpoint.plan?.actions ?? []) {
+    const label = actionLabels[action.type];
+    actionCounts.set(label, (actionCounts.get(label) ?? 0) + 1);
+  }
+  const planRows = [...actionCounts.entries()]
+    .map(([label, count]) => `<span>${escapeHtml(label)} <b>${count}</b></span>`)
+    .join('');
+  const issueTargetId = checkpoint.results.find((result) => (
+    result.targetId && (result.status === 'failed' || result.status === 'review')
+  ))?.targetId;
+  return `
+    <section class="agent-task-panel ${view.phaseTone}">
+      <div class="agent-task-head">
+        <div><strong>保填 Agent 2.0</strong><span>页面级理解 · 整行执行 · 写后回读</span></div>
+        <em>${escapeHtml(view.phaseLabel)}</em>
+      </div>
+      <div class="agent-task-meta">
+        <span>计划 ${view.planned} 项</span>
+        ${view.cached ? '<span class="cache">已复用本页计划</span>' : '<span>本页新计划</span>'}
+        ${view.retries ? `<span>已修复 ${view.retries} 次</span>` : ''}
+      </div>
+      <div class="agent-task-metrics">
+        <span><b>${view.verified}</b>回读一致</span>
+        <span><b>${view.manual}</b>保留手工</span>
+        <span class="${view.review || view.pendingReview ? 'warning' : ''}"><b>${view.review + view.pendingReview}</b>待确认</span>
+        <span class="${view.failed ? 'danger' : ''}"><b>${view.failed}</b>失败</span>
+      </div>
+      ${view.error ? `<p class="agent-task-error">${escapeHtml(view.error)}</p>` : ''}
+      <details class="agent-plan-summary">
+        <summary>查看本页 Agent 计划</summary>
+        <div>${planRows || '<span>正在生成安全计划</span>'}</div>
+        <small>这里只展示动作类别和数量，不展示个人资料值或模型原始响应。</small>
+      </details>
+      <div class="agent-task-actions">
+        ${issueTargetId ? '<button type="button" id="locateAgentIssueBtn">定位问题字段</button>' : ''}
+        ${view.canRetry ? '<button type="button" id="retryAgentBtn">重试失败项</button>' : ''}
+        ${view.canReplan ? '<button type="button" id="replanAgentBtn">重新规划本页</button>' : ''}
+        ${task?.status === 'running' || task?.status === 'paused' ? '<button type="button" id="stopTaskAgentBtn" class="danger">停止任务</button>' : ''}
+      </div>
+    </section>
+  `;
+}
+
 function renderCurrentTaskSummary(): string {
   const summary = buildPopupTaskSummary(applicationTasks, currentTaskId);
   const current = summary.current;
@@ -338,6 +394,7 @@ function renderCurrentTaskSummary(): string {
         <span class="${current.materialNeedsReview ? 'warning' : ''}"><b>${current.materialNeedsReview}</b>材料待核</span>
       </div>
       <div class="last-audit-summary"><span>上次最终检查</span><strong>${escapeHtml(auditSummary(task))}</strong></div>
+      ${renderAgentTaskPanel(task)}
     </section>
   ` : '<section class="current-task-summary empty"><strong>当前网站尚未建立连续填写任务</strong><span>单页识别和快速填充仍可直接使用</span></section>';
   if (summary.batch.total === 0) return currentHtml;
@@ -399,10 +456,36 @@ function renderIdle(apiReady = true) {
   document.getElementById('resumeAutoRunBtn')?.addEventListener('click', startAutoRun);
   document.getElementById('reviewMaterialsBtn')?.addEventListener('click', startScan);
   document.getElementById('stopAutoRunBtn')?.addEventListener('click', stopAutoRun);
+  document.getElementById('stopTaskAgentBtn')?.addEventListener('click', stopAutoRun);
+  document.getElementById('retryAgentBtn')?.addEventListener('click', () => controlPageAgent('retry_failed'));
+  document.getElementById('replanAgentBtn')?.addEventListener('click', () => controlPageAgent('replan_page'));
+  document.getElementById('locateAgentIssueBtn')?.addEventListener('click', async () => {
+    const task = applicationTasks.find((item) => item.id === currentTaskId);
+    const checkpoint = task?.runner?.agent;
+    const result = checkpoint?.results.find((item) => (
+      item.targetId && (item.status === 'failed' || item.status === 'review')
+    ));
+    if (!checkpoint || !result?.targetId) return;
+    await sendRuntimeMessage({
+      type: 'focusAgentTarget',
+      payload: { pageKey: checkpoint.pageKey, targetId: result.targetId },
+    });
+  });
   document.getElementById('openAuditCenterBtn')?.addEventListener('click', async () => {
     const response = await sendRuntimeMessage<{ ok: boolean } | ErrorResponse>({ type: 'openAuditCenter' });
     if (response.ok) window.close();
   });
+}
+
+async function controlPageAgent(command: 'retry_failed' | 'replan_page'): Promise<void> {
+  const response = await sendRuntimeMessage<AutoRunResponse | ErrorResponse>({
+    type: 'controlPageAgent',
+    payload: { command },
+  });
+  if (!response.ok) return;
+  autoRunStatus = response;
+  await refreshApplicationTasks();
+  renderIdle(apiAvailable);
 }
 
 async function startAutoRun() {
