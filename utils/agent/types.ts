@@ -1,5 +1,25 @@
 export type AgentGroupKind = 'single' | 'repeatable' | 'aggregate' | 'material';
 
+export interface AgentApplicationIdentity {
+  institutionName: string;
+  departmentName: string;
+  projectName: string;
+}
+
+export interface AgentQuestionContext {
+  fullText: string;
+  annotations: string[];
+  dateExamples: string[];
+  forbiddenCharacters: string[];
+  maxLength?: number;
+}
+
+export interface AgentMaterialContext {
+  targetId: string;
+  questionText: string;
+  existingFiles: string[];
+}
+
 export interface AgentTargetField {
   targetId: string;
   index: number;
@@ -15,11 +35,25 @@ export interface AgentTargetField {
   formatHints: string[];
   forbiddenCharacters: string[];
   maxLength?: number;
+  questionText?: string;
+  annotations?: string[];
+  contextHtml?: string;
+  selectionMode?: string;
+}
+
+export interface CompleteAgentTargetField extends AgentTargetField {
+  questionText: string;
+  annotations: string[];
+  contextHtml: string;
 }
 
 export interface AgentFieldRow {
   rowIndex: number;
   fields: AgentTargetField[];
+}
+
+export interface CompleteAgentFieldRow extends Omit<AgentFieldRow, 'fields'> {
+  fields: CompleteAgentTargetField[];
 }
 
 export interface AgentFieldGroup {
@@ -31,14 +65,34 @@ export interface AgentFieldGroup {
   rows: AgentFieldRow[];
 }
 
+export interface CompleteAgentFieldGroup extends Omit<AgentFieldGroup, 'fields' | 'rows'> {
+  fields: CompleteAgentTargetField[];
+  rows: CompleteAgentFieldRow[];
+}
+
 export interface AgentPageSnapshot {
   pageKey: string;
   url: string;
   title: string;
   stepText: string;
   instructions: string[];
+  identity?: AgentApplicationIdentity;
+  questionContext?: AgentQuestionContext;
+  visiblePageText?: string[];
+  materials?: AgentMaterialContext[];
   groups: AgentFieldGroup[];
   capturedAt: number;
+}
+
+export interface CompleteAgentPageSnapshot extends Omit<
+  AgentPageSnapshot,
+  'identity' | 'questionContext' | 'visiblePageText' | 'materials' | 'groups'
+> {
+  identity: AgentApplicationIdentity;
+  questionContext: AgentQuestionContext;
+  visiblePageText: string[];
+  materials: AgentMaterialContext[];
+  groups: CompleteAgentFieldGroup[];
 }
 
 export interface AgentPlannedValue {

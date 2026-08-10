@@ -22,6 +22,7 @@ function awardField(
     placeholder: '',
     ariaLabel: '',
     context: '奖励情况（本科期间） 内容中不得含有 |、#',
+    html: '<section>奖励情况（本科期间）<script>alert("sensitive")</script></section>',
     value: '',
     options: [],
     required: true,
@@ -49,6 +50,12 @@ const snapshot = buildAgentPageSnapshot({
   title: '奖励情况（本科期间）',
   stepText: '已完成11步（共13步）',
   instructions: ['日期格式：2018-11', '内容中不得含有 |、#'],
+  visibleTexts: [
+    '复旦大学',
+    '计算机科学技术学院',
+    '2027年全国优秀大学生夏令营',
+  ],
+  profileInstitution: '合肥工业大学',
   fields,
   capturedAt: 123,
 });
@@ -61,6 +68,11 @@ assert.deepEqual(snapshot.groups[0].rows[0].fields[2].forbiddenCharacters, ['|',
 assert.equal(snapshot.groups[0].rows[0].fields[0].formatHints.includes('2018-11'), true);
 assert.notEqual(snapshot.groups[0].rows[0].fields[0].targetId, snapshot.groups[0].rows[1].fields[0].targetId);
 assert.equal(snapshot.capturedAt, 123);
+assert.equal(snapshot.identity.institutionName, '复旦大学');
+assert.equal(snapshot.identity.departmentName, '计算机科学技术学院');
+assert.equal(snapshot.questionContext.fullText.includes('内容中不得含有 |、#'), true);
+assert.equal(snapshot.groups[0].rows[0].fields[2].questionText.includes('奖励情况'), true);
+assert.equal(snapshot.groups[0].rows[0].fields[2].contextHtml.includes('<script'), false);
 
 const singleSnapshot = buildAgentPageSnapshot({
   pageKey: 'basic',
@@ -97,6 +109,54 @@ assert.deepEqual(singleSnapshot.groups[0].fields[0].options, ['测试同学']);
 assert.equal(singleSnapshot.groups[0].fields[0].placeholder, '请输入姓名');
 assert.equal(singleSnapshot.groups[0].fields[0].maxLength, 20);
 assert.deepEqual(singleSnapshot.groups[0].fields[0].forbiddenCharacters, ['#']);
+
+const sensitiveSnapshot = buildAgentPageSnapshot({
+  pageKey: 'security',
+  url: 'https://example.test/basic?access_token=TEST_ONLY_TOKEN&redirect=Authorization%3A%20Bearer%20TEST_ONLY_REDIRECT&view=1',
+  title: '基本信息',
+  instructions: ['Authorization: Bearer TEST_ONLY_AUTH'],
+  fields: [{
+    index: 10,
+    kind: 'text',
+    tag: 'input',
+    type: 'password',
+    name: 'password',
+    id: 'password',
+    label: '登录密码',
+    placeholder: '请输入密码',
+    ariaLabel: '登录密码',
+    context: '登录凭证',
+    value: 'TEST_ONLY_PASSWORD',
+  }, {
+    index: 11,
+    kind: 'text',
+    tag: 'textarea',
+    type: 'text',
+    name: 'note',
+    id: 'note',
+    label: '备注',
+    placeholder: '请输入备注',
+    ariaLabel: '备注',
+    context: '补充说明',
+    html: '<div data-authorization="Bearer TEST_ONLY_HTML">补充说明</div>',
+    value: '普通内容',
+  }, {
+    index: 12,
+    kind: 'text',
+    tag: 'input',
+    type: 'text',
+    name: 'operation',
+    id: 'operation',
+    label: '操作',
+    placeholder: '',
+    ariaLabel: '操作',
+    context: '付款卡号',
+    value: 'TEST_ONLY_PAYMENT',
+  }],
+});
+
+assert.equal(JSON.stringify(sensitiveSnapshot).includes('TEST_ONLY'), false);
+assert.deepEqual(sensitiveSnapshot.groups.flatMap((group) => group.fields).map((field) => field.label), ['备注']);
 
 const stableField = awardField(1, 0, '时间', { id: 'award-time-0' });
 assert.equal(
