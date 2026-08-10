@@ -11,6 +11,7 @@ dist/
 .chrome-profile/
 .playwright-cli/
 qa/
+.worktrees/
 
 # macOS
 .DS_Store
