@@ -70,6 +70,7 @@ import { buildAgentPageSnapshot } from '@/utils/agent/page-snapshot';
 import { retrieveAgentSourceRecords } from '@/utils/agent/profile-retriever';
 import { requestAgentPagePlan } from '@/utils/agent/planner';
 import {
+  AGENT_PROTOCOL_VERSION,
   createAgentPlanCacheKey,
   getAgentPlanCache,
   saveAgentPlanCache,
@@ -79,7 +80,7 @@ import { buildAgentExecutionBatch } from '@/utils/agent/executor';
 import type { AgentExecutionResult } from '@/utils/agent/executor';
 import { verifyAgentExecution } from '@/utils/agent/verifier';
 import { runAgentPage } from '@/utils/agent/runtime';
-import { applyAgentControl } from '@/utils/agent/control';
+import { agentCheckpointForPage, applyAgentControl } from '@/utils/agent/control';
 import type { AgentControlCommand } from '@/utils/agent/control';
 import { shouldPreferPageAgent } from '@/utils/agent/activation';
 import { requestAgentModelThroughBridge } from '@/utils/agent/model-bridge';
@@ -551,7 +552,18 @@ function markerStoreKey(tabId: number): string {
 async function getAutoRunState(tabId: number): Promise<AutoRunState | null> {
   const result = await chrome.storage.session.get(autoRunKey(tabId));
   const state = (result[autoRunKey(tabId)] as AutoRunState | undefined) ?? null;
-  return state ? { ...state, history: state.history ?? [] } : null;
+  if (!state) return null;
+  if (state.agent && state.agent.protocolVersion !== AGENT_PROTOCOL_VERSION) {
+    return {
+      ...state,
+      status: state.status === 'paused' ? 'stopped' : state.status,
+      pauseReason: undefined,
+      message: 'Agent 规划规则已升级，请重新开始当前页',
+      agent: undefined,
+      history: state.history ?? [],
+    };
+  }
+  return { ...state, history: state.history ?? [] };
 }
 
 async function saveAutoRunState(state: AutoRunState): Promise<void> {
@@ -2155,16 +2167,18 @@ async function runAgentForScan(
         }
         return [];
       }));
-      return {
+      const blockingReviewItems = blockingAgentReviewItems(
         plan,
+        snapshot,
+        validated.reviewItems,
+        new Set(validated.executableActions.map((action) => action.actionId)),
+        executableTargetIds,
+        sourceRecords.length > 0,
+      );
+      return {
         ...validated,
-        reviewItems: blockingAgentReviewItems(
-          plan,
-          snapshot,
-          validated.reviewItems,
-          new Set(validated.executableActions.map((action) => action.actionId)),
-          executableTargetIds,
-        ),
+        plan: { ...plan, reviewItems: blockingReviewItems },
+        reviewItems: blockingReviewItems,
       };
     },
     prepare: async (validated) => {
@@ -2352,6 +2366,7 @@ async function processAutoRun(tabId: number): Promise<void> {
       return;
     }
     const markers = buildPageMarkers(scan);
+    state.agent = agentCheckpointForPage(state.agent, scan.pageSignature, AGENT_PROTOCOL_VERSION);
     state.lastPageKey = semanticPageKey({
       url: scan.pageUrl,
       label: scan.pageLabel,

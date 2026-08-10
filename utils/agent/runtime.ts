@@ -1,4 +1,4 @@
-import { cloneAgentCheckpoint, updateAgentCheckpoint } from './cache';
+import { AGENT_PROTOCOL_VERSION, cloneAgentCheckpoint, updateAgentCheckpoint } from './cache';
 import type { ValidatedAgentPlan } from './policy';
 import type { AgentSourceRecord } from './profile-retriever';
 import type {
@@ -59,7 +59,8 @@ export interface AgentRunOutcome {
 }
 
 function initialCheckpoint(checkpoint?: AgentCheckpoint): AgentCheckpoint {
-  return checkpoint ? cloneAgentCheckpoint(checkpoint) : {
+  return checkpoint ? { ...cloneAgentCheckpoint(checkpoint), protocolVersion: AGENT_PROTOCOL_VERSION } : {
+    protocolVersion: AGENT_PROTOCOL_VERSION,
     pageKey: '',
     phase: 'observing',
     nextActionIndex: 0,
@@ -123,6 +124,7 @@ function mergeResults(
 
 function resetForPage(checkpoint: AgentCheckpoint, pageKey: string): AgentCheckpoint {
   return {
+    protocolVersion: AGENT_PROTOCOL_VERSION,
     pageKey,
     phase: 'observing',
     nextActionIndex: 0,
@@ -135,7 +137,11 @@ function resetForPage(checkpoint: AgentCheckpoint, pageKey: string): AgentCheckp
 
 function manualReviewReason(validated: AgentValidatedRunPlan): string {
   const count = validated.reviewItems.length + validated.rejectedActionIds.length;
-  return `Agent plan contains ${count} item(s) requiring manual review`;
+  const messages = validated.reviewItems.map((item) => item.message.trim()).filter(Boolean);
+  if (validated.rejectedActionIds.length > 0) {
+    messages.push(`${validated.rejectedActionIds.length} 个计划动作未通过本地安全校验`);
+  }
+  return `保填 Agent 需要人工确认（${count} 项）：${messages.slice(0, 3).join('；') || '存在无法安全自动处理的字段'}`;
 }
 
 export async function runAgentPage(
@@ -162,6 +168,8 @@ export async function runAgentPage(
     let plan = checkpoint.plan;
     checkpoint = await persist(deps, checkpoint, 'validating', { plan });
     let validated = deps.validate(plan, snapshot, records);
+    plan = validated.plan;
+    checkpoint = updateAgentCheckpoint(checkpoint, { plan, updatedAt: Date.now() });
 
     for (;;) {
       const pending = pendingValidatedPlan(validated, checkpoint.results);
@@ -235,6 +243,8 @@ export async function runAgentPage(
       }
       checkpoint = await persist(deps, checkpoint, 'validating', { plan });
       validated = deps.validate(plan, snapshot, records);
+      plan = validated.plan;
+      checkpoint = updateAgentCheckpoint(checkpoint, { plan, updatedAt: Date.now() });
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Agent runtime failed';

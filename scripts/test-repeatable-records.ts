@@ -73,6 +73,30 @@ assert.deepEqual(existingAwardPlan.groups['本科期间校级以上（含）荣�
 assert.deepEqual(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].missingItemIndexes, [1]);
 assert.equal(existingAwardPlan.groups['本科期间校级以上（含）荣誉奖励'].rowsToAdd, 1, 'a populated matching row must not be added again');
 
+const separatedAchievementPlan = planRepeatableRecords([], [
+  ...awardBlocks,
+  {
+    title: '科研训练',
+    sectionId: 'research_training',
+    items: [{ fields: [{ key: '项目名称', value: 'PRISM-Net' }] }],
+  },
+  {
+    title: '学科竞赛',
+    sectionId: 'subject_competitions',
+    items: [{ fields: [{ key: '获奖项目名称', value: 'OopsOS' }] }],
+  },
+], []);
+assert.equal(
+  separatedAchievementPlan.groups['学术成果'].itemCount,
+  2,
+  'legacy academic-achievement projection should include research and subject competitions',
+);
+assert.equal(
+  separatedAchievementPlan.groups['奖励情况'].itemCount,
+  2,
+  'legacy narrative reward projection should contain honors only',
+);
+
 const projectedProjectPlan = planRepeatableRecords([
   field(10, { groupLabel: '项目经历', rowIndex: 0, columnLabel: '项目名称', value: 'PRISM-Net' }),
 ], [{

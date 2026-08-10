@@ -127,11 +127,14 @@ function isRepeatGroupSourceCompatible(targetGroup: string, sourceGroup: string)
   if (targetMatches(/社会工作|学生工作|社会职务/)) return sourceMatches(/社会工作|学生工作|社会职务/);
   if (targetMatches(/论文情况|已发表论文|论文成果/)) return sourceMatches(/已发表论文|论文情况|论文成果/);
   if (targetMatches(/已取得专利|专利情况|专利成果/)) return sourceMatches(/已取得专利|专利情况|专利成果/);
+  if (targetMatches(/何时何地.*受过何种奖励|奖励情况本科期间|本科期间奖励情况|荣誉奖励|荣誉称号/)) {
+    return sourceMatches(/荣誉奖励|荣誉称号/);
+  }
   if (targetMatches(/获奖情况|奖励情况|学科竞赛|荣誉奖励/)) {
     return sourceMatches(/获奖情况|奖励情况|学科竞赛|荣誉奖励/);
   }
   if (targetMatches(/学术成果|科研成果/)) {
-    return sourceMatches(/已发表论文|论文情况|已取得专利|专利情况|学科竞赛/);
+    return sourceMatches(/科研训练|科研项目|项目经历|已发表论文|论文情况|已取得专利|专利情况|学科竞赛/);
   }
   return true;
 }

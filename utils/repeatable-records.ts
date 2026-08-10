@@ -104,8 +104,8 @@ const IDENTITY_KEYS: Record<string, string[]> = {
   '项目经历': ['项目名称', '实习实践单位', '社会工作名称', '起止时间'],
   '论文情况': ['论文标题', '论文名称', '作者'],
   '获奖情况': ['获奖项目名称', '获奖名称', '竞赛名称', '获奖人'],
-  '学术成果': ['论文标题', '论文名称', '专利名称', '获奖项目名称', '竞赛名称'],
-  '奖励情况': ['获奖项目名称', '获奖名称', '竞赛名称', '获奖人'],
+  '学术成果': ['项目名称', '论文标题', '论文名称', '专利名称', '获奖项目名称', '竞赛名称'],
+  '奖励情况': ['获奖名称'],
 };
 
 export function getSectionIdentityKeys(sectionId: string | undefined, groupLabel = ''): string[] {
@@ -172,6 +172,7 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
     {
       label: '学术成果',
       items: [
+        ...(sourceBySection.get('research_training')?.items ?? []),
         ...(sourceBySection.get('published_papers')?.items ?? []),
         ...(sourceBySection.get('granted_patents')?.items ?? []),
         ...(sourceBySection.get('subject_competitions')?.items ?? []),
@@ -180,7 +181,6 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
     {
       label: '奖励情况',
       items: [
-        ...(sourceBySection.get('subject_competitions')?.items ?? []),
         ...(sourceBySection.get('honors_awards')?.items ?? []),
       ],
     },

@@ -2,6 +2,16 @@ import type { AgentCheckpoint } from './types';
 
 export type AgentControlCommand = 'retry_failed' | 'replan_page';
 
+export function agentCheckpointForPage(
+  checkpoint: AgentCheckpoint | undefined,
+  pageKey: string,
+  protocolVersion?: number,
+): AgentCheckpoint | undefined {
+  if (!checkpoint || checkpoint.pageKey !== pageKey) return undefined;
+  if (protocolVersion != null && checkpoint.protocolVersion !== protocolVersion) return undefined;
+  return checkpoint;
+}
+
 function keepDurableResult(result: AgentCheckpoint['results'][number]): boolean {
   return result.status === 'verified' || result.status === 'manual' || result.status === 'skipped';
 }

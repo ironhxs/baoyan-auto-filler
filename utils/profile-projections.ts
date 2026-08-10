@@ -56,14 +56,21 @@ function sourceSectionsForTarget(target: TargetFieldSchema): SourceSectionId[] {
       && /结束时间/.test(targetFields)
       && /学校或工作单位/.test(targetFields)
       && /担任职务/.test(targetFields)
-    );
+  );
   if (chronologyTarget) return ['education_career'];
-  if (/论文|学术成果|论文情况/.test(label)) return ['published_papers'];
+  if (/学术成果|科研成果|学术活动/.test(label)) {
+    return ['published_papers', 'research_training', 'subject_competitions', 'granted_patents'];
+  }
+  if (/论文|论文情况/.test(label)) return ['published_papers'];
   if (
     /项目经历|项目经验|科研实践/.test(label)
     || (/经历/.test(label) && /(项目名称|项目描述|项目时间|本人角色)/.test(targetFields))
   ) {
     return ['research_training', 'internship_practice', 'social_work'];
+  }
+  if (/学科竞赛|竞赛名称|赛事名称|比赛名称/.test(label)) return ['subject_competitions'];
+  if (/何时何地.*受过何种奖励|奖励情况本科期间|本科期间奖励情况|荣誉奖励|荣誉称号/.test(label)) {
+    return ['honors_awards'];
   }
   if (/获奖|奖励|荣誉|竞赛|奖项/.test(label)) {
     return ['subject_competitions', 'honors_awards'];

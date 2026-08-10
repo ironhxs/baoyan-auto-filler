@@ -9,6 +9,9 @@ export type AgentPageIntent =
   | 'project'
   | 'publication'
   | 'patent'
+  | 'academic_achievement'
+  | 'competition'
+  | 'honor'
   | 'award'
   | 'material'
   | 'unknown';
@@ -62,8 +65,22 @@ export function inferAgentPageIntent(snapshot: AgentPageSnapshot): AgentPageInte
   if (includesAny(text, ['外语水平', '外语成绩', '英语四级', '英语六级', 'CET-4', 'CET-6', '雅思', '托福'])) {
     return 'language';
   }
+  // Composite academic-achievement questions often mention papers and awards in their
+  // instructions. Recognize the whole question before the narrower paper/award rules.
+  if (includesAny(text, ['学术成果', '科研成果', '学术活动', '科研学术成果'])) {
+    return 'academic_achievement';
+  }
   if (includesAny(text, ['论文情况', '发表论文', '论文名称', '刊物/会议', '论文标题'])) return 'publication';
   if (includesAny(text, ['专利情况', '取得专利', '专利名称', '专利权人', '授权或受理'])) return 'patent';
+  if (includesAny(text, ['学科竞赛', '竞赛名称', '赛事名称', '比赛名称'])) return 'competition';
+  if (includesAny(text, [
+    '何时何地何原因受过何种奖励',
+    '何时何地因何受过何种奖励',
+    '奖励情况（本科期间）',
+    '本科期间奖励情况',
+    '荣誉奖励',
+    '荣誉称号',
+  ])) return 'honor';
   if (includesAny(text, ['奖励情况', '获奖情况', '荣誉奖励', '奖项名称', '获奖等级', '学科竞赛', '竞赛名称'])) {
     return 'award';
   }
@@ -88,6 +105,9 @@ const INTENT_CATEGORY_IDS: Record<Exclude<AgentPageIntent, 'basic' | 'material' 
   project: ['research_training', 'internship_practice', 'social_work', 'project_experience'],
   publication: ['published_papers'],
   patent: ['granted_patents'],
+  academic_achievement: ['subject_competitions', 'research_training', 'published_papers', 'granted_patents', 'project_experience'],
+  competition: ['subject_competitions'],
+  honor: ['honors_awards'],
   award: ['subject_competitions', 'honors_awards'],
 };
 
@@ -111,6 +131,9 @@ function categoryMatchesIntent(category: BlockCategory, intent: AgentPageIntent)
     case 'project': return /科研训练|项目经历|实习实践|社会工作/.test(title);
     case 'publication': return /论文/.test(title);
     case 'patent': return /专利/.test(title);
+    case 'academic_achievement': return /学科竞赛|科研训练|科研项目|项目经历|论文|专利/.test(title);
+    case 'competition': return /学科竞赛|竞赛|赛事|比赛/.test(title);
+    case 'honor': return /荣誉奖励|荣誉称号|奖学金|三好学生|优秀共青团员|优秀心理委员/.test(title);
     case 'award': return /学科竞赛|奖励|获奖|荣誉/.test(title);
     default: return false;
   }
@@ -250,6 +273,24 @@ function enrichAwardRecord(record: AgentSourceRecord, school: string, blocks: Bl
   };
 }
 
+function academicAggregateRecord(records: AgentSourceRecord[]): AgentSourceRecord | null {
+  const fields: Record<string, string> = {};
+  for (const record of records) {
+    for (const [key, value] of Object.entries(record.fields)) {
+      fields[`${record.categoryLabel}[${record.itemIndex + 1}].${key}`] = value;
+    }
+  }
+  if (Object.keys(fields).length === 0) return null;
+  return {
+    recordId: 'academic_achievement:aggregate',
+    categoryId: 'academic_achievement',
+    categoryLabel: '学术成果综合资料',
+    itemIndex: 0,
+    fields,
+    searchText: Object.entries(fields).map(([key, value]) => `${key}: ${value}`).join('；'),
+  };
+}
+
 export function retrieveAgentSourceRecords(
   snapshot: AgentPageSnapshot,
   blocks: BlockCategory[],
@@ -262,9 +303,13 @@ export function retrieveAgentSourceRecords(
       .map((_, itemIndex) => serializeBlockRecord(category, itemIndex))
       .filter((record): record is AgentSourceRecord => record != null));
 
-  if (intent === 'award') {
+  if (intent === 'award' || intent === 'honor') {
     const school = firstProfileValue(fields, /^(?:学校|所在学校|本科院校|毕业院校)$/);
     records = records.map((record) => enrichAwardRecord(record, school, blocks));
+  }
+  if (intent === 'academic_achievement' && !snapshot.groups.some((group) => group.kind === 'repeatable')) {
+    const aggregate = academicAggregateRecord(records);
+    if (aggregate) records = [aggregate];
   }
   if (intent === 'basic' || intent === 'unknown') records.unshift(...serializeFlatFields(fields));
   return records;

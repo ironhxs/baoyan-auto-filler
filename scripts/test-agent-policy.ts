@@ -281,6 +281,18 @@ assert.deepEqual(
 assert.equal(
   blockingAgentReviewItems(
     blankOptionalPlan,
+    blankOptionalSnapshot,
+    blankOptionalPlan.reviewItems,
+    new Set(),
+    new Set(),
+    true,
+  ).length,
+  1,
+  'a blank optional page must pause when relevant saved records exist but the model planned no actions',
+);
+assert.equal(
+  blockingAgentReviewItems(
+    blankOptionalPlan,
     { ...blankOptionalSnapshot, groups: blankOptionalSnapshot.groups.map((group) => ({
       ...group,
       fields: group.fields.map((item, index) => ({ ...item, required: index === 0 })),
@@ -289,6 +301,30 @@ assert.equal(
   ).length,
   1,
   'the same explanation must remain blocking when the page declares a required field',
+);
+
+const filledProtectedSnapshot: AgentPageSnapshot = {
+  ...blankOptionalSnapshot,
+  title: '获奖情况',
+  groups: blankOptionalSnapshot.groups.map((group) => ({
+    ...group,
+    fields: group.fields.map((item, index) => ({
+      ...item,
+      currentValue: index === 0 ? '2025年12月' : `网页已有内容${index + 1}`,
+      required: index < 2,
+      protected: true,
+    })),
+    rows: [],
+  })),
+};
+const protectedExplanation = [{
+  reviewId: 'preserve-protected-awards',
+  message: '页面中的字段已有网页值并受保护，因此不规划任何覆盖操作。',
+}];
+assert.deepEqual(
+  blockingAgentReviewItems(blankOptionalPlan, filledProtectedSnapshot, protectedExplanation),
+  [],
+  'a targetless no-overwrite explanation must not halt a page whose required fields already have protected values',
 );
 
 const derivedPlaceReview = [{

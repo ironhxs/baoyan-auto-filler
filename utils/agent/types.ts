@@ -135,6 +135,7 @@ export interface AgentActionResult {
 }
 
 export interface AgentCheckpoint {
+  protocolVersion?: number;
   pageKey: string;
   phase: AgentPhase;
   plan?: AgentPagePlan;

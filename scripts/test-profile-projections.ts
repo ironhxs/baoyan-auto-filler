@@ -44,6 +44,15 @@ const blocks: BlockCategory[] = [
       { key: '获奖时间', value: '2025年12月' },
     ] }],
   },
+  {
+    title: '已取得专利',
+    sectionId: 'granted_patents',
+    items: [{ fields: [
+      { key: '专利权人', value: '测试同学' },
+      { key: '专利名称', value: '多模态分析方法' },
+      { key: '授权或受理时间', value: '2026年3月' },
+    ] }],
+  },
 ];
 
 const textFields: TextField[] = [];
@@ -69,6 +78,40 @@ assert.equal(competition.find((candidate) => candidate.targetFieldKey === '奖�
 assert.equal(competition.find((candidate) => candidate.targetFieldKey === '奖项级别')?.value, '华东区域赛');
 assert.equal(honors.find((candidate) => candidate.targetFieldKey === '奖项名称')?.value, '一等奖学金');
 assert.equal(honors.find((candidate) => candidate.targetFieldKey === '奖项级别')?.value, '校级');
+
+const academicCandidates = projectProfileToTargetSchema({
+  groupLabel: '学术成果（包括荣获奖项、发表论文、学术活动等）',
+  fields: [
+    { key: '项目名称', label: '项目名称' },
+    { key: '论文名称', label: '论文名称' },
+    { key: '专利名称', label: '专利名称' },
+    { key: '竞赛名称', label: '竞赛名称' },
+  ],
+}, blocks, textFields);
+assert.deepEqual(
+  [...new Set(academicCandidates.map((candidate) => candidate.sourceSectionId))],
+  ['published_papers', 'research_training', 'subject_competitions', 'granted_patents'],
+  'academic-achievement pages should receive research, papers, patents, and subject competitions',
+);
+assert.equal(
+  academicCandidates.some((candidate) => candidate.sourceSectionId === 'honors_awards'),
+  false,
+  'general honors must stay on the dedicated honors page',
+);
+
+const narrativeHonorCandidates = projectProfileToTargetSchema({
+  groupLabel: '奖励情况（本科期间）：何时何地何原因受过何种奖励',
+  fields: [
+    { key: '时间', label: '时间' },
+    { key: '地点', label: '地点' },
+    { key: '内容', label: '内容' },
+  ],
+}, blocks, textFields);
+assert.deepEqual(
+  [...new Set(narrativeHonorCandidates.map((candidate) => candidate.sourceSectionId))],
+  ['honors_awards'],
+  'the narrative reward question should not project subject competitions',
+);
 
 const projectCandidates = projectProfileToTargetSchema({
   groupLabel: '项目经历',

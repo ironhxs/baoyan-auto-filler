@@ -35,6 +35,9 @@ const INTENT_CATEGORY_IDS: Partial<Record<AgentPageIntent, string[]>> = {
   project: ['research_training', 'internship_practice', 'social_work', 'project_experience'],
   publication: ['published_papers'],
   patent: ['granted_patents'],
+  academic_achievement: ['academic_achievement', 'subject_competitions', 'research_training', 'published_papers', 'granted_patents', 'project_experience'],
+  competition: ['subject_competitions'],
+  honor: ['honors_awards'],
   award: ['subject_competitions', 'honors_awards'],
 };
 

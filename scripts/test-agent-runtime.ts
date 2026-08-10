@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { runAgentPage } from '../utils/agent/runtime';
+import { AGENT_PROTOCOL_VERSION } from '../utils/agent/cache';
 import type { AgentRuntimeDeps, AgentValidatedRunPlan } from '../utils/agent/runtime';
 import type { AgentCheckpoint, AgentPagePlan, AgentPageSnapshot } from '../utils/agent/types';
 import type { AgentSourceRecord } from '../utils/agent/profile-retriever';
@@ -77,6 +78,7 @@ function validated(plan: AgentPagePlan): AgentValidatedRunPlan {
   };
   const outcome = await runAgentPage(deps);
   assert.equal(outcome.status, 'complete');
+  assert.equal(outcome.checkpoint.protocolVersion, AGENT_PROTOCOL_VERSION);
   assert.deepEqual(phases, ['observing', 'planning', 'validating', 'executing', 'verifying', 'complete']);
   assert.deepEqual(executed, [['a1', 'a2']]);
 }
@@ -214,7 +216,39 @@ function validated(plan: AgentPagePlan): AgentValidatedRunPlan {
   assert.equal(outcome.status, 'paused', 'review-only plans must stop for manual confirmation');
   assert.equal(outcome.canAdvance, false);
   assert.equal(executed, false);
-  assert.match(outcome.reason ?? '', /manual review/i);
+  assert.match(outcome.reason ?? '', /页面字段含义不明确，需要人工确认/);
+  assert.doesNotMatch(outcome.reason ?? '', /Agent plan contains/);
+}
+
+{
+  const { snapshot, records, plan } = fixture('advisory-review-page');
+  plan.actions = [];
+  plan.reviewItems = [{
+    reviewId: 'preserved-values',
+    message: '页面已有值，因此不覆盖。',
+  }];
+  const deps: AgentRuntimeDeps = {
+    observe: async () => snapshot,
+    retrieve: async () => records,
+    plan: async () => plan,
+    validate: (value) => ({
+      ...validated(value),
+      plan: { ...value, reviewItems: [] },
+      reviewItems: [],
+    }),
+    execute: async () => ({ results: [] }),
+    verify: async () => ({
+      results: [], complete: true, needsRepair: false, failedActionIds: [], canAdvance: true,
+    }),
+    save: async () => undefined,
+  };
+  const outcome = await runAgentPage(deps);
+  assert.equal(outcome.status, 'complete');
+  assert.deepEqual(
+    outcome.checkpoint.plan?.reviewItems,
+    [],
+    'the persisted checkpoint must expose only the review items that still block the validated page',
+  );
 }
 
 {

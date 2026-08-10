@@ -236,6 +236,38 @@ assert.equal(
   true,
   'project pages may still use research training records',
 );
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(53, { groupLabel: '奖励情况（本科期间）：何时何地何原因受过何种奖励', columnLabel: '内容' }),
+    '学科竞赛[1].获奖项目名称',
+  ),
+  false,
+  'the narrative honors question must reject subject-competition records',
+);
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(54, { groupLabel: '奖励情况（本科期间）：何时何地何原因受过何种奖励', columnLabel: '内容' }),
+    '本科期间校级以上（含）荣誉奖励[1].获奖名称',
+  ),
+  true,
+  'the narrative honors question may use honor records',
+);
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(55, { groupLabel: '学术成果（包括荣获奖项、发表论文、学术活动等）', label: '学术成果' }),
+    '科研训练[1].项目名称',
+  ),
+  true,
+  'academic-achievement fields may use research-training records',
+);
+assert.equal(
+  isSemanticallyCompatibleMatch(
+    field(56, { groupLabel: '学术成果（包括荣获奖项、发表论文、学术活动等）', label: '学术成果' }),
+    '本科期间校级以上（含）荣誉奖励[1].获奖名称',
+  ),
+  false,
+  'general honors stay on the dedicated honors page',
+);
 
 const aiEligible = getAiEligibleFields(fields, matches);
 assert.deepEqual(aiEligible.map((candidate) => candidate.index), [9, 15, 20]);

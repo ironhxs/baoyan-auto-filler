@@ -1,7 +1,7 @@
 {
   "name": "baotian",
   "description": "保填",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -31,6 +31,7 @@
     "test:image-mime": "tsx scripts/test-image-mime.ts",
     "test:audit-view-model": "tsx scripts/test-audit-view-model.ts",
     "test:page-identity": "tsx scripts/test-page-identity.ts",
+    "test:field-context": "tsx scripts/test-field-context.ts",
     "test:navigation-wait": "tsx scripts/test-navigation-wait.ts",
     "test:agent:snapshot": "tsx scripts/test-agent-page-snapshot.ts",
     "test:agent:profile": "tsx scripts/test-agent-profile-retriever.ts",

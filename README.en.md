@@ -5,7 +5,7 @@
   <p>A local-first graduate application form assistant for Chrome, Edge, and Firefox.</p>
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-2.0.0-2563eb" />
+    <img alt="Version" src="https://img.shields.io/badge/version-2.0.1-2563eb" />
     <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.9-3178c6" />
     <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-16a34a" />
   </p>
@@ -32,11 +32,17 @@ Version 2.0 introduces a page-level form Agent. Instead of matching keywords in 
 
 ## Page-level Agent in 2.0
 
-When a saved award record has fields such as title, level, date, organizer, description, and personal rank, but a school asks for only **Date / Place / Content**, the Agent plans one complete row:
+The Agent classifies the whole question before retrieving records instead of mixing every item that contains the word “award”:
+
+- an **Academic achievements** prompt can synthesize research training, publications, patents, and subject competitions; for a single long field, the model receives one auditable aggregate record with item-level evidence;
+- a **When, where, why, and what honor did you receive?** or **Awards during undergraduate study** page uses general honors only, so research projects and subject competitions are not duplicated there;
+- explicit competition, publication, and patent tables continue to use their own source groups, preserving cross-school behavior.
+
+When a saved honor record has fields such as title, level, date, organizer, description, and personal rank, but a school asks for only **Date / Place / Content**, the Agent plans one complete row:
 
 - dates are adapted to the page example;
-- place is rewritten as a geographic range or a verifiable awarding institution. For example, a source label equivalent to “East China regional round” becomes “East China”, and “Anhui division” becomes “Anhui Province”, instead of treating the competition stage as a literal place;
-- content first distinguishes a research project, competition entry, team award, and personal honor, then writes a natural sentence instead of applying one fixed bracket template;
+- place uses a verifiable awarding institution or geographic location; award levels such as municipal, provincial, and university-level are never treated as places, and unsupported cities are not invented;
+- content distinguishes scholarships, honor titles, individual commendations, and team honors before writing a natural sentence instead of applying one fixed bracket template;
 - sibling columns are planned together to avoid repeating the same fact. If the source contains only a year but the page requires a month, the Agent requests review rather than inventing one;
 - all columns in a record are treated atomically, so a partial row is never reported as complete.
 
@@ -131,8 +137,8 @@ Download from [GitHub Releases](https://github.com/ironhxs/baoyan-auto-filler/re
 
 | File | Browser |
 |---|---|
-| `baotian-2.0.0-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
-| `baotian-2.0.0-firefox.zip` | Firefox temporary loading or later signed distribution |
+| `baotian-2.0.1-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
+| `baotian-2.0.1-firefox.zip` | Firefox temporary loading or later signed distribution |
 
 For Chrome / Edge, extract the archive, open `chrome://extensions/` or `edge://extensions/`, enable Developer mode, and choose **Load unpacked**.
 

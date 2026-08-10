@@ -86,6 +86,9 @@ assert.match(naturalCompositionPrompt, /不要套用固定的括号拼接模板/
 assert.match(naturalCompositionPrompt, /避免重复已经写入同一行其他列的信息/);
 assert.match(naturalCompositionPrompt, /先判断名称表示项目、作品、团队、个人奖项还是荣誉称号/);
 assert.match(naturalCompositionPrompt, /队名不要强行添加“项目”/);
+assert.match(naturalCompositionPrompt, /发表刊物或出版社/);
+assert.match(naturalCompositionPrompt, /科研训练.*项目级别.*项目名称.*排名/s);
+assert.match(naturalCompositionPrompt, /学科竞赛.*竞赛名称.*获奖项目名称.*获奖人/s);
 
 const planObject = {
   version: 1,

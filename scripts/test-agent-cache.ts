@@ -12,6 +12,8 @@ import type { AgentCheckpoint, AgentPagePlan, AgentPageSnapshot } from '../utils
 import type { AgentSourceRecord } from '../utils/agent/profile-retriever';
 import type { ApiConfig } from '../utils/storage';
 
+assert.equal(AGENT_PROTOCOL_VERSION, 7, 'snapshot, retrieval, and planning semantics changed, so cached older plans must not be reused');
+
 const snapshot: AgentPageSnapshot = {
   pageKey: 'page-1', url: 'https://example.test', title: '基本信息', stepText: '', instructions: [], capturedAt: 1,
   groups: [{

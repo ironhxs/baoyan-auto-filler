@@ -7,13 +7,18 @@ import {
 import type { AgentPageSnapshot } from '../utils/agent/types';
 import type { BlockCategory } from '../utils/db';
 
-function snapshot(title: string, columns: string[], groupLabel = title): AgentPageSnapshot {
+function snapshot(
+  title: string,
+  columns: string[],
+  groupLabel = title,
+  instructions: string[] = [],
+): AgentPageSnapshot {
   return {
     pageKey: title,
     url: 'https://example.test/form',
     title,
     stepText: '',
-    instructions: [],
+    instructions,
     capturedAt: 1,
     groups: [{
       groupId: 'group',
@@ -84,6 +89,23 @@ const blocks: BlockCategory[] = [
     ] }],
   },
   {
+    title: '已发表论文',
+    sectionId: 'published_papers',
+    items: [{ fields: [
+      { key: '作者', value: '测试同学等' },
+      { key: '论文标题', value: '缺失模态脑肿瘤分割研究' },
+      { key: '刊物/会议名称', value: '医学影像会议' },
+    ] }],
+  },
+  {
+    title: '已取得专利',
+    sectionId: 'granted_patents',
+    items: [{ fields: [
+      { key: '专利权人', value: '测试同学' },
+      { key: '专利名称', value: '多模态分析方法' },
+    ] }],
+  },
+  {
     title: '实习实践',
     sectionId: 'internship_practice',
     items: [{ fields: [
@@ -98,23 +120,71 @@ const blocks: BlockCategory[] = [
   },
 ];
 
-const awardSnapshot = snapshot('奖励情况（本科期间）', ['时间', '地点', '内容']);
-assert.equal(inferAgentPageIntent(awardSnapshot), 'award');
+const awardSnapshot = snapshot(
+  '奖励情况（本科期间）',
+  ['时间', '地点', '内容'],
+  '奖励情况（本科期间）',
+  ['何时何地何原因受过何种奖励（内容中不得含有|、#）'],
+);
+assert.equal(inferAgentPageIntent(awardSnapshot), 'honor');
 const awardRecords = retrieveAgentSourceRecords(awardSnapshot, blocks, [
   { key: '学校', value: '合肥工业大学' },
 ]);
 assert.deepEqual([...new Set(awardRecords.map((record) => record.categoryId))], [
-  'subject_competitions',
   'honors_awards',
-]);
-assert.equal(awardRecords[0].recordId, 'subject_competitions:0');
-assert.equal('空字段' in awardRecords[1].fields, false);
-assert.equal(awardRecords[0].fields.地点语义证据, '华东地区');
-assert.equal('网页内容候选' in awardRecords[0].fields, false, 'Agent should compose content for the actual page instead of copying a fixed bracket template');
-assert.equal(awardRecords[1].fields.地点语义证据, '合肥工业大学');
-assert.equal('网页内容候选' in awardRecords[1].fields, false);
-assert.equal(awardRecords[2].fields.地点语义证据, '宣城市', 'a generic 市级 must be resolved from a related factual record, not written as the place');
-assert.equal(awardRecords[3].fields.地点语义证据, '宣城市', 'related evidence can resolve a location through a distinctive award type, not only an exact full title');
+], 'the narrative honors question must not receive subject-competition records');
+assert.equal(awardRecords[0].recordId, 'honors_awards:0');
+assert.equal('空字段' in awardRecords[0].fields, false);
+assert.equal(awardRecords[0].fields.地点语义证据, '合肥工业大学');
+assert.equal('网页内容候选' in awardRecords[0].fields, false);
+assert.equal(awardRecords[1].fields.地点语义证据, '宣城市', 'a generic 市级 must be resolved from a related factual record, not written as the place');
+assert.equal(awardRecords[2].fields.地点语义证据, '宣城市', 'related evidence can resolve a location through a distinctive award type, not only an exact full title');
+
+const academicSnapshot = snapshot(
+  '学术成果',
+  [],
+  '学术成果（包括荣获奖项、发表论文、学术活动等）',
+  ['内容中不得含有|、#'],
+);
+academicSnapshot.groups[0].kind = 'single';
+academicSnapshot.groups[0].fields = [{
+  targetId: 'academic-summary',
+  index: 0,
+  label: '学术成果（包括荣获奖项、发表论文、学术活动等）',
+  currentValue: '',
+  required: false,
+  protected: false,
+  kind: 'text',
+  options: [],
+  placeholder: '',
+  formatHints: [],
+  forbiddenCharacters: ['|', '#'],
+}];
+assert.equal(
+  inferAgentPageIntent(academicSnapshot),
+  'academic_achievement',
+  'the page title must win over nested words such as 发表论文 and 荣获奖项',
+);
+const academicRecords = retrieveAgentSourceRecords(academicSnapshot, blocks, []);
+assert.deepEqual(academicRecords.map((record) => record.recordId), ['academic_achievement:aggregate']);
+const academicAggregate = academicRecords.find((record) => record.recordId === 'academic_achievement:aggregate');
+assert.ok(academicAggregate, 'a single academic-achievement field needs one auditable multi-record source for synthesis');
+assert.equal(academicAggregate.fields['科研训练[1].项目名称'], 'PRISM-Net');
+assert.equal(academicAggregate.fields['学科竞赛[1].竞赛名称'], '操作系统设计赛');
+assert.equal(academicAggregate.fields['已发表论文[1].论文标题'], '缺失模态脑肿瘤分割研究');
+assert.equal(academicAggregate.fields['已取得专利[1].专利名称'], '多模态分析方法');
+assert.equal(
+  Object.keys(academicAggregate.fields).some((key) => key.startsWith('荣誉奖励[')),
+  false,
+  'general honors belong to the dedicated honors question, not the academic-achievement summary',
+);
+
+const competitionSnapshot = snapshot('学科竞赛', ['竞赛名称', '获奖等级', '获奖时间']);
+assert.equal(inferAgentPageIntent(competitionSnapshot), 'competition');
+assert.deepEqual(
+  [...new Set(retrieveAgentSourceRecords(competitionSnapshot, blocks, []).map((record) => record.categoryId))],
+  ['subject_competitions'],
+);
 
 const careerSnapshot = snapshot(
   '学习和工作经历',

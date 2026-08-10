@@ -3,6 +3,7 @@ import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
 import { waitForPageTransition } from '@/utils/navigation-wait';
 import { inferImageMimeType } from '@/utils/image-mime';
+import { chooseNearestAncestorQuestionContext } from '@/utils/field-context';
 import { stableTargetId } from '@/utils/agent/page-snapshot';
 import type { AgentExecutionItem, AgentExecutionResult } from '@/utils/agent/executor';
 import { classifyObservedRepeatTable, extractAgentFieldRules } from '@/utils/agent/field-rules';
@@ -423,6 +424,26 @@ function findNearbyText(el: HTMLElement, contextRoot: HTMLElement): string {
   }
 
   return parts.join(' ');
+}
+
+function findAncestorQuestionText(el: HTMLElement): string {
+  const levels: string[][] = [];
+  const seen = new Set<HTMLTableRowElement>();
+  let row = el.closest<HTMLTableRowElement>('tr');
+  let anchor: HTMLElement = el;
+
+  while (row && levels.length < 5 && !seen.has(row)) {
+    seen.add(row);
+    const cells = Array.from(row.cells);
+    const carrierIndex = cells.findIndex((cell) => cell === anchor || cell.contains(anchor));
+    levels.push(carrierIndex > 0
+      ? cells.slice(0, carrierIndex).map((cell) => textWithoutControls(cell))
+      : []);
+    anchor = row;
+    row = row.parentElement?.closest<HTMLTableRowElement>('tr') ?? null;
+  }
+
+  return chooseNearestAncestorQuestionContext(levels);
 }
 
 function joinUnique(parts: Array<string | undefined>): string {
@@ -929,8 +950,9 @@ function findContext(el: HTMLElement): string {
   const singleFieldContainer = findNearestSingleFieldContainer(el, contextRoot);
   const localText = textWithoutControls(singleFieldContainer);
   const nearbyText = findNearbyText(el, contextRoot);
+  const ancestorQuestionText = findAncestorQuestionText(el);
 
-  return joinUnique([localText, nearbyText]);
+  return joinUnique([localText, nearbyText, ancestorQuestionText]);
 }
 
 function findHint(el: HTMLElement, label: string, context: string): string {

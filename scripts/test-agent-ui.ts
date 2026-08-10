@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { buildAgentViewModel } from '../utils/agent/view-model';
-import { applyAgentControl } from '../utils/agent/control';
+import { agentCheckpointForPage, applyAgentControl } from '../utils/agent/control';
+import { AGENT_PROTOCOL_VERSION } from '../utils/agent/cache';
 import type { AgentActionResult, AgentCheckpoint } from '../utils/agent/types';
 
 function result(
@@ -20,6 +21,7 @@ function result(
 }
 
 const checkpoint: AgentCheckpoint = {
+  protocolVersion: AGENT_PROTOCOL_VERSION,
   pageKey: 'award-page',
   phase: 'paused',
   plan: {
@@ -87,5 +89,21 @@ assert.equal(replan.plan, undefined);
 assert.equal(replan.results.filter((item) => item.status === 'verified').length, 12);
 assert.equal(replan.results.filter((item) => item.status === 'manual').length, 1);
 assert.deepEqual(replan.manualOverrides, checkpoint.manualOverrides);
+
+assert.equal(
+  agentCheckpointForPage(checkpoint, 'material-page', AGENT_PROTOCOL_VERSION),
+  undefined,
+  'a checkpoint from the previous form page must not appear in the current material page panel',
+);
+assert.equal(
+  agentCheckpointForPage(checkpoint, 'award-page', AGENT_PROTOCOL_VERSION),
+  checkpoint,
+  'the current page checkpoint must remain visible',
+);
+assert.equal(
+  agentCheckpointForPage({ ...checkpoint, protocolVersion: AGENT_PROTOCOL_VERSION - 1 }, 'award-page', AGENT_PROTOCOL_VERSION),
+  undefined,
+  'a checkpoint created under older retrieval semantics must be discarded',
+);
 
 console.log('Agent UI view-model tests passed');

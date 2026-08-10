@@ -303,6 +303,7 @@ export function blockingAgentReviewItems(
   reviewItems: AgentReviewItem[],
   executableActionIds: ReadonlySet<string> = new Set(),
   executableTargetIds: ReadonlySet<string> = new Set(),
+  hasRelevantSources = false,
 ): AgentReviewItem[] {
   if (reviewItems.length === 0) return [];
   const fields = snapshot.groups.flatMap((group) => group.fields);
@@ -315,12 +316,13 @@ export function blockingAgentReviewItems(
     && (!item.targetId || !populatedTargetIds.has(item.targetId))
   ));
   if (blockingItems.length === 0) return [];
-  const isBlankOptionalPage = (
+  const isResolvedNoActionPage = (
     plan.actions.length === 0 &&
-    blockingItems.every((item) => !item.targetId) &&
-    fields.every((field) => !field.required && !normalized(field.currentValue))
+    blockingItems.every((item) => !item.actionId && !item.targetId) &&
+    fields.every((field) => !field.required || Boolean(normalized(field.currentValue))) &&
+    (fields.some((field) => Boolean(normalized(field.currentValue))) || !hasRelevantSources)
   );
-  return isBlankOptionalPage ? [] : blockingItems;
+  return isResolvedNoActionPage ? [] : blockingItems;
 }
 
 export interface CanAgentAdvanceInput {
