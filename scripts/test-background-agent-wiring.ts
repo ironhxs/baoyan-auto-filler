@@ -33,5 +33,20 @@ assert.match(
   /if \(Object\.values\(scan\.repeatPlan\.groups\)\.some\(\(group\) => group\.rowsToAdd > 0\)\) \{\s*const preparedScan = await collectTabScan\(tabId, true, true, true\)/u,
   'continuous filling should prepare pending repeatable records before either local or Agent page execution',
 );
+assert.match(
+  source,
+  /resolveCascaderOption: CascaderAgentObservation/u,
+  'the content executor must have a typed background route for constrained cascader observations',
+);
+assert.match(
+  source,
+  /requestModelText\(apiConfig, prompt, \{ timeoutMs: 15_000 \}\)/u,
+  'a single cascader decision must have a short bounded API timeout',
+);
+assert.match(
+  source,
+  /request\.type === 'resolveCascaderOption'[\s\S]*?handleResolveCascaderOption/u,
+  'the cascader decision route must reach the allowlist-validating handler',
+);
 
 console.log('background agent wiring tests passed');

@@ -15,6 +15,7 @@ import {
   pickControlIdentityCandidate,
   pickHierarchicalSegment,
   selectionTextsEquivalent,
+  stableDomControlIdentityKey,
   type DomControlProbe,
 } from '../utils/dom-control-adapter';
 
@@ -37,6 +38,34 @@ assert.equal(
   classifyDomControl(selectProbe),
   'select',
   'Element-style res-select controls must be classified as selectable controls',
+);
+assert.equal(
+  pickControlIdentityCandidate(
+    {
+      tagName: 'input',
+      prop: 'jdyxm',
+      xtype: 'select-tree',
+      caption: '就读院校',
+      controlKind: 'cascader',
+    },
+    [
+      { tagName: 'input', prop: 'jdyxm', xtype: 'select-tree', caption: '出生地', controlKind: 'cascader' },
+      { tagName: 'input', prop: 'jdyxm', xtype: 'select-tree', caption: '就读院校', controlKind: 'cascader' },
+    ],
+  ),
+  1,
+  'rerendered fields with repeated props must use caption and control kind to rebind uniquely',
+);
+assert.match(
+  stableDomControlIdentityKey({
+    tagName: 'input',
+    name: 'jdyxm',
+    prop: 'jdyxm',
+    xtype: 'select-tree',
+    caption: '就读院校',
+    controlKind: 'cascader',
+  }),
+  /^cascader\|input\|name=jdyxm\|prop=jdyxm\|xtype=select-tree\|caption=就读院校/u,
 );
 assert.deepEqual(
   collectDisplayValueCandidates(selectProbe),
@@ -230,6 +259,11 @@ const secondSegment = pickHierarchicalSegment(firstSegment?.remaining ?? '', ['�
 assert.deepEqual(secondSegment, { label: '潍坊市', remaining: '临朐县' });
 const finalSegment = pickHierarchicalSegment(secondSegment?.remaining ?? '', ['临朐县', '青州市']);
 assert.deepEqual(finalSegment, { label: '临朐县', remaining: '' });
+assert.deepEqual(
+  pickHierarchicalSegment('合肥工业大学', ['10357 安徽大学', '10359 合肥工业大学']),
+  { label: '10359 合肥工业大学', remaining: '' },
+  'a uniquely coded terminal option must complete a hierarchical path',
+);
 
 assert.deepEqual(
   pickCascaderExplorationLabels('山东省潍坊市临朐县', ['北京市', '安徽省', '山东省']),

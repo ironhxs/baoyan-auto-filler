@@ -5,7 +5,7 @@
   <p>面向 Chrome / Edge / Firefox 的本地优先报名表单助手。</p>
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-2.1.1-2563eb" />
+    <img alt="Version" src="https://img.shields.io/badge/version-2.1.2-2563eb" />
     <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.9-3178c6" />
     <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-16a34a" />
     <img alt="Browser" src="https://img.shields.io/badge/browser-Chrome%20%7C%20Edge%20%7C%20Firefox-f97316" />
@@ -24,6 +24,16 @@
 姓名、家庭成员、学习经历、外语成绩、科研项目、论文专利、竞赛奖励……不同学校反复填写同一批资料，不但耗时，还很容易把日期、排名或某一行内容填错。
 
 保填把常用资料集中保存在浏览器里，并在报名页面中完成识别、规划、填写和写后回读。2.0 引入页面级 Agent：它看到的是页面实际字段、列名、行号、格式限制和相关资料记录，能够把同一份资料转换成不同学校需要的结构，而不是只做关键词对关键词的机械复制。
+
+## 2.1.2：动态级联也进入 Agent 闭环
+
+院校、地区、专业等“省份 → 学校”“省 → 市 → 区县”级联控件，不再只依赖一次机械点击：
+
+- 打开控件前保存 `id / name / prop / xtype / caption / 控件类型` 等稳定身份；Vue、React 或 Element UI 重建输入框后，扩展会重新绑定唯一的新节点再回读；
+- 资料包含完整路径时优先在本地逐层精确选择；资料只有“合肥工业大学”这类末级值时，依次使用已验证路径缓存、当前候选精确匹配、本地路径拆分、受约束 Agent 决策和最多 60 个首级分支的有限探索；
+- Agent 每次只能看到当前层的可见候选，只能返回其中一个候选原文；不能返回脚本、页面选择器、坐标、下一步、保存或提交操作，最多重新决策两次；
+- 页面显示 `10359 合肥工业大学`、资料保存“合肥工业大学”时会按唯一代码前缀标准化后回读；同名候选不唯一时停止猜测并交给人工；
+- 只有页面回读一致后才缓存真实选择路径。缓存不保存登录状态或 API Key，页面首级候选结构变化或超过 30 天时自动失效。
 
 ## 2.1.1：先理解整个报名，再逐页填写
 
@@ -166,8 +176,8 @@ Agent 不是 Codex 桌面端，也不需要本地模型。它直接运行在扩�
 
 | 文件 | 浏览器 |
 |---|---|
-| `baotian-2.1.1-chrome.zip` | Chrome、Edge、Brave 等 Chromium 浏览器 |
-| `baotian-2.1.1-firefox.zip` | Firefox 临时加载或后续签名发布 |
+| `baotian-2.1.2-chrome.zip` | Chrome、Edge、Brave 等 Chromium 浏览器 |
+| `baotian-2.1.2-firefox.zip` | Firefox 临时加载或后续签名发布 |
 
 Chrome / Edge：
 
@@ -183,7 +193,7 @@ Chrome / Edge：
 如果重新加载后仍显示旧版本：
 
 1. 在扩展详情页确认“加载位置”是不是刚刚覆盖的目录；
-2. 打开该目录的 `manifest.json`，确认 `version` 为 `2.1.1`；
+2. 打开该目录的 `manifest.json`，确认 `version` 为 `2.1.2`；
 3. 完全退出浏览器后重开，再点一次“重新加载”；
 4. 仍无效时先导出备份，再移除旧扩展并重新加载正确目录。
 

@@ -123,6 +123,11 @@ import type { AgentControlCommand } from '@/utils/agent/control';
 import { shouldPreferPageAgent } from '@/utils/agent/activation';
 import { requestAgentModelThroughBridge } from '@/utils/agent/model-bridge';
 import { accountAgentRun } from '@/utils/agent/run-accounting';
+import {
+  requestCascaderAgentDecision,
+  type CascaderAgentDecision,
+  type CascaderAgentObservation,
+} from '@/utils/agent/cascader';
 import type {
   AgentActionResult,
   AgentCheckpoint,
@@ -172,6 +177,7 @@ interface MessageMap {
   getAuditPreflight: { taskIds: string[] };
   runFinalAudit: { taskIds: string[]; force: boolean; confirmed: boolean };
   focusApplicationTask: { taskId: string };
+  resolveCascaderOption: CascaderAgentObservation;
 }
 
 type MessageType = keyof MessageMap;
@@ -245,6 +251,14 @@ interface ExistingMaterialPreviewSuccessResponse {
   dataUrl: string;
   mimeType: string;
   evidence: string;
+}
+
+interface CascaderDecisionSuccessResponse {
+  ok: true;
+  type: 'cascaderDecision';
+  attempted: boolean;
+  decision: CascaderAgentDecision | null;
+  reason: string;
 }
 
 type AutoRunStatus = 'running' | 'paused' | 'complete' | 'stopped';
@@ -330,7 +344,7 @@ interface FinalAuditSuccessResponse {
   degradedReason?: string;
 }
 
-type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | ExistingMaterialPreviewSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | PageAnalysisSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
+type Response = ScanSuccessResponse | FillSuccessResponse | InspectSuccessResponse | PageActionSuccessResponse | ExistingMaterialPreviewSuccessResponse | CascaderDecisionSuccessResponse | AutoRunSuccessResponse | ApplicationTaskSuccessResponse | PageAnalysisSuccessResponse | ApplicationTaskListSuccessResponse | AuditPreflightSuccessResponse | FinalAuditSuccessResponse | ErrorResponse;
 
 type ContentFillItem =
   | { kind: 'text'; index: number; value: string; confidence: MatchResult['confidence'] }
@@ -1475,7 +1489,46 @@ async function seedDevData() {
   }
 }
 
+async function handleResolveCascaderOption(
+  observation: CascaderAgentObservation,
+): Promise<CascaderDecisionSuccessResponse> {
+  const [configured, apiConfig] = await Promise.all([isApiConfigured(), getApiConfig()]);
+  if (!configured || !apiConfig.aiEnhanced) {
+    return {
+      ok: true,
+      type: 'cascaderDecision',
+      attempted: false,
+      decision: null,
+      reason: configured ? 'AI 增强未开启' : '尚未配置 API',
+    };
+  }
+  try {
+    const decision = await aiRequestQueue.run(() => requestCascaderAgentDecision(
+      observation,
+      (prompt) => requestModelText(apiConfig, prompt, { timeoutMs: 15_000 }),
+    ));
+    return {
+      ok: true,
+      type: 'cascaderDecision',
+      attempted: true,
+      decision,
+      reason: decision ? '' : 'Agent 未能从当前可见候选中作出可靠选择',
+    };
+  } catch (error) {
+    return {
+      ok: true,
+      type: 'cascaderDecision',
+      attempted: true,
+      decision: null,
+      reason: error instanceof Error ? error.message.replace(/\s+/gu, ' ').slice(0, 240) : '级联候选决策失败',
+    };
+  }
+}
+
 async function handleMessage(request: Request): Promise<Response> {
+  if (request.type === 'resolveCascaderOption') {
+    return handleResolveCascaderOption(request.payload!);
+  }
   if (request.type === 'inspectPage') {
     return handleInspectPage();
   }

@@ -29,6 +29,12 @@ export interface DomControlIdentity {
   name?: string;
   prop?: string;
   type?: string;
+  xtype?: string;
+  caption?: string;
+  label?: string;
+  groupLabel?: string;
+  controlKind?: DomControlKind;
+  fingerprint?: string;
 }
 
 export interface DomControlInteractionPlan {
@@ -161,15 +167,37 @@ export function pickControlIdentityCandidate(
     if (candidate.tagName.toLowerCase() !== normalizedTag) return { index, score: 0 };
     let score = 1;
     if (target.type && candidate.type === target.type) score += 1;
+    if (target.controlKind && candidate.controlKind === target.controlKind) score += 2;
+    if (target.groupLabel && normalized(candidate.groupLabel) === normalized(target.groupLabel)) score += 3;
+    if (target.xtype && normalized(candidate.xtype) === normalized(target.xtype)) score += 4;
     if (target.prop && candidate.prop === target.prop) score += 4;
+    if (target.label && normalized(candidate.label) === normalized(target.label)) score += 6;
+    if (target.caption && normalized(candidate.caption) === normalized(target.caption)) score += 6;
     if (target.name && candidate.name === target.name) score += 8;
     if (target.id && candidate.id === target.id) score += 16;
+    if (target.fingerprint && candidate.fingerprint === target.fingerprint) score += 24;
     return { index, score };
   }).filter((candidate) => candidate.score > 1)
     .sort((left, right) => right.score - left.score);
   if (ranked.length === 0) return null;
   if (ranked.length > 1 && ranked[0].score === ranked[1].score) return null;
   return ranked[0].index;
+}
+
+export function stableDomControlIdentityKey(identity: DomControlIdentity): string {
+  const values = [
+    identity.controlKind || 'unknown',
+    normalized(identity.tagName).toLowerCase(),
+    identity.id ? `id=${normalized(identity.id)}` : '',
+    identity.name ? `name=${normalized(identity.name)}` : '',
+    identity.prop ? `prop=${normalized(identity.prop)}` : '',
+    identity.xtype ? `xtype=${normalized(identity.xtype)}` : '',
+    identity.caption ? `caption=${normalized(identity.caption)}` : '',
+    identity.label ? `label=${normalized(identity.label)}` : '',
+    identity.groupLabel ? `group=${normalized(identity.groupLabel)}` : '',
+    identity.fingerprint ? `fingerprint=${normalized(identity.fingerprint)}` : '',
+  ];
+  return values.filter(Boolean).join('|').slice(0, 800);
 }
 
 function structuralMarkers(probe: DomControlProbe): string {
@@ -299,6 +327,14 @@ export function pickHierarchicalSegment(
 ): { label: string; remaining: string } | null {
   const compactTarget = normalized(target).replace(/[>／/、,，\s]+/gu, '');
   if (!compactTarget) return null;
+
+  const terminalMatches = candidates
+    .map(normalized)
+    .filter(Boolean)
+    .filter((candidate) => selectionTextsEquivalent(candidate, target));
+  if (terminalMatches.length === 1) {
+    return { label: terminalMatches[0], remaining: '' };
+  }
 
   const matches = candidates
     .map((candidate) => ({

@@ -58,10 +58,20 @@ import {
   pickControlIdentityCandidate,
   pickHierarchicalSegment,
   selectionTextsEquivalent,
+  stableDomControlIdentityKey,
   type DomControlKind,
   type DomControlIdentity,
   type DomControlProbe,
 } from '@/utils/dom-control-adapter';
+import {
+  createCascaderPathCacheEntry,
+  createCascaderPathCacheKey,
+  validateCascaderPathCacheEntry,
+  type CascaderAgentDecision,
+  type CascaderAgentObservation,
+  type CascaderPathCacheEntry,
+  type CascaderPathCacheScope,
+} from '@/utils/agent/cascader';
 import {
   alignRepeatableQuestionCell,
   findRepeatableQuestionCell,
@@ -282,20 +292,28 @@ function getControlAttribute(el: HTMLElement, name: string): string {
 }
 
 function domControlIdentity(el: HTMLElement): DomControlIdentity {
+  const repeatMeta = getRepeatFieldMeta(el);
+  const caption = getControlAttribute(el, 'caption');
+  const label = getControlAttribute(el, 'label') || caption || findLabel(el);
   return {
     tagName: el.tagName.toLowerCase(),
     id: el.id || undefined,
     name: getControlAttribute(el, 'name') || undefined,
     prop: getControlAttribute(el, 'prop') || undefined,
     type: el instanceof HTMLInputElement ? el.type : undefined,
+    xtype: getControlAttribute(el, 'xtype') || undefined,
+    caption: caption || undefined,
+    label: label || undefined,
+    groupLabel: repeatMeta.groupLabel || undefined,
+    controlKind: controlKind(el),
   };
 }
 
-function resolveLiveControl(el: HTMLElement): HTMLElement {
+function resolveLiveControl(el: HTMLElement, capturedIdentity = domControlIdentity(el)): HTMLElement {
   if (el.isConnected) return el;
   const candidates = Array.from(document.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR));
   const selectedIndex = pickControlIdentityCandidate(
-    domControlIdentity(el),
+    capturedIdentity,
     candidates.map(domControlIdentity),
   );
   return selectedIndex == null ? el : candidates[selectedIndex] ?? el;
@@ -2184,8 +2202,12 @@ async function searchDialogChoice(root: HTMLElement, value: string): Promise<HTM
   return waitForDialogChoice(root, term, 1800);
 }
 
-function dialogValueMatches(el: HTMLElement, expected: string): boolean {
-  const live = resolveLiveControl(el);
+function dialogValueMatches(
+  el: HTMLElement,
+  expected: string,
+  capturedIdentity?: DomControlIdentity,
+): boolean {
+  const live = resolveLiveControl(el, capturedIdentity);
   const rawValue = live instanceof HTMLInputElement || live instanceof HTMLTextAreaElement
     ? live.value
     : '';
@@ -2196,8 +2218,8 @@ function dialogValueMatches(el: HTMLElement, expected: string): boolean {
   if (compactRaw && compactExpected && (compactRaw.includes(compactExpected) || compactExpected.includes(compactRaw))) {
     return true;
   }
-  if (valueMatches(el, expected)) return true;
-  const currentValue = getCurrentValue(el);
+  if (valueMatches(live, expected)) return true;
+  const currentValue = getCurrentValue(live);
   if (datePickerValuesEquivalent(currentValue, expected)) return true;
   if (selectionTextsEquivalent(currentValue, expected)) return true;
   const actual = normalizeSelectionText(currentValue).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
@@ -2270,13 +2292,18 @@ function findScopedSelectionConfirm(root: HTMLElement): HTMLElement | null {
   return selected == null ? null : controls[Number(selected)] ?? null;
 }
 
-async function waitForDialogValue(el: HTMLElement, value: string, timeoutMs = 1400): Promise<boolean> {
+async function waitForDialogValue(
+  el: HTMLElement,
+  value: string,
+  timeoutMs = 1400,
+  capturedIdentity?: DomControlIdentity,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (dialogValueMatches(el, value)) return true;
+    if (dialogValueMatches(el, value, capturedIdentity)) return true;
     await new Promise((resolve) => setTimeout(resolve, 80));
   }
-  return dialogValueMatches(el, value);
+  return dialogValueMatches(el, value, capturedIdentity);
 }
 
 function cascaderCandidates(root: HTMLElement): Array<{ element: HTMLElement; label: string }> {
@@ -2307,6 +2334,171 @@ function firstLevelCascaderCandidates(root: HTMLElement): Array<{ element: HTMLE
   ));
 }
 
+function activeLevelCascaderCandidates(root: HTMLElement): Array<{ element: HTMLElement; label: string }> {
+  const selector = '.el-cascader-menu,.ant-cascader-menu';
+  const menus = [
+    ...(root.matches(selector) ? [root] : []),
+    ...Array.from(root.querySelectorAll<HTMLElement>(selector)),
+  ].filter((menu) => isVisible(menu) || isActionableOverlayRoot(root));
+  const activeMenu = menus.at(-1);
+  if (!activeMenu) return cascaderCandidates(root);
+  return cascaderCandidates(activeMenu).filter((candidate) => (
+    candidate.element.closest(selector) === activeMenu
+  ));
+}
+
+function findUniqueCascaderCandidate(
+  candidates: Array<{ element: HTMLElement; label: string }>,
+  value: string,
+): { element: HTMLElement; label: string } | null {
+  const exact = candidates.filter((candidate) => candidate.label === value);
+  if (exact.length === 1) return exact[0];
+  const equivalent = candidates.filter((candidate) => selectionTextsEquivalent(candidate.label, value));
+  return equivalent.length === 1 ? equivalent[0] : null;
+}
+
+async function waitForActiveCascaderCandidate(
+  root: HTMLElement,
+  value: string,
+  timeoutMs = 1200,
+): Promise<{ element: HTMLElement; label: string } | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const candidate = findUniqueCascaderCandidate(activeLevelCascaderCandidates(root), value);
+    if (candidate) return candidate;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
+  return findUniqueCascaderCandidate(activeLevelCascaderCandidates(root), value);
+}
+
+function cascaderPathCacheScope(
+  identity: DomControlIdentity,
+  value: string,
+  root: HTMLElement,
+): CascaderPathCacheScope {
+  return {
+    pageUrl: location.href,
+    fieldIdentity: stableDomControlIdentityKey(identity),
+    target: value,
+    firstLevelOptions: firstLevelCascaderCandidates(root).map((candidate) => candidate.label),
+  };
+}
+
+async function readCachedCascaderPath(scope: CascaderPathCacheScope): Promise<string[] | null> {
+  const key = createCascaderPathCacheKey(scope);
+  try {
+    const stored = (await chrome.storage.local.get(key))[key] as CascaderPathCacheEntry | undefined;
+    const path = validateCascaderPathCacheEntry(stored, scope);
+    if (!path && stored) await chrome.storage.local.remove(key);
+    return path;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCascaderPath(scope: CascaderPathCacheScope, path: string[]): Promise<void> {
+  if (path.length === 0) return;
+  const key = createCascaderPathCacheKey(scope);
+  try {
+    await chrome.storage.local.set({ [key]: createCascaderPathCacheEntry(scope, path) });
+  } catch {
+    // A storage failure must not turn a verified page interaction into a failure.
+  }
+}
+
+async function forgetCascaderPath(scope: CascaderPathCacheScope): Promise<void> {
+  try {
+    await chrome.storage.local.remove(createCascaderPathCacheKey(scope));
+  } catch {
+    // Ignore cache cleanup failures; the field remains governed by readback.
+  }
+}
+
+async function executeCascaderPath(root: HTMLElement, path: string[]): Promise<string[] | null> {
+  const executed: string[] = [];
+  for (let index = 0; index < path.length && index < 12; index++) {
+    const candidate = await waitForActiveCascaderCandidate(root, path[index], index === 0 ? 500 : 1200);
+    if (!candidate) return null;
+    const terminal = index === path.length - 1;
+    activateCascaderNode(candidate.element, terminal);
+    executed.push(candidate.label);
+    if (!terminal) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return executed.length === path.length ? executed : null;
+}
+
+interface CascaderAgentRuntimeResponse {
+  ok: boolean;
+  type?: 'cascaderDecision';
+  attempted?: boolean;
+  decision?: CascaderAgentDecision | null;
+  reason?: string;
+  error?: string;
+}
+
+async function requestCascaderAgentOption(
+  observation: CascaderAgentObservation,
+): Promise<CascaderAgentRuntimeResponse> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({
+      target: 'baotian-background',
+      type: 'resolveCascaderOption',
+      payload: observation,
+    }, (response: CascaderAgentRuntimeResponse | undefined) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        resolve({ ok: false, error: runtimeError.message });
+        return;
+      }
+      resolve(response ?? { ok: false, error: '级联候选决策没有返回结果' });
+    });
+  });
+}
+
+async function resolveCascaderThroughAgent(
+  root: HTMLElement,
+  field: FormField,
+  value: string,
+  selectedPathPrefix: string[] = [],
+): Promise<{ terminal: HTMLElement; path: string[] } | null> {
+  const selectedPath: string[] = [...selectedPathPrefix];
+  const tried = new Set<string>();
+  for (let replan = 0; replan < 2; replan++) {
+    const currentCandidates = activeLevelCascaderCandidates(root)
+      .filter((candidate) => !tried.has(candidate.label));
+    const direct = findUniqueCascaderCandidate(currentCandidates, value);
+    if (direct) return { terminal: direct.element, path: [...selectedPath, direct.label] };
+    const visibleOptions = currentCandidates.map((candidate) => candidate.label).slice(0, 80);
+    if (visibleOptions.length === 0) return null;
+    const result = await requestCascaderAgentOption({
+      field: {
+        label: field.label || field.columnLabel || field.groupLabel,
+        hint: joinUnique([field.hint, field.context]),
+        controlType: 'cascader',
+      },
+      target: value,
+      level: selectedPath.length,
+      selectedPath,
+      visibleOptions,
+    });
+    lastCascaderTrace.push(`agent:${result.attempted ? 'attempted' : 'skipped'}:${result.decision ? 'choice' : 'none'}`);
+    const decision = result.decision;
+    if (!result.ok || !decision) return null;
+    const selected = findUniqueCascaderCandidate(currentCandidates, decision.value);
+    if (!selected) return null;
+    tried.add(selected.label);
+    if (selectionTextsEquivalent(selected.label, value)) {
+      return { terminal: selected.element, path: [...selectedPath, selected.label] };
+    }
+    activateCascaderNode(selected.element, false);
+    selectedPath.push(selected.label);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const terminal = await waitForActiveCascaderCandidate(root, value, 1000);
+    if (terminal) return { terminal: terminal.element, path: [...selectedPath, terminal.label] };
+  }
+  return null;
+}
+
 async function waitForCascaderSegment(
   root: HTMLElement,
   remaining: string,
@@ -2334,7 +2526,10 @@ function activateCascaderNode(element: HTMLElement, isTerminal: boolean): void {
   (target ?? element).click();
 }
 
-async function searchCascaderBranches(root: HTMLElement, value: string): Promise<HTMLElement | null> {
+async function searchCascaderBranches(
+  root: HTMLElement,
+  value: string,
+): Promise<{ terminal: HTMLElement; path: string[] } | null> {
   const initialCandidates = firstLevelCascaderCandidates(root);
   const branchLabels = pickCascaderExplorationLabels(
     value,
@@ -2345,10 +2540,13 @@ async function searchCascaderBranches(root: HTMLElement, value: string): Promise
     const branch = firstLevelCascaderCandidates(root).find((candidate) => candidate.label === label);
     if (!branch) continue;
     activateCascaderNode(branch.element, false);
-    const direct = await waitForDialogChoice(root, value, 320);
+    const direct = await waitForDialogChoice(root, value, 180);
     if (direct) {
       lastCascaderTrace.push(`matched:${label}`);
-      return direct;
+      const terminalCandidate = cascaderCandidates(root)
+        .find((candidate) => candidate.element === direct || candidate.element.contains(direct))
+        ?? { element: direct, label: normalizeSelectionText(direct.textContent ?? value) || value };
+      return { terminal: direct, path: [branch.label, terminalCandidate.label] };
     }
   }
   lastCascaderTrace.push('matched:none');
@@ -2360,8 +2558,32 @@ async function fillCascaderSelection(
   root: HTMLElement,
   value: string,
   confidence: 'high' | 'medium' | 'low',
+  capturedIdentity: DomControlIdentity,
+  field: FormField,
 ): Promise<boolean> {
   lastCascaderTrace = [`target:${value}`];
+  const cacheScope = cascaderPathCacheScope(capturedIdentity, value, root);
+  const cachedPath = await readCachedCascaderPath(cacheScope);
+  if (cachedPath) {
+    lastCascaderTrace.push(`cache:hit:${cachedPath.length}`);
+    const executed = await executeCascaderPath(root, cachedPath);
+    if (executed) {
+      await waitForDialogValue(el, value, 1400, capturedIdentity);
+      const cachedVerified = dialogValueMatches(el, value, capturedIdentity);
+      markField(resolveLiveControl(el, capturedIdentity), cachedVerified
+        ? (confidence === 'high' ? 'verified' : 'review')
+        : 'mismatch');
+      if (cachedVerified) return true;
+      await forgetCascaderPath(cacheScope);
+      return false;
+    }
+    lastCascaderTrace.push('cache:invalid');
+    await forgetCascaderPath(cacheScope);
+  } else {
+    lastCascaderTrace.push('cache:miss');
+  }
+
+  const resolvedPath: string[] = [];
   let remaining = normalizeSelectionText(value).replace(/[>／/、,，\s]+/g, '');
   for (let depth = 0; remaining && depth < 8; depth++) {
     const segment = await waitForCascaderSegment(root, remaining, depth === 0 ? 900 : 1800);
@@ -2374,23 +2596,39 @@ async function fillCascaderSelection(
         setDialogSearchValue(search, value);
         direct = await waitForDialogChoice(root, value, 2200);
       }
-      if (!direct && !search) direct = await searchCascaderBranches(root, value);
-      if (!direct) {
+      let agentResolution: { terminal: HTMLElement; path: string[] } | null = null;
+      if (!direct) agentResolution = await resolveCascaderThroughAgent(root, field, value, resolvedPath);
+      let exploredResolution: { terminal: HTMLElement; path: string[] } | null = null;
+      if (!direct && !agentResolution && !search) exploredResolution = await searchCascaderBranches(root, value);
+      const terminal = direct ?? agentResolution?.terminal ?? exploredResolution?.terminal;
+      if (!terminal) {
         markField(el, 'review');
         return false;
       }
-      activateCascaderNode(direct, true);
+      if (direct) {
+        const directCandidate = cascaderCandidates(root)
+          .find((candidate) => candidate.element === direct || candidate.element.contains(direct));
+        resolvedPath.push(directCandidate?.label ?? (normalizeSelectionText(direct.textContent ?? value) || value));
+      } else if (agentResolution) {
+        resolvedPath.splice(0, resolvedPath.length, ...agentResolution.path);
+      } else {
+        resolvedPath.push(...(exploredResolution?.path ?? []));
+      }
+      activateCascaderNode(terminal, true);
       remaining = '';
       break;
     }
     activateCascaderNode(segment.element, segment.remaining === '');
+    resolvedPath.push(segment.label);
     remaining = segment.remaining;
     if (remaining) await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  await waitForDialogValue(el, value, 1200);
-  const verified = dialogValueMatches(el, value);
-  markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+  await waitForDialogValue(el, value, 1400, capturedIdentity);
+  const verified = dialogValueMatches(el, value, capturedIdentity);
+  const live = resolveLiveControl(el, capturedIdentity);
+  markField(live, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+  if (verified && resolvedPath.length > 0) await saveCascaderPath(cacheScope, resolvedPath);
   return verified;
 }
 
@@ -2485,6 +2723,7 @@ async function fillDialogSelection(
   confidence: 'high' | 'medium' | 'low',
 ): Promise<boolean> {
   const interactionPlan = createDomControlInteractionPlan(buildDomControlProbe(el));
+  const capturedIdentity = domControlIdentity(el);
   const trigger = findSelectionTrigger(el);
   if (!trigger) return false;
   const field = extractField(el);
@@ -2497,7 +2736,7 @@ async function fillDialogSelection(
     return false;
   }
   if (interactionPlan.kind === 'cascader') {
-    return fillCascaderSelection(el, dialogRoot, value, confidence);
+    return fillCascaderSelection(el, dialogRoot, value, confidence, capturedIdentity, field);
   }
   let choice = await waitForDialogChoice(dialogRoot, value, 1200);
 
@@ -2525,15 +2764,15 @@ async function fillDialogSelection(
     return false;
   }
   choice.click();
-  await waitForDialogValue(el, value, 500);
+  await waitForDialogValue(el, value, 500, capturedIdentity);
 
-  if (!dialogValueMatches(el, value)) {
+  if (!dialogValueMatches(el, value, capturedIdentity)) {
     const confirm = findScopedSelectionConfirm(dialogRoot);
     confirm?.click();
-    await waitForDialogValue(el, value);
+    await waitForDialogValue(el, value, 1400, capturedIdentity);
   }
 
-  const verified = dialogValueMatches(el, value);
+  const verified = dialogValueMatches(el, value, capturedIdentity);
   if (verified) {
     markField(el, confidence === 'high' ? 'verified' : 'review');
     return true;
@@ -2545,8 +2784,9 @@ async function fillDialogSelection(
   // a later task instead of reporting a false failure immediately.
   markField(el, 'review');
   window.setTimeout(() => {
-    const deferredVerified = dialogValueMatches(el, value);
-    markField(el, deferredVerified
+    const live = resolveLiveControl(el, capturedIdentity);
+    const deferredVerified = dialogValueMatches(live, value, capturedIdentity);
+    markField(live, deferredVerified
       ? (confidence === 'high' ? 'verified' : 'review')
       : 'mismatch');
   }, 350);

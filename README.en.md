@@ -5,7 +5,7 @@
   <p>A local-first graduate application form assistant for Chrome, Edge, and Firefox.</p>
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-2.1.1-2563eb" />
+    <img alt="Version" src="https://img.shields.io/badge/version-2.1.2-2563eb" />
     <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.9-3178c6" />
     <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-16a34a" />
   </p>
@@ -23,6 +23,16 @@
 Graduate recommendation and early-admission systems repeatedly ask for the same profile, family, education, language, project, publication, patent, competition, and award data. Baotian keeps those records in the browser and helps inspect, plan, fill, and verify each application page.
 
 Version 2.0 introduces a page-level form Agent. Instead of matching keywords in isolation, it receives the actual page groups, rows, columns, format rules, and only the relevant saved records. This allows one profile to be transformed into different school-specific structures while remaining grounded in stored facts.
+
+## 2.1.2: dynamic cascaders join the Agent loop
+
+Hierarchical school, region, and major controls now use a constrained observe-act-readback loop instead of relying on one mechanical click:
+
+- Baotian captures stable `id / name / prop / xtype / caption / control kind` evidence before opening a control and uniquely rebinds the live node after Vue, React, or Element UI rerenders it.
+- Complete paths are selected locally. For leaf-only values such as a school name, the order is verified path cache, exact current option, local path decomposition, constrained Agent decision, then bounded exploration of at most 60 first-level branches.
+- On each step the Agent sees only the current visible allowlist and may return only one exact option. It cannot return scripts, selectors, coordinates, navigation, save, or submit actions, and may replan at most twice.
+- A profile value such as `Hefei University of Technology` can be verified against a uniquely coded page label. Ambiguous normalized duplicates stop for manual review.
+- A successful path is cached only after page readback. The cache stores no login state or API key and expires when the first-level structure changes or after 30 days.
 
 ## 2.1.1: understand the whole application before filling it
 
@@ -148,8 +158,8 @@ Download from [GitHub Releases](https://github.com/ironhxs/baoyan-auto-filler/re
 
 | File | Browser |
 |---|---|
-| `baotian-2.1.1-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
-| `baotian-2.1.1-firefox.zip` | Firefox temporary loading or later signed distribution |
+| `baotian-2.1.2-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
+| `baotian-2.1.2-firefox.zip` | Firefox temporary loading or later signed distribution |
 
 For Chrome / Edge, extract the archive, open `chrome://extensions/` or `edge://extensions/`, enable Developer mode, and choose **Load unpacked**.
 
