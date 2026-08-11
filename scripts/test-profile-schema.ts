@@ -5,6 +5,7 @@ const repeatIds = DEFAULT_REPEAT_SECTIONS.map((section) => section.id);
 assert.deepEqual(repeatIds, [
   'family',
   'language',
+  'education_career',
   'research_training',
   'internship_practice',
   'social_work',
@@ -26,4 +27,3 @@ assert.equal(getSectionDefinition('awards'), undefined);
 assert.equal(PROFILE_SECTIONS.filter((section) => section.id === 'honors_awards').length, 1);
 
 console.log('profile-schema tests passed');
-

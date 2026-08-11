@@ -7,6 +7,7 @@ import {
   sortTasksForCurrentSite,
   unbindTaskFromTab,
   updateTaskFromAutoRun,
+  updateTaskApplicationIdentity,
   updateTaskRunnerCheckpoint,
   canResumeRunner,
   upsertTaskPageAnalysis,
@@ -17,6 +18,10 @@ import type {
   ApplicationTask,
 } from '../utils/application-tasks';
 import type { ApplicationPageAnalysis, ApplicationRunnerCheckpoint } from '../utils/page-analysis';
+import { createAgentBatchBlueprint } from '../utils/agent/batch-prompt';
+import { agentFingerprint } from '../utils/agent/planner';
+import type { AgentBatchPlan } from '../utils/agent/batch-types';
+import type { AgentPageSnapshot } from '../utils/agent/types';
 
 const firstPage: ApplicationPageSnapshot = {
   id: 'page-basic',
@@ -38,6 +43,35 @@ const task = createApplicationTask({
   now: 100,
 });
 
+const agentSnapshot: AgentPageSnapshot = {
+  pageKey: 'basic-signature',
+  url: firstPage.url,
+  title: 'A 大学推免报名',
+  stepText: '基本信息',
+  instructions: ['手机号必须为 11 位'],
+  groups: [{
+    groupId: 'basic',
+    label: '基本信息',
+    kind: 'single',
+    columns: [],
+    rows: [],
+    fields: [{
+      targetId: 'phone',
+      index: 0,
+      label: '手机号',
+      currentValue: '',
+      required: true,
+      protected: false,
+      kind: 'text',
+      options: [],
+      placeholder: '',
+      formatHints: ['11 位手机号'],
+      forbiddenCharacters: [],
+    }],
+  }],
+  capturedAt: 150,
+};
+
 const analysisA: ApplicationPageAnalysis = {
   pageKey: firstPage.key,
   pageLabel: firstPage.label,
@@ -56,6 +90,7 @@ const analysisA: ApplicationPageAnalysis = {
     reviewed: 0,
     error: '',
   },
+  agentSnapshot,
   capturedAt: 150,
 };
 const analysisB: ApplicationPageAnalysis = { ...analysisA, pageKey: 'https://a.example/app/materials', capturedAt: 160 };
@@ -63,16 +98,55 @@ const withAnalysis = upsertTaskPageAnalysis(task, analysisA);
 assert.equal(getTaskPageAnalysis(withAnalysis, analysisA.pageKey)?.pageKey, analysisA.pageKey);
 assert.equal(getTaskPageAnalysis(withAnalysis, analysisB.pageKey), null);
 assert.equal(task.pageAnalyses, undefined, 'analysis update must not mutate the input task');
+const retrievedAnalysis = getTaskPageAnalysis(withAnalysis, analysisA.pageKey)!;
+retrievedAnalysis.agentSnapshot!.groups[0].fields[0].currentValue = 'mutated';
+assert.equal(
+  getTaskPageAnalysis(withAnalysis, analysisA.pageKey)?.agentSnapshot?.groups[0].fields[0].currentValue,
+  '',
+  'cached Agent snapshots must be cloned instead of sharing nested field state',
+);
+
+const batchBlueprint = createAgentBatchBlueprint('task-a', [{
+  snapshot: agentSnapshot,
+  sourceRecords: [{
+    recordId: 'basic:0',
+    categoryId: 'basic',
+    categoryLabel: '基本信息',
+    itemIndex: 0,
+    fields: { 手机号: '13800000000' },
+    searchText: '手机号: 13800000000',
+  }],
+}], 170);
+const batchPlan: AgentBatchPlan = {
+  version: 1,
+  blueprintFingerprint: batchBlueprint.fingerprint,
+  pagePlans: [{
+    version: 1,
+    pageKey: agentSnapshot.pageKey,
+    snapshotFingerprint: agentFingerprint(agentSnapshot),
+    profileFingerprint: agentFingerprint(batchBlueprint.pages[0].sourceRecords),
+    actions: [],
+    reviewItems: [],
+  }],
+  reviewItems: [],
+};
 
 const checkpoint: ApplicationRunnerCheckpoint = {
   status: 'running',
   lastPageKey: analysisA.pageKey,
   history: [],
+  batchPhase: 'planning',
+  batchBlueprint,
+  batchPlan,
   updatedAt: 180,
 };
 const withRunner = updateTaskRunnerCheckpoint(withAnalysis, checkpoint);
 assert.equal(withRunner.runner?.status, 'running');
 assert.equal(task.runner, undefined, 'immutable update must not mutate the input task');
+checkpoint.batchBlueprint!.pages[0].snapshot.title = 'mutated title';
+checkpoint.batchPlan!.pagePlans[0].reviewItems.push({ reviewId: 'mutated', message: 'mutated' });
+assert.equal(withRunner.runner?.batchBlueprint?.pages[0].snapshot.title, 'A 大学推免报名');
+assert.equal(withRunner.runner?.batchPlan?.pagePlans[0].reviewItems.length, 0);
 
 const taskA = createApplicationTask({
   id: 'independent-a',
@@ -104,6 +178,16 @@ assert.notEqual(first.runner?.lastPageKey, second.runner?.lastPageKey);
 
 assert.equal(task.status, 'stopped');
 assert.equal(task.displayName, 'A 大学');
+
+const identifiedTask = updateTaskApplicationIdentity(task, {
+  institutionName: '中山大学',
+  departmentName: '计算机学院',
+  projectName: '预推免',
+}, 175);
+assert.equal(identifiedTask.displayName, '中山大学 · 计算机学院 · 预推免');
+assert.equal(identifiedTask.siteTitle, '中山大学');
+assert.equal(identifiedTask.updatedAt, 175);
+assert.equal(task.displayName, 'A 大学', 'identity update must not mutate the input task');
 assert.deepEqual(task.pageOrder, ['page-basic']);
 assert.equal(task.pages['page-basic'].capturedAt, 100);
 

@@ -5,9 +5,39 @@ import {
   hasVerifiedRepeatRecordChange,
   isProtectedRepeatDialogControl,
   planRepeatDialogAssignments,
+  pickRepeatDialogFieldLabel,
   selectRepeatDialogRoot,
   selectRepeatDialogSaveCandidate,
+  validateRepeatDialogCommit,
 } from '../utils/repeatable-dialog';
+
+const repeatDialogModule = await import('../utils/repeatable-dialog');
+assert.equal(
+  typeof repeatDialogModule.selectRepeatDialogCancelCandidate,
+  'function',
+  'a failed record must have a narrowly scoped cancel selector before another group can continue',
+);
+const selectRepeatDialogCancelCandidate = repeatDialogModule.selectRepeatDialogCancelCandidate as <T>(
+  candidates: Array<{ id: T; label: string; recordAssociated: boolean }>,
+) => { id?: T; reason: 'record-cancel' | 'ambiguous-record-cancel' | 'no-record-cancel' };
+assert.deepEqual(selectRepeatDialogCancelCandidate([
+  { id: 'record-cancel', label: '\u53d6\u6d88', recordAssociated: true },
+  { id: 'page-submit', label: '\u63d0\u4ea4\u62a5\u540d', recordAssociated: false },
+]), { id: 'record-cancel', reason: 'record-cancel' });
+assert.deepEqual(selectRepeatDialogCancelCandidate([
+  { id: 'first', label: '\u53d6\u6d88', recordAssociated: true },
+  { id: 'second', label: '\u53d6\u6d88', recordAssociated: true },
+]), { id: undefined, reason: 'ambiguous-record-cancel' });
+assert.deepEqual(selectRepeatDialogCancelCandidate([
+  { id: 'close-page', label: '\u5173\u95ed\u9875\u9762', recordAssociated: false },
+]), { id: undefined, reason: 'no-record-cancel' });
+
+assert.equal(pickRepeatDialogFieldLabel({
+  columnLabel: '',
+  label: '\u5956\u9879\u7ea7\u522b',
+  hint: '*',
+  context: '*\u5956\u9879\u7ea7\u522b',
+}), '\u5956\u9879\u7ea7\u522b', 'the primary field label must not be polluted by validation hints or context');
 
 const fields = classifyRepeatDialogFields([
   { index: 0, label: '\u83b7\u5956\u65f6\u95f4', value: '', required: true, kind: 'text', protected: false },
@@ -34,6 +64,53 @@ const reorderedPaperFields = classifyRepeatDialogFields([
 ]);
 assert.deepEqual(reorderedPaperFields.map((field) => field.semanticKey), ['ranking', 'status', 'type', 'date', 'name']);
 
+const sysuProjectFields = classifyRepeatDialogFields([
+  { index: 0, label: '\u9879\u76ee\u540d\u79f0', value: '', required: true, kind: 'text', protected: false },
+  { index: 1, label: '\u9879\u76ee\u63cf\u8ff0', value: '', required: true, kind: 'text', protected: false },
+  { index: 2, label: '\u9879\u76ee\u65f6\u95f4\u6bb5', value: '', required: true, kind: 'text', protected: false },
+  { index: 3, label: '\u672c\u4eba\u89d2\u8272', value: '', required: true, kind: 'text', protected: false },
+]);
+assert.deepEqual(sysuProjectFields.map((field) => field.semanticKey), ['name', 'description', 'date', 'role']);
+assert.equal(sysuProjectFields.every((field) => !field.ambiguous), true, '本人角色 must be a first-class role field');
+assert.deepEqual(planRepeatDialogAssignments(sysuProjectFields, [
+  { key: '\u9879\u76ee\u540d\u79f0', value: 'PRISM-Net' },
+  { key: '\u9879\u76ee\u63cf\u8ff0', value: '缺失模态脑肿瘤分割研究' },
+  { key: '\u9879\u76ee\u65f6\u95f4\u6bb5', value: '2025.07-2026.07' },
+  { key: '\u672c\u4eba\u89d2\u8272', value: '排名第一' },
+]).failures, []);
+
+const sysuAwardFields = classifyRepeatDialogFields([
+  { index: 0, label: '\u5956\u9879\u540d\u79f0', value: '', required: true, kind: 'text', protected: false },
+  { index: 1, label: '\u5956\u9879\u7ea7\u522b', value: '', required: true, kind: 'text', protected: false },
+  { index: 2, label: '\u5956\u9879\u7b49\u7ea7', value: '', required: true, kind: 'text', protected: false },
+  { index: 3, label: '\u83b7\u5956\u65f6\u95f4', value: '', required: true, kind: 'text', protected: false },
+  { index: 4, label: '\u4e3b\u529e\u5355\u4f4d', value: '', required: true, kind: 'text', protected: false },
+  { index: 5, label: '\u63cf\u8ff0', value: '', required: true, kind: 'text', protected: false },
+  { index: 6, label: '\u672c\u4eba\u6392\u540d', value: '', required: true, kind: 'text', protected: false },
+]);
+assert.deepEqual(sysuAwardFields.map((field) => field.semanticKey), [
+  'name', 'level', 'level', 'date', 'organization', 'description', 'ranking',
+]);
+const sysuAwardPlan = planRepeatDialogAssignments(sysuAwardFields, [
+  { key: '\u5956\u9879\u540d\u79f0', value: 'OopsOS' },
+  { key: '\u5956\u9879\u7ea7\u522b', value: '\u534e\u4e1c\u533a\u57df\u8d5b' },
+  { key: '\u5956\u9879\u7b49\u7ea7', value: '\u4e09\u7b49\u5956' },
+  { key: '\u83b7\u5956\u65f6\u95f4', value: '2026-01' },
+  { key: '\u4e3b\u529e\u5355\u4f4d', value: '\u5927\u8d5b\u7ec4\u59d4\u4f1a' },
+  { key: '\u63cf\u8ff0', value: '\u64cd\u4f5c\u7cfb\u7edf\u5185\u6838\u6269\u5c55' },
+  { key: '\u672c\u4eba\u6392\u540d', value: '1' },
+]);
+assert.deepEqual(sysuAwardPlan.failures, [], 'distinct exact labels must override duplicate semantic categories');
+assert.deepEqual(sysuAwardPlan.assignments.map(({ index, sourceKey }) => ({ index, sourceKey })), [
+  { index: 0, sourceKey: '\u5956\u9879\u540d\u79f0' },
+  { index: 1, sourceKey: '\u5956\u9879\u7ea7\u522b' },
+  { index: 2, sourceKey: '\u5956\u9879\u7b49\u7ea7' },
+  { index: 3, sourceKey: '\u83b7\u5956\u65f6\u95f4' },
+  { index: 4, sourceKey: '\u4e3b\u529e\u5355\u4f4d' },
+  { index: 5, sourceKey: '\u63cf\u8ff0' },
+  { index: 6, sourceKey: '\u672c\u4eba\u6392\u540d' },
+]);
+
 const duplicateNames = classifyRepeatDialogFields([
   { index: 0, label: '\u8bba\u6587\u540d\u79f0', value: '', required: true, kind: 'text', protected: false },
   { index: 1, label: '\u6210\u679c\u540d\u79f0', value: '', required: true, kind: 'text', protected: false },
@@ -55,6 +132,17 @@ assert.equal(isProtectedRepeatDialogControl('\u8f93\u5165\u9a8c\u8bc1\u7801'), t
 assert.equal(isProtectedRepeatDialogControl('Choose advisor'), true);
 assert.equal(isProtectedRepeatDialogControl('Captcha'), true);
 assert.equal(isProtectedRepeatDialogControl('\u4fdd\u5b58'), false);
+
+assert.deepEqual(validateRepeatDialogCommit([
+  { required: true, protected: false, kind: 'text', value: 'Family member' },
+  { required: true, protected: false, kind: 'text', value: 'Parent' },
+]), { safe: true, reason: 'ready' });
+assert.deepEqual(validateRepeatDialogCommit([
+  { required: true, protected: false, kind: 'text', value: '' },
+]), { safe: false, reason: 'required-empty' });
+assert.deepEqual(validateRepeatDialogCommit([
+  { required: true, protected: true, kind: 'text', value: 'Do not commit' },
+]), { safe: false, reason: 'protected-required' });
 
 assert.deepEqual(selectRepeatDialogSaveCandidate([
   { id: 'save', label: '\u4fdd\u5b58', recordAssociated: true },

@@ -36,6 +36,7 @@ import {
   updateApplicationTask,
   updateTaskRunnerCheckpoint,
   updateTaskFromAutoRun,
+  updateTaskApplicationIdentity,
   upsertTaskPage,
   upsertTaskPageAnalysis,
 } from '@/utils/application-tasks';
@@ -59,16 +60,31 @@ import {
 } from '@/utils/page-analysis';
 import type { ApplicationPageAnalysis, CachedAnalysisRestoreResult } from '@/utils/page-analysis';
 import {
+  buildRepeatDialogTargetSchemas,
   buildRepeatDialogTargets,
   planRepeatableRecords,
   prepareRepeatableRowScan,
+  runSequentialRepeatPreparationPasses,
+  sameRepeatableGroupLabel,
   type PrepareRepeatRecordsResult,
+  type CommitRepeatRecordResult,
   type RepeatableRecordPlan,
   type PrepareRepeatRowsResult,
+  type RepeatableGroupObservation,
 } from '@/utils/repeatable-records';
 import { buildAgentPageSnapshot } from '@/utils/agent/page-snapshot';
+import { inferAgentApplicationIdentityFromPage } from '@/utils/agent/page-identity';
+import { buildAgentPreview } from '@/utils/agent/preview';
 import { retrieveAgentSourceRecords } from '@/utils/agent/profile-retriever';
-import { requestAgentPagePlan } from '@/utils/agent/planner';
+import {
+  completeRepeatDialogRecordWithAgent,
+  requestAgentPagePlan,
+} from '@/utils/agent/planner';
+import { sanitizeAgentSourceRecords } from '@/utils/agent/batch-prompt';
+import { requestAgentBatchPlan } from '@/utils/agent/batch-planner';
+import { findReusableAgentBatchPagePlan, mergeAgentBatchPages, refreshAgentBatchPage } from '@/utils/agent/batch-state';
+import { coordinateAgentBatchPlanning } from '@/utils/agent/batch-coordinator';
+import type { AgentBatchBlueprint, AgentBatchPageInput, AgentBatchPlan } from '@/utils/agent/batch-types';
 import {
   AGENT_PROTOCOL_VERSION,
   createAgentPlanCacheKey,
@@ -78,6 +94,7 @@ import {
 import { blockingAgentReviewItems, canAgentAdvance, validateAgentPlan } from '@/utils/agent/policy';
 import { buildAgentExecutionBatch } from '@/utils/agent/executor';
 import type { AgentExecutionResult } from '@/utils/agent/executor';
+import { decideRepeatRecordCommit } from '@/utils/agent/repeat-commit-policy';
 import { verifyAgentExecution } from '@/utils/agent/verifier';
 import { runAgentPage } from '@/utils/agent/runtime';
 import { agentCheckpointForPage, applyAgentControl } from '@/utils/agent/control';
@@ -88,6 +105,7 @@ import { accountAgentRun } from '@/utils/agent/run-accounting';
 import type {
   AgentActionResult,
   AgentCheckpoint,
+  AgentPageSemanticContext,
   AgentPagePlan,
   AgentPageSnapshot,
   AgentPlannedAction,
@@ -157,8 +175,13 @@ interface ScanSuccessResponse {
   pageLabel: string;
   pageUrl: string;
   pageSignature: string;
+  applicationTitle?: string;
+  stepText?: string;
+  visibleTexts?: string[];
+  instructions?: string[];
   repeatRowPreparation: PrepareRepeatRowsResult;
   repeatPlan: RepeatableRecordPlan;
+  repeatGroups?: RepeatableGroupObservation[];
   ai: {
     configured: boolean;
     mode: 'enhanced' | 'fallback';
@@ -166,6 +189,9 @@ interface ScanSuccessResponse {
     cached: boolean;
     reviewed: number;
     error: string;
+    agent?: boolean;
+    pendingActions?: number;
+    reviewItems?: number;
   };
 }
 
@@ -231,6 +257,9 @@ interface AutoRunState {
   confirmedMaterialPageKey?: string;
   lastPageKey?: string;
   agent?: AgentCheckpoint;
+  batchPhase?: 'collecting' | 'planning' | 'executing' | 'review';
+  batchBlueprint?: AgentBatchBlueprint;
+  batchPlan?: AgentBatchPlan;
 }
 
 interface AutoRunSuccessResponse extends AutoRunState {
@@ -587,6 +616,9 @@ async function saveAutoRunState(state: AutoRunState): Promise<void> {
         pauseReason: state.pauseReason as ApplicationTaskPauseReason | undefined,
         confirmedMaterialPageKey: state.confirmedMaterialPageKey,
         agent: state.agent,
+        batchPhase: state.batchPhase,
+        batchBlueprint: state.batchBlueprint,
+        batchPlan: state.batchPlan,
         updatedAt: state.updatedAt,
       };
       return updateTaskRunnerCheckpoint(nextTask, checkpoint);
@@ -681,6 +713,7 @@ async function savePageAnalysis(
   markers: PageMarkerItem[],
   checkedIndexes: number[],
   repeatPlan: RepeatableRecordPlan,
+  applicationTitle = '',
 ): Promise<void> {
   const pageKey = semanticPageKey({
     url: scan.pageUrl,
@@ -688,7 +721,25 @@ async function savePageAnalysis(
     signature: scan.pageSignature,
   });
   if (!pageKey) return;
-  await updateApplicationTask(taskId, (task) => upsertTaskPageAnalysis(task, {
+  const profileFields = await getAllTextFields();
+  const profileInstitution = profileFields.find((field) => (
+    /^(?:学校|所在学校|本科院校|毕业院校)$/u.test(field.key.trim())
+  ))?.value ?? '';
+  const identity = inferAgentApplicationIdentityFromPage({
+    title: applicationTitle || scan.pageLabel,
+    url: scan.pageUrl,
+    pageLabel: scan.pageLabel,
+    fields: scan.fields,
+    profileInstitution,
+  });
+  const capturedAt = Date.now();
+  const agentSnapshot = buildSnapshotForAgent({
+    ...scan,
+    applicationTitle: applicationTitle || scan.applicationTitle,
+  });
+  await updateApplicationTask(taskId, (task) => upsertTaskPageAnalysis(
+    updateTaskApplicationIdentity(task, identity, capturedAt),
+    {
     pageKey,
     pageLabel: scan.pageLabel,
     pageUrl: scan.pageUrl,
@@ -699,7 +750,8 @@ async function savePageAnalysis(
     checkedIndexes,
     repeatPlan,
     ai: scan.ai,
-    capturedAt: Date.now(),
+    agentSnapshot,
+    capturedAt,
   }));
 }
 
@@ -1465,7 +1517,7 @@ async function handleSavePageAnalysis(
     return errorResponse('The page changed before its analysis could be saved');
   }
   const task = await ensureTaskForTab(tab);
-  await savePageAnalysis(task.id, payload.scan, payload.markers, payload.checkedIndexes, payload.repeatPlan);
+  await savePageAnalysis(task.id, payload.scan, payload.markers, payload.checkedIndexes, payload.repeatPlan, tab.title || '');
   return { ok: true, type: 'pageAction' };
 }
 
@@ -1654,6 +1706,9 @@ async function handleStartAutoRun(): Promise<Response> {
     history: previous?.status === 'paused' ? previous.history : [],
     confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
     agent: previous?.status === 'paused' ? previous.agent : undefined,
+    batchPhase: previous?.status === 'paused' ? previous.batchPhase : undefined,
+    batchBlueprint: previous?.status === 'paused' ? previous.batchBlueprint : undefined,
+    batchPlan: previous?.status === 'paused' ? previous.batchPlan : undefined,
   };
   await saveAutoRunState(state);
   void processAutoRun(tab.id);
@@ -1676,6 +1731,9 @@ async function handleStopAutoRun(): Promise<Response> {
     history: previous?.history ?? [],
     confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
     agent: previous?.agent,
+    batchPhase: previous?.batchPhase,
+    batchBlueprint: previous?.batchBlueprint,
+    batchPlan: previous?.batchPlan,
   };
   await saveAutoRunState(state);
   return autoRunResponse(state);
@@ -1703,6 +1761,7 @@ async function collectTabScan(
   tabId: number,
   allowAi = true,
   deferFieldAiToAgent = false,
+  prepareRepeatables = true,
 ): Promise<ScanSuccessResponse> {
   const [textFields, blocks, apiConfig, textApiReady, fileRecords, categories] = await Promise.all([
     getAllTextFields(),
@@ -1713,48 +1772,164 @@ async function collectTabScan(
     getAllCategories(),
   ]);
   const readableFileRecords = await filterReadableFileRecords(fileRecords);
-  const preparedRows = await prepareRepeatableRowScan(
-    () => sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
-    (targets) => sendToContentScript<PrepareRepeatRowsResult>(tabId, { type: 'prepareRepeatRows', targets }),
-    blocks,
-    textFields,
-  );
-  let scanResults = preparedRows.scanResults;
-  let repeatRowPreparation = preparedRows.preparation;
-  const dialogGroups = new Set(repeatRowPreparation.dialogGroups ?? []);
-  if (dialogGroups.size > 0) {
-    const dialogPlan = planRepeatableRecords(
-      scanResults.map((result) => ({ ...result.field, index: result.index })),
-      blocks,
-      textFields,
-    );
-    const dialogTargets = buildRepeatDialogTargets(dialogPlan, blocks)
-      .filter((target) => dialogGroups.has(target.groupLabel));
-    const uncoveredGroups = [...dialogGroups]
-      .filter((groupLabel) => !dialogTargets.some((target) => target.groupLabel === groupLabel));
-    const dialogPreparation = dialogTargets.length > 0
-      ? await sendToContentScript<PrepareRepeatRecordsResult>(tabId, { type: 'prepareRepeatRecords', targets: dialogTargets })
-      : { added: 0, processed: 0, failures: [] };
-    repeatRowPreparation = {
-      added: repeatRowPreparation.added + dialogPreparation.added,
-      failures: [
-        ...repeatRowPreparation.failures,
-        ...dialogPreparation.failures.map((failure) => ({
-          groupLabel: failure.groupLabel,
-          reason: `${failure.presentation} record ${failure.itemIndex == null ? '' : `${failure.itemIndex + 1} `}${failure.reason}`.trim(),
-        })),
-        ...uncoveredGroups.map((groupLabel) => ({
-          groupLabel,
-          reason: 'Saved repeatable records are unavailable for the opened dialog',
-        })),
-      ],
-    };
-    scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' });
+  const initialScan = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' });
+  let scanResults = initialScan;
+  let repeatGroups: RepeatableGroupObservation[] = [];
+  let repeatRowPreparation: PrepareRepeatRowsResult = { added: 0, failures: [] };
+  let repeatAgentAttempted = false;
+  let repeatAgentCached = false;
+  let repeatAgentReviewed = 0;
+  let repeatAgentErrors: string[] = [];
+  if (prepareRepeatables) {
+    const excludedRepeatGroups = new Set<string>();
+    const sequentialPreparation = await runSequentialRepeatPreparationPasses(async () => {
+      const preparedRows = await prepareRepeatableRowScan(
+        () => sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
+        (targets) => sendToContentScript<PrepareRepeatRowsResult>(tabId, { type: 'prepareRepeatRows', targets }),
+        blocks,
+        textFields,
+        excludedRepeatGroups,
+      );
+      scanResults = preparedRows.scanResults;
+      repeatRowPreparation = {
+        added: repeatRowPreparation.added + preparedRows.preparation.added,
+        failures: [...repeatRowPreparation.failures, ...preparedRows.preparation.failures],
+      };
+      repeatGroups = await sendToContentScript<RepeatableGroupObservation[]>(tabId, { type: 'observeRepeatGroups' }).catch(() => []);
+      const dialogGroups = [...new Set(preparedRows.preparation.dialogGroups ?? [])];
+      if (dialogGroups.length === 0) return { dialogGroups };
+
+      const dialogPlan = planRepeatableRecords(
+        scanResults.map((result) => ({ ...result.field, index: result.index })),
+        blocks,
+        textFields,
+      );
+      const targetSchemas = buildRepeatDialogTargetSchemas(
+        scanResults.map((result) => ({ ...result.field, index: result.index })),
+        repeatGroups,
+      );
+      const dialogTargets = buildRepeatDialogTargets(dialogPlan, blocks, targetSchemas)
+        .filter((target) => dialogGroups.includes(target.groupLabel));
+      let preparedDialogTargets = dialogTargets;
+      if (dialogTargets.length > 0 && allowAi && textApiReady && apiConfig.aiEnhanced) {
+        const [repeatPageMeta, repeatPageContext] = await Promise.all([
+          sendToContentScript<{ label: string; url: string; signature: string }>(tabId, { type: 'getPageMeta' }),
+          sendToContentScript<AgentPageSemanticContext>(tabId, { type: 'getAgentPageContext' })
+            .catch(() => ({ title: '', stepText: '', visibleTexts: [], instructions: [] })),
+        ]);
+        preparedDialogTargets = [];
+        for (const target of dialogTargets) {
+          const schema = targetSchemas.find((candidate) => sameRepeatableGroupLabel(
+            candidate.groupLabel,
+            target.groupLabel,
+          ));
+          if (!schema) {
+            preparedDialogTargets.push(target);
+            continue;
+          }
+          const completedRecords: typeof target.records = [];
+          for (const record of target.records) {
+            const missingFields = schema.fields.filter((field) => (
+              field.required
+              && !field.currentValue?.trim()
+              && !record.fields.find((candidate) => candidate.key === field.key)?.value.trim()
+            ));
+            if (missingFields.length === 0 && !schema.fields.some((field) => (
+              !field.currentValue?.trim()
+              && !record.fields.find((candidate) => candidate.key === field.key)?.value.trim()
+            ))) {
+              completedRecords.push(record);
+              continue;
+            }
+            const completionInput = {
+              pageKey: repeatPageMeta.signature || repeatPageMeta.url,
+              pageUrl: repeatPageMeta.url,
+              pageTitle: repeatPageContext.title || repeatPageMeta.label,
+              stepText: repeatPageContext.stepText || target.groupLabel,
+              instructions: repeatPageContext.instructions,
+              visibleTexts: repeatPageContext.visibleTexts,
+              groupLabel: target.groupLabel,
+              schema,
+              record,
+            };
+            const completion = await completeRepeatDialogRecordWithAgent(
+              completionInput,
+              apiConfig,
+              {
+                requestText: requestAgentModelDurably,
+                loadPlan: async (planningInput) => {
+                  const key = createAgentPlanCacheKey({
+                    snapshot: planningInput.snapshot,
+                    sourceRecords: planningInput.sourceRecords,
+                    apiConfig,
+                  });
+                  const cached = await getAgentPlanCache(key);
+                  if (cached) repeatAgentCached = true;
+                  return cached?.plan ?? null;
+                },
+                savePlan: async (planningInput, plan) => {
+                  const key = createAgentPlanCacheKey({
+                    snapshot: planningInput.snapshot,
+                    sourceRecords: planningInput.sourceRecords,
+                    apiConfig,
+                  });
+                  await saveAgentPlanCache(key, planningInput.snapshot.pageKey, plan);
+                },
+              },
+            );
+            repeatAgentAttempted = repeatAgentAttempted || completion.attempted;
+            repeatAgentReviewed += completion.reviewed;
+            if (completion.error) repeatAgentErrors.push(`${target.groupLabel} 第${record.itemIndex + 1}条：${completion.error}`);
+            completedRecords.push(completion.record);
+          }
+          preparedDialogTargets.push({ ...target, records: completedRecords });
+        }
+      }
+      const uncoveredGroups = dialogGroups
+        .filter((groupLabel) => !preparedDialogTargets.some((target) => target.groupLabel === groupLabel));
+      const dialogPreparation = preparedDialogTargets.length > 0
+        ? await sendToContentScript<PrepareRepeatRecordsResult>(tabId, { type: 'prepareRepeatRecords', targets: preparedDialogTargets })
+        : { added: 0, processed: 0, failures: [] };
+      for (const groupLabel of dialogPreparation.dismissedGroups ?? []) {
+        excludedRepeatGroups.add(groupLabel);
+      }
+      repeatRowPreparation = {
+        added: repeatRowPreparation.added + dialogPreparation.added,
+        failures: [
+          ...repeatRowPreparation.failures,
+          ...dialogPreparation.failures.map((failure) => ({
+            groupLabel: failure.groupLabel,
+            reason: `${failure.presentation} record ${failure.itemIndex == null ? '' : `${failure.itemIndex + 1} `}${failure.reason}`.trim(),
+          })),
+          ...uncoveredGroups.map((groupLabel) => ({
+            groupLabel,
+            reason: 'Saved repeatable records are unavailable for the opened dialog',
+          })),
+        ],
+      };
+      scanResults = await sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' });
+      return {
+        dialogGroups,
+        stop: Boolean(dialogPreparation.blocked) || uncoveredGroups.length > 0,
+      };
+    });
+    if (sequentialPreparation.truncated) {
+      repeatRowPreparation.failures.push({
+        groupLabel: '复杂记录',
+        reason: 'Dynamic record preparation exceeded the bounded sequential pass limit',
+      });
+    }
+  } else {
+    repeatGroups = await sendToContentScript<RepeatableGroupObservation[]>(tabId, { type: 'observeRepeatGroups' }).catch(() => []);
   }
-  const pageMeta = await sendToContentScript<{ label: string; url: string; signature: string }>(
-    tabId,
-    { type: 'getPageMeta' },
-  );
+  const [pageMeta, pageContext] = await Promise.all([
+    sendToContentScript<{ label: string; url: string; signature: string }>(
+      tabId,
+      { type: 'getPageMeta' },
+    ),
+    sendToContentScript<AgentPageSemanticContext>(tabId, { type: 'getAgentPageContext' })
+      .catch(() => ({ title: '', stepText: '', visibleTexts: [], instructions: [] })),
+  ]);
   if (!scanResults?.length) {
     const repeatPlan = planRepeatableRecords([], blocks, textFields);
     return {
@@ -1767,8 +1942,13 @@ async function collectTabScan(
       pageLabel: pageMeta?.label || '当前页面',
       pageUrl: pageMeta?.url || '',
       pageSignature: pageMeta?.signature || pageMeta?.url || '',
+      applicationTitle: pageContext.title,
+      stepText: pageContext.stepText || pageMeta?.label || '当前页面',
+      visibleTexts: pageContext.visibleTexts,
+      instructions: pageContext.instructions,
       repeatRowPreparation,
       repeatPlan,
+      repeatGroups,
       ai: {
         configured: textApiReady,
         mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
@@ -1790,13 +1970,7 @@ async function collectTabScan(
   const repeatPlan = planRepeatableRecords(fieldInfos, blocks, textFields);
   const textFieldInfos = fieldInfos.filter((field) => field.kind !== 'file');
   const localMatches = matchFieldsLocally(textFieldInfos, textFields, blocks);
-  const pageAgentPreferred = deferFieldAiToAgent && shouldPreferPageAgent(
-    fieldInfos,
-    localMatches,
-    textApiReady,
-    apiConfig.aiEnhanced,
-  );
-  const aiFields = pageAgentPreferred
+  const aiFields = deferFieldAiToAgent
     ? []
     : apiConfig.aiEnhanced
       ? textFieldInfos.filter((field) => !field.protected || /只读|锁定/.test(field.protectionReason ?? ''))
@@ -1867,15 +2041,20 @@ async function collectTabScan(
     pageLabel: fieldInfos.find((field) => field.groupLabel)?.groupLabel || pageMeta?.label || fieldInfos[0]?.label || '当前页面',
     pageUrl: pageMeta?.url || '',
     pageSignature: pageMeta?.signature || pageMeta?.url || '',
+    applicationTitle: pageContext.title,
+    stepText: pageContext.stepText || pageMeta?.label || '当前页面',
+    visibleTexts: pageContext.visibleTexts,
+    instructions: pageContext.instructions,
     repeatRowPreparation,
     repeatPlan,
+    repeatGroups,
     ai: {
       configured: textApiReady,
       mode: apiConfig.aiEnhanced ? 'enhanced' : 'fallback',
-      attempted: aiAttempted,
-      cached: aiCached,
-      reviewed: aiMatches.length + materialAiReviewed,
-      error: aiError,
+        attempted: aiAttempted || repeatAgentAttempted,
+        cached: aiCached || repeatAgentCached,
+        reviewed: aiMatches.length + materialAiReviewed + repeatAgentReviewed,
+        error: [aiError, ...repeatAgentErrors].filter(Boolean).join('；').slice(0, 500),
     },
   };
 }
@@ -1883,7 +2062,29 @@ async function collectTabScan(
 async function handleScan(): Promise<Response> {
   const tab = await getCurrentTab();
   if (!tab?.id) return errorResponse('No active tab found');
-  const scan = await collectTabScan(tab.id);
+  const scan = await collectTabScan(tab.id, true, true, false);
+  const agentPreview = await runAgentPreviewForScan(scan);
+  if (agentPreview.attempted) {
+    const textFields = scan.fields.filter((field) => field.kind !== 'file');
+    const localMatches = scan.matches.filter((match) => match.kind !== 'file');
+    const fileMatches = scan.matches.filter((match) => match.kind === 'file');
+    const aiMatches = agentPreview.matches.map((match) => ({ ...match, source: 'ai_reviewed' as const }));
+    scan.matches = [
+      ...mergeLocalAndAiMatches(localMatches, aiMatches, textFields, true),
+      ...fileMatches,
+    ];
+    scan.matched = scan.matches.length;
+    scan.ai = {
+      ...scan.ai,
+      attempted: true,
+      cached: agentPreview.cached,
+      reviewed: agentPreview.reviewed,
+      error: agentPreview.error,
+      agent: true,
+      pendingActions: agentPreview.pendingActions,
+      reviewItems: agentPreview.reviewItems,
+    };
+  }
   const task = await ensureTaskForTab(tab);
   await savePageAnalysis(
     task.id,
@@ -1891,6 +2092,7 @@ async function handleScan(): Promise<Response> {
     buildPageMarkers(scan),
     defaultCheckedIndexes(scan),
     scan.repeatPlan,
+    tab.title || '',
   );
   return scan;
 }
@@ -2034,20 +2236,203 @@ function agentInstructions(fields: FormFieldInfo[]): string[] {
     const contextRules = (field.context ?? '').match(/[^。；;\n]{0,50}(?:日期格式|时间格式|不得|不能|禁止|最多|不超过)[^。；;\n]{0,80}/g) ?? [];
     return [field.dateFormat ?? '', field.hint ?? '', ...contextRules];
   });
-  return [...new Set(values.map((value) => value.replace(/\s+/g, ' ').trim()).filter(Boolean))].slice(0, 30);
+  return [...new Set(values.map((value) => value.replace(/\s+/g, ' ').trim()).filter(Boolean))];
 }
 
 function buildSnapshotForAgent(
-  scan: Pick<ScanSuccessResponse, 'pageSignature' | 'pageUrl' | 'pageLabel' | 'fields'>,
+  scan: Pick<ScanSuccessResponse, 'pageSignature' | 'pageUrl' | 'pageLabel' | 'fields'> & {
+    visibleTexts?: string[];
+    instructions?: string[];
+    applicationTitle?: string;
+    stepText?: string;
+    profileInstitution?: string;
+    repeatGroups?: RepeatableGroupObservation[];
+  },
 ): AgentPageSnapshot {
+  const instructions = [...new Set([
+    ...(scan.instructions ?? []),
+    ...agentInstructions(scan.fields),
+  ])];
   return buildAgentPageSnapshot({
     pageKey: scan.pageSignature,
     url: scan.pageUrl,
-    title: scan.pageLabel,
-    stepText: scan.pageLabel,
-    instructions: agentInstructions(scan.fields),
+    title: scan.applicationTitle || scan.pageLabel,
+    stepText: scan.stepText || scan.pageLabel,
+    instructions,
+    visibleTexts: scan.visibleTexts ?? [
+      scan.pageLabel,
+      ...scan.fields.flatMap((field) => [
+        field.groupLabel ?? '',
+        field.repeatGroup ?? '',
+        field.columnLabel ?? '',
+        field.label ?? '',
+        field.hint ?? '',
+        field.context ?? '',
+        (field.value?.length ?? 0) <= 80 ? (field.value ?? '') : '',
+      ]),
+    ],
+    profileInstitution: scan.profileInstitution,
     fields: scan.fields,
+    repeatGroups: scan.repeatGroups,
   });
+}
+
+async function collectAgentBatchPages(
+  state: AutoRunState,
+  currentSnapshot: AgentPageSnapshot,
+): Promise<AgentBatchPageInput[]> {
+  if (!state.taskId) return [];
+  const task = await getApplicationTask(state.taskId);
+  const [blocks, textFields] = await Promise.all([
+    getAllBlockCategories(),
+    getAllTextFields(),
+  ]);
+  const snapshots = Object.values(task?.pageAnalyses ?? {})
+    .map((analysis) => analysis.agentSnapshot)
+    .filter((snapshot): snapshot is AgentPageSnapshot => Boolean(snapshot));
+  const pageInputs = mergeAgentBatchPages([
+    ...snapshots.map((snapshot) => ({ snapshot, sourceRecords: [] })),
+    { snapshot: currentSnapshot, sourceRecords: [] },
+  ]);
+  return pageInputs.map((page) => ({
+    ...page,
+    sourceRecords: retrieveAgentSourceRecords(page.snapshot, blocks, textFields),
+  }));
+}
+
+async function prepareAgentBatchPlanForCurrentPage(
+  state: AutoRunState,
+  currentSnapshot: AgentPageSnapshot,
+  apiConfig: Awaited<ReturnType<typeof getApiConfig>>,
+): Promise<AgentPagePlan | null> {
+  const pages = await collectAgentBatchPages(state, currentSnapshot);
+  if (pages.length < 2) {
+    state.batchPhase = 'collecting';
+    state.batchBlueprint = undefined;
+    state.batchPlan = undefined;
+    await saveAutoRunState(state);
+    return null;
+  }
+  try {
+    const result = await coordinateAgentBatchPlanning({
+      applicationId: state.taskId || state.batchId || 'application',
+      pages,
+      currentPageKey: currentSnapshot.pageKey,
+      existingBlueprint: state.batchBlueprint,
+      existingPlan: state.batchPlan,
+      capturedAt: Date.now(),
+    }, {
+      requestPlan: async (blueprint) => {
+        state.batchPhase = 'planning';
+        state.batchBlueprint = blueprint;
+        state.batchPlan = undefined;
+        state.message = `保填 Agent 正在综合分析 ${blueprint.pages.length} 个页面`;
+        await saveAutoRunState(state);
+        return requestAgentBatchPlan(blueprint, apiConfig, {
+          requestText: requestAgentModelDurably,
+        });
+      },
+    });
+    state.batchPhase = result.phase;
+    state.batchBlueprint = result.blueprint;
+    state.batchPlan = result.plan;
+    await saveAutoRunState(state);
+    return result.currentPagePlan;
+  } catch (error) {
+    state.batchPhase = 'review';
+    state.batchBlueprint = undefined;
+    state.batchPlan = undefined;
+    state.message = `跨页 Agent 规划未完成，本页将继续单页规划：${error instanceof Error ? error.message : '未知错误'}`
+      .replace(/\s+/g, ' ')
+      .slice(0, 240);
+    await saveAutoRunState(state);
+    return null;
+  }
+}
+
+interface AgentPreviewRunResult {
+  matches: MatchResult[];
+  attempted: boolean;
+  cached: boolean;
+  reviewed: number;
+  pendingActions: number;
+  reviewItems: number;
+  error: string;
+}
+
+function profileInstitutionFromTextFields(fields: Awaited<ReturnType<typeof getAllTextFields>>): string {
+  return fields.find((field) => /^(?:学校|所在学校|本科院校|毕业院校)$/u.test(field.key.trim()))?.value?.trim() ?? '';
+}
+
+async function runAgentPreviewForScan(
+  scan: ScanSuccessResponse,
+): Promise<AgentPreviewRunResult> {
+  const apiConfig = await getApiConfig();
+  const configured = await isApiConfigured();
+  const empty: AgentPreviewRunResult = {
+    matches: [], attempted: false, cached: false, reviewed: 0,
+    pendingActions: 0, reviewItems: 0, error: '',
+  };
+  if (!configured || !apiConfig.aiEnhanced || scan.fields.length === 0) return empty;
+
+  const [blocks, textFields, fileRecords] = await Promise.all([
+    getAllBlockCategories(),
+    getAllTextFields(),
+    getAllFileRecords(),
+  ]);
+  const snapshot = buildSnapshotForAgent({
+    pageSignature: scan.pageSignature,
+    pageUrl: scan.pageUrl,
+    pageLabel: scan.pageLabel,
+    fields: scan.fields,
+    applicationTitle: scan.applicationTitle,
+    stepText: scan.stepText,
+    visibleTexts: scan.visibleTexts,
+    instructions: scan.instructions,
+    repeatGroups: scan.repeatGroups,
+    profileInstitution: profileInstitutionFromTextFields(textFields),
+  });
+  const sourceRecords = retrieveAgentSourceRecords(snapshot, blocks, textFields);
+  if (sourceRecords.length === 0) return { ...empty, attempted: true };
+
+  const key = createAgentPlanCacheKey({ snapshot, sourceRecords, apiConfig });
+  let plan: AgentPagePlan;
+  let cached = false;
+  try {
+    const existing = await getAgentPlanCache(key);
+    if (existing) {
+      cached = true;
+      plan = existing.plan;
+    } else {
+      plan = await requestAgentPagePlan({
+        snapshot,
+        sourceRecords,
+        fileRecordIds: fileRecords.flatMap((record) => record.id == null ? [] : [String(record.id)]),
+      }, apiConfig, { requestText: requestAgentModelDurably });
+      await saveAgentPlanCache(key, snapshot.pageKey, plan);
+    }
+    const preview = buildAgentPreview({
+      snapshot,
+      sourceRecords,
+      plan,
+      fileRecordIds: fileRecords.flatMap((record) => record.id == null ? [] : [String(record.id)]),
+    });
+    return {
+      matches: preview.matches,
+      attempted: true,
+      cached,
+      reviewed: preview.matches.length + preview.reviewItems.length,
+      pendingActions: preview.pendingStructureActions.length,
+      reviewItems: preview.reviewItems.length,
+      error: '',
+    };
+  } catch (error) {
+    return {
+      ...empty,
+      attempted: true,
+      error: (error instanceof Error ? error.message : 'Agent 规划失败').replace(/\s+/g, ' ').slice(0, 240),
+    };
+  }
 }
 
 function agentSnapshotValues(snapshot: AgentPageSnapshot): Record<string, string> {
@@ -2081,6 +2466,7 @@ async function runAgentForScan(
   tabId: number,
   state: AutoRunState,
   initialScan: ScanSuccessResponse,
+  preplannedPlan?: AgentPagePlan | null,
 ): Promise<AgentScanRunResult> {
   const apiConfig = await getApiConfig();
   let currentSnapshot = buildSnapshotForAgent(initialScan);
@@ -2090,19 +2476,29 @@ async function runAgentForScan(
   let lastAfterSnapshot = currentSnapshot;
   let lastContentResults: AgentExecutionResult[] = [];
   let lastExecutionPlan: AgentPagePlan | null = null;
-  let preparedResults: AgentActionResult[] = [];
+  let lastCommitResults: AgentActionResult[] = [];
+  let lastCommittedTargets = new Set<string>();
   const filledThisRun = new Set<string>();
+  let pendingPreplannedPlan = preplannedPlan ?? null;
 
   const observe = async (): Promise<AgentPageSnapshot> => {
-    const [results, meta] = await Promise.all([
+    const [results, meta, pageContext, repeatGroups] = await Promise.all([
       sendToContentScript<Array<{ index: number; field: FormFieldInfo }>>(tabId, { type: 'scan' }),
       sendToContentScript<{ label: string; url: string; signature: string }>(tabId, { type: 'getPageMeta' }),
+      sendToContentScript<AgentPageSemanticContext>(tabId, { type: 'getAgentPageContext' })
+        .catch(() => ({ title: '', stepText: '', visibleTexts: [], instructions: [] })),
+      sendToContentScript<RepeatableGroupObservation[]>(tabId, { type: 'observeRepeatGroups' }).catch(() => []),
     ]);
     currentSnapshot = buildSnapshotForAgent({
       pageSignature: meta.signature,
       pageUrl: meta.url,
       pageLabel: meta.label,
+      applicationTitle: pageContext.title,
+      stepText: pageContext.stepText || meta.label,
+      visibleTexts: pageContext.visibleTexts,
+      instructions: pageContext.instructions,
       fields: (results ?? []).map((result) => ({ ...result.field, index: result.index })),
+      repeatGroups,
     });
     return currentSnapshot;
   };
@@ -2115,13 +2511,44 @@ async function runAgentForScan(
       await getAllTextFields(),
     ),
     plan: async (snapshot, sourceRecords) => {
-      const key = createAgentPlanCacheKey({ snapshot, sourceRecords, apiConfig });
+      const explicitBatchPlan = pendingPreplannedPlan ? {
+        version: 1 as const,
+        blueprintFingerprint: state.batchPlan?.blueprintFingerprint ?? '',
+        pagePlans: [pendingPreplannedPlan],
+        reviewItems: [],
+      } : null;
+      const reusableBatchPlan = findReusableAgentBatchPagePlan(
+        explicitBatchPlan ?? state.batchPlan,
+        snapshot,
+        sourceRecords,
+      );
+      pendingPreplannedPlan = null;
+      if (reusableBatchPlan) {
+        cached = true;
+        return reusableBatchPlan;
+      }
+      const planningRecords = state.batchBlueprint && state.batchPlan
+        ? sanitizeAgentSourceRecords(sourceRecords)
+        : sourceRecords;
+      const key = createAgentPlanCacheKey({ snapshot, sourceRecords: planningRecords, apiConfig });
       const existing = await getAgentPlanCache(key);
       if (existing) {
         cached = true;
+        if (state.batchBlueprint && state.batchPlan) {
+          const refreshed = refreshAgentBatchPage(
+            state.batchBlueprint,
+            state.batchPlan,
+            { snapshot, sourceRecords: planningRecords },
+            existing.plan,
+          );
+          state.batchBlueprint = refreshed.blueprint;
+          state.batchPlan = refreshed.plan;
+          state.batchPhase = 'executing';
+          await saveAutoRunState(state);
+        }
         return existing.plan;
       }
-      const plan = await requestAgentPagePlan({ snapshot, sourceRecords }, apiConfig, {
+      const plan = await requestAgentPagePlan({ snapshot, sourceRecords: planningRecords }, apiConfig, {
         requestText: requestAgentModelDurably,
         loadChunkPlan: async (chunk) => {
           const chunkKey = createAgentPlanCacheKey({
@@ -2147,6 +2574,18 @@ async function runAgentForScan(
         },
       });
       await saveAgentPlanCache(key, snapshot.pageKey, plan);
+      if (state.batchBlueprint && state.batchPlan) {
+        const refreshed = refreshAgentBatchPage(
+          state.batchBlueprint,
+          state.batchPlan,
+          { snapshot, sourceRecords: planningRecords },
+          plan,
+        );
+        state.batchBlueprint = refreshed.blueprint;
+        state.batchPlan = refreshed.plan;
+        state.batchPhase = 'executing';
+        await saveAutoRunState(state);
+      }
       return plan;
     },
     validate: (plan, snapshot, sourceRecords) => {
@@ -2182,22 +2621,22 @@ async function runAgentForScan(
       };
     },
     prepare: async (validated) => {
-      preparedResults = [];
       const additions = validated.executableActions.filter((action) => action.type === 'add_rows');
-      if (additions.length === 0) return;
+      if (additions.length === 0) return { structureChanged: false, results: [] };
       const targets = additions.flatMap((action) => {
         if (action.type !== 'add_rows') return [];
         const group = currentSnapshot.groups.find((candidate) => candidate.groupId === action.groupId);
+        const currentRows = Math.max(group?.rows.length ?? 0, group?.observation?.currentRowCount ?? 0);
         return group ? [{
           groupLabel: group.label,
-          requiredRows: group.rows.length + action.count,
-          missingItemIndexes: Array.from({ length: action.count }, (_, index) => group.rows.length + index),
+          requiredRows: currentRows + action.count,
+          missingItemIndexes: Array.from({ length: action.count }, (_, index) => currentRows + index),
         }] : [];
       });
       const prepared = targets.length > 0
         ? await sendToContentScript<PrepareRepeatRowsResult>(tabId, { type: 'prepareRepeatRows', targets })
         : { added: 0, failures: [] };
-      preparedResults = additions.map((action) => ({
+      const results = additions.map((action) => ({
         actionId: action.actionId,
         status: prepared.failures.some((failure) => (
           currentSnapshot.groups.find((group) => group.groupId === action.groupId)?.label === failure.groupLabel
@@ -2207,12 +2646,18 @@ async function runAgentForScan(
         retryable: prepared.failures.length > 0,
         updatedAt: Date.now(),
       }));
-      await observe();
+      return {
+        structureChanged: prepared.added > 0 || (prepared.dialogGroups?.length ?? 0) > 0,
+        results,
+        reason: prepared.failures.map((failure) => failure.reason).join('; ') || undefined,
+      };
     },
     execute: async (validated) => {
       lastExecutionPlan = { ...validated.plan, actions: validated.executableActions };
       const batch = buildAgentExecutionBatch(lastExecutionPlan, currentSnapshot);
       lastBeforeValues = agentSnapshotValues(currentSnapshot);
+      lastCommitResults = [];
+      lastCommittedTargets = new Set<string>();
       if (!batch.safeToExecute) {
         lastContentResults = [
           ...batch.missingTargetIds.map((targetId) => ({
@@ -2234,6 +2679,43 @@ async function runAgentForScan(
           : [];
       }
       for (const result of lastContentResults) if (result.matched) filledThisRun.add(result.targetId);
+      const dialogGroups = currentSnapshot.groups.filter((group) => group.observation?.dialogVisible);
+      const commitDecision = decideRepeatRecordCommit({
+        targetIds: batch.items.map((item) => item.targetId),
+        executionResults: lastContentResults,
+        visibleDialogGroups: dialogGroups.map((group) => group.label),
+      });
+      if (commitDecision.action === 'commit') {
+          const commit = await sendToContentScript<CommitRepeatRecordResult>(tabId, {
+            type: 'commitRepeatRecord',
+            groupLabel: commitDecision.groupLabel,
+          }).catch(() => ({
+            groupLabel: commitDecision.groupLabel,
+            committed: false,
+            reason: 'record-commit-message-failed',
+          }));
+          if (commit.committed) {
+            lastCommittedTargets = new Set(commitDecision.committedTargetIds);
+          } else {
+            lastCommitResults.push({
+              actionId: batch.items[0].actionId,
+              status: 'failed',
+              observed: '',
+              reason: `repeat-record-commit-failed:${commit.reason}`,
+              retryable: true,
+              updatedAt: Date.now(),
+            });
+          }
+      } else if (commitDecision.action === 'fail') {
+        lastCommitResults.push({
+          actionId: batch.items[0]?.actionId ?? 'repeat-record-commit',
+          status: 'failed',
+          observed: '',
+          reason: `repeat-record-commit-failed:${commitDecision.reason}`,
+          retryable: false,
+          updatedAt: Date.now(),
+        });
+      }
       lastAfterSnapshot = await observe();
       const executionResults: AgentActionResult[] = lastContentResults.map((result) => ({
         actionId: result.actionId,
@@ -2244,12 +2726,17 @@ async function runAgentForScan(
         retryable: /target-not-found|page-changed|write-readback-mismatch/.test(result.reason),
         updatedAt: Date.now(),
       }));
-      return { results: [...preparedResults, ...executionResults] };
+      return { results: [...executionResults, ...lastCommitResults] };
     },
     verify: async (validated, report) => {
       const verificationPlan = lastExecutionPlan ?? { ...validated.plan, actions: validated.executableActions };
       const planTargets = agentPlanTargetActions(verificationPlan);
       const afterValues = agentSnapshotValues(lastAfterSnapshot);
+      for (const result of lastContentResults) {
+        if (lastCommittedTargets.has(result.targetId) && !afterValues[result.targetId]) {
+          afterValues[result.targetId] = result.observed;
+        }
+      }
       const verification = verifyAgentExecution({
         plan: verificationPlan,
         snapshot: lastAfterSnapshot,
@@ -2274,8 +2761,10 @@ async function runAgentForScan(
           updatedAt: Date.now(),
         } satisfies AgentActionResult;
       });
-      const failedActionIds = [...new Set(results.filter((result) => result.status === 'failed')
-        .map((result) => result.actionId))];
+      const failedActionIds = [...new Set([
+        ...report.results.filter((result) => result.status === 'failed').map((result) => result.actionId),
+        ...results.filter((result) => result.status === 'failed').map((result) => result.actionId),
+      ])];
       const rowBlocked = verification.rowStatuses.some((row) => row.blocksAdvance);
       const allFieldStatuses = Object.fromEntries(lastAfterSnapshot.groups.flatMap((group) => group.fields)
         .map((field) => [
@@ -2356,10 +2845,10 @@ async function processAutoRun(tabId: number): Promise<void> {
       // has finished its first DOM pass. Give the page a short settling window.
       await new Promise((resolve) => setTimeout(resolve, 600));
     }
-    let scan = await collectTabScan(tabId, true, true);
+    let scan = await collectTabScan(tabId, true, true, false);
     if (scan.total === 0 && state.pageCount > 0) {
       await new Promise((resolve) => setTimeout(resolve, 600));
-      scan = await collectTabScan(tabId, true, true);
+      scan = await collectTabScan(tabId, true, true, false);
     }
     if (!(await isSamePage(tabId, scan))) {
       await retryAutoRunAfterPageChange(state);
@@ -2405,19 +2894,7 @@ async function processAutoRun(tabId: number): Promise<void> {
         ? savePageAnalysis(state.taskId, scan, markers, defaultCheckedIndexes(scan), scan.repeatPlan)
         : Promise.resolve(),
     ]);
-    if (scan.repeatRowPreparation.failures.length > 0) {
-      state.status = 'paused';
-      state.pauseReason = 'required';
-      state.message = `Repeatable rows need attention: ${scan.repeatRowPreparation.failures
-        .map((failure) => `${failure.groupLabel}: ${failure.reason}`)
-        .join('; ')}`;
-      historyEntry.status = 'paused';
-      historyEntry.message = state.message;
-      historyEntry.updatedAt = Date.now();
-      await saveAutoRunState(state);
-      return;
-    }
-    const scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
+    let scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
     const fileFields = scan.fields.filter((field) => field.kind === 'file');
     const currentMaterialPageKey = semanticPageKey({
       url: scan.pageUrl,
@@ -2450,13 +2927,45 @@ async function processAutoRun(tabId: number): Promise<void> {
       return;
     }
     const [apiConfig, configured] = await Promise.all([getApiConfig(), isApiConfigured()]);
-    let result: { success: number; failure: number };
-    if (shouldUsePageAgent(scan, configured, apiConfig.aiEnhanced)) {
-      state.message = '保填 Agent 正在按页面行列和填写规则生成整页计划';
+    const usePageAgent = shouldUsePageAgent(scan, configured, apiConfig.aiEnhanced);
+    if (Object.values(scan.repeatPlan.groups).some((group) => group.rowsToAdd > 0)) {
+      const preparedScan = await collectTabScan(tabId, true, true, true);
+      if (!(await isSamePage(tabId, preparedScan))) {
+        await retryAutoRunAfterPageChange(state);
+        return;
+      }
+      scan = preparedScan;
+      scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
+    }
+    if (scan.repeatRowPreparation.failures.length > 0) {
+      state.status = 'paused';
+      state.pauseReason = 'required';
+      state.message = `Repeatable rows need attention: ${scan.repeatRowPreparation.failures
+        .map((failure) => `${failure.groupLabel}: ${failure.reason}`)
+        .join('; ')}`;
+      historyEntry.status = 'paused';
       historyEntry.message = state.message;
       historyEntry.updatedAt = Date.now();
       await saveAutoRunState(state);
-      const agentRun = await runAgentForScan(tabId, state, scan);
+      return;
+    }
+    let result: { success: number; failure: number };
+    if (usePageAgent) {
+      const currentAgentSnapshot = buildSnapshotForAgent(scan);
+      state.message = '保填 Agent 正在汇总已识别页面并生成当前页计划';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
+      await saveAutoRunState(state);
+      const preplannedPlan = await prepareAgentBatchPlanForCurrentPage(state, currentAgentSnapshot, apiConfig);
+      state.message = preplannedPlan
+        ? `保填 Agent 已完成 ${state.batchBlueprint?.pages.length ?? 1} 页综合规划，正在执行当前页`
+        : state.batchPhase === 'collecting'
+          ? '当前仅收集到一页，先按当前页完整语义规划；后续页面会加入跨页综合分析'
+          : '保填 Agent 正在按当前页面的完整题干、注释和结构生成计划';
+      historyEntry.message = state.message;
+      historyEntry.updatedAt = Date.now();
+      await saveAutoRunState(state);
+      const agentRun = await runAgentForScan(tabId, state, scan, preplannedPlan);
       scan.ai.attempted = true;
       scan.ai.cached = agentRun.cached;
       scan.ai.reviewed += agentRun.reviewed;

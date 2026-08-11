@@ -6,12 +6,21 @@ import { inferImageMimeType } from '@/utils/image-mime';
 import { chooseNearestAncestorQuestionContext } from '@/utils/field-context';
 import { stableTargetId } from '@/utils/agent/page-snapshot';
 import type { AgentExecutionItem, AgentExecutionResult } from '@/utils/agent/executor';
+import type { AgentPageSemanticContext } from '@/utils/agent/types';
+import {
+  buildAgentPageSemanticText,
+  isSensitiveAgentPageText,
+  normalizeAgentPageText,
+} from '@/utils/agent/page-context';
 import { classifyObservedRepeatTable, extractAgentFieldRules } from '@/utils/agent/field-rules';
 import {
   MAX_REPEAT_ROW_ADDITIONS_PER_PASS,
+  forEachRepeatPreparationTarget,
   isAddRowLabel,
   limitRepeatRecordBatch,
   planRepeatRowPreparation,
+  type CommitRepeatRecordResult,
+  type RepeatableGroupObservation,
 } from '@/utils/repeatable-records';
 import {
   classifyRepeatableHeaderSchema,
@@ -24,10 +33,40 @@ import {
   classifyRepeatDialogFields,
   hasVerifiedRepeatRecordChange,
   isProtectedRepeatDialogControl,
+  pickRepeatDialogFieldLabel,
   planRepeatDialogAssignments,
+  selectRepeatDialogCancelCandidate,
   selectRepeatDialogRoot,
   selectRepeatDialogSaveCandidate,
+  validateRepeatDialogCommit,
 } from '@/utils/repeatable-dialog';
+import {
+  selectAdjacentRepeatGroupSurface,
+  type RepeatGroupSurfaceNode,
+} from '@/utils/repeat-group-surface';
+import {
+  classifyDomControl,
+  collectDisplayValueCandidates,
+  createDomControlInteractionPlan,
+  datePickerValuesEquivalent,
+  getCascaderNodeActivationSelectors,
+  getOverlayRootSelectors,
+  isActionableOverlayCandidate,
+  isActionableOverlaySurface,
+  parseDatePickerTarget,
+  pickCascaderExplorationLabels,
+  pickControlIdentityCandidate,
+  pickHierarchicalSegment,
+  selectionTextsEquivalent,
+  type DomControlKind,
+  type DomControlIdentity,
+  type DomControlProbe,
+} from '@/utils/dom-control-adapter';
+import {
+  alignRepeatableQuestionCell,
+  findRepeatableQuestionCell,
+  restoreRepeatableQuestionCell,
+} from '@/utils/marker-layout';
 
 interface FormField {
   kind: 'text' | 'file';
@@ -91,6 +130,9 @@ interface FillResult {
 }
 
 interface ScanMessage { type: 'scan' }
+interface ObserveRepeatGroupsMessage { type: 'observeRepeatGroups' }
+interface CommitRepeatRecordMessage { type: 'commitRepeatRecord'; groupLabel: string }
+interface GetAgentPageContextMessage { type: 'getAgentPageContext' }
 interface FillMessage { type: 'fill'; items: FillItem[] }
 interface FillStreamInitMessage { type: 'fillStreamInit'; items: Array<{ index: number; fillMode: 'short' | 'long' }> }
 interface FillFieldMessage { type: 'fillField'; index: number; value: string; confidence?: 'high' | 'medium' | 'low' }
@@ -120,6 +162,8 @@ interface PrepareRepeatRecordsMessage {
 interface PrepareRepeatRecordsResult {
   added: number;
   processed: number;
+  blocked?: boolean;
+  dismissedGroups?: string[];
   failures: Array<{
     groupLabel: string;
     itemIndex?: number;
@@ -142,11 +186,12 @@ interface ExecuteAgentActionsMessage {
   pageKey: string;
   items: AgentExecutionItem[];
 }
-type Message = ScanMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetExistingMaterialPreviewMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
+type Message = ScanMessage | ObserveRepeatGroupsMessage | CommitRepeatRecordMessage | GetAgentPageContextMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetExistingMaterialPreviewMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
 let lastFocusedElement: HTMLElement | null = null;
+let lastCascaderTrace: string[] = [];
 
 function findLabel(el: HTMLElement): string {
   if (el.id) {
@@ -200,9 +245,117 @@ const EDITABLE_SELECTOR = [
 
 const FILE_SELECTOR = 'input[type="file"]';
 const SCANNABLE_SELECTOR = `${EDITABLE_SELECTOR},${FILE_SELECTOR}`;
+const CUSTOM_CONTROL_SELECTOR = [
+  '.res-select',
+  '.res-cascader',
+  '.res-date-picker',
+  '.el-select',
+  '.el-cascader',
+  '.el-date-editor',
+  '[role="combobox"]',
+  '[aria-haspopup="listbox"]',
+].join(',');
+const EPHEMERAL_OVERLAY_SELECTOR = [
+  ...getOverlayRootSelectors('select'),
+  ...getOverlayRootSelectors('cascader'),
+  ...getOverlayRootSelectors('date-picker'),
+].join(',');
 
 function normalizeText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+function getCustomControlOwner(el: HTMLElement): HTMLElement | null {
+  return el.closest<HTMLElement>(CUSTOM_CONTROL_SELECTOR);
+}
+
+function getControlAttribute(el: HTMLElement, name: string): string {
+  const direct = el.getAttribute(name);
+  if (direct) return direct;
+  let ancestor: HTMLElement | null = el.parentElement;
+  for (let depth = 0; ancestor && ancestor !== document.body && depth < 6; depth++, ancestor = ancestor.parentElement) {
+    const value = ancestor.getAttribute(name);
+    if (value) return value;
+  }
+  return '';
+}
+
+function domControlIdentity(el: HTMLElement): DomControlIdentity {
+  return {
+    tagName: el.tagName.toLowerCase(),
+    id: el.id || undefined,
+    name: getControlAttribute(el, 'name') || undefined,
+    prop: getControlAttribute(el, 'prop') || undefined,
+    type: el instanceof HTMLInputElement ? el.type : undefined,
+  };
+}
+
+function resolveLiveControl(el: HTMLElement): HTMLElement {
+  if (el.isConnected) return el;
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR));
+  const selectedIndex = pickControlIdentityCandidate(
+    domControlIdentity(el),
+    candidates.map(domControlIdentity),
+  );
+  return selectedIndex == null ? el : candidates[selectedIndex] ?? el;
+}
+
+function buildDomControlProbe(el: HTMLElement): DomControlProbe {
+  const owner = getCustomControlOwner(el);
+  const ancestorClassNames: string[] = [];
+  let ancestor: HTMLElement | null = el.parentElement;
+  for (let depth = 0; ancestor && ancestor !== document.body && depth < 6; depth++, ancestor = ancestor.parentElement) {
+    if (typeof ancestor.className === 'string' && ancestor.className.trim()) {
+      ancestorClassNames.push(ancestor.className);
+    }
+  }
+  const attributes = Object.fromEntries([
+    'xtype',
+    'name',
+    'prop',
+    'caption',
+    'label',
+    'format',
+    'pattern',
+    'value-format',
+    'appendtobody',
+    'aria-haspopup',
+    'aria-controls',
+    'aria-owns',
+  ].map((name) => [name, getControlAttribute(el, name) || undefined]));
+  const selected = owner?.querySelector<HTMLElement>([
+    '.el-select-selection-item',
+    '.el-select__selected-item',
+    '.el-select__tags-text',
+    '.ant-select-selection-item',
+    '.el-cascader__label',
+    '[aria-selected="true"]',
+  ].join(','));
+  return {
+    tagName: el.tagName.toLowerCase(),
+    type: el instanceof HTMLInputElement ? el.type : undefined,
+    value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : undefined,
+    placeholder: el.getAttribute('placeholder') ?? undefined,
+    readOnly: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.readOnly : undefined,
+    disabled: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement
+      ? el.disabled
+      : undefined,
+    role: el.getAttribute('role') ?? undefined,
+    classNames: typeof el.className === 'string' ? [el.className] : [],
+    ancestorClassNames,
+    attributes,
+    labelText: getControlAttribute(el, 'label') || getControlAttribute(el, 'caption') || findLabel(el),
+    visibleSelectionText: selected ? normalizeText(selected.textContent ?? '') : undefined,
+    visibleDisplayText: owner?.getAttribute('aria-valuetext') ?? undefined,
+  };
+}
+
+function controlKind(el: HTMLElement): DomControlKind {
+  return classifyDomControl(buildDomControlProbe(el));
+}
+
+function isInsideEphemeralOverlay(el: HTMLElement): boolean {
+  return Boolean(EPHEMERAL_OVERLAY_SELECTOR && el.closest(EPHEMERAL_OVERLAY_SELECTOR));
 }
 
 function isVisible(el: HTMLElement): boolean {
@@ -211,6 +364,44 @@ function isVisible(el: HTMLElement): boolean {
     return false;
   }
   return el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0;
+}
+
+const ACTIONABLE_OVERLAY_CANDIDATE_SELECTOR = [
+  '[role="option"]',
+  '[role="menuitem"]',
+  '.el-select-dropdown__item',
+  '.el-cascader-node',
+  '.el-date-table td',
+  '.el-month-table td',
+  '.el-year-table td',
+  '.ant-select-item-option',
+  '.ant-cascader-menu-item',
+  '.ant-picker-cell',
+].join(',');
+
+function buildOverlaySurfaceProbe(el: HTMLElement) {
+  const style = (el.ownerDocument.defaultView ?? window).getComputedStyle(el);
+  const rect = el.getBoundingClientRect();
+  return {
+    display: style.display,
+    visibility: style.visibility,
+    opacity: style.opacity,
+    width: rect.width,
+    height: rect.height,
+    className: typeof el.className === 'string' ? el.className : '',
+    candidateCount: el.querySelectorAll(ACTIONABLE_OVERLAY_CANDIDATE_SELECTOR).length,
+  };
+}
+
+function isActionableOverlayRoot(el: HTMLElement): boolean {
+  return isActionableOverlaySurface(buildOverlaySurfaceProbe(el));
+}
+
+function isActionableOverlayChoice(root: HTMLElement, candidate: HTMLElement): boolean {
+  return isActionableOverlayCandidate(
+    buildOverlaySurfaceProbe(root),
+    buildOverlaySurfaceProbe(candidate),
+  );
 }
 
 function discoverVisibleWebsiteMaterials(): WebsiteMaterialCandidate[] {
@@ -266,6 +457,18 @@ function hasVisibleFileTrigger(input: HTMLInputElement): boolean {
 }
 
 function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
+  if (
+    el instanceof HTMLInputElement
+    && !el.disabled
+    && (controlKind(el) === 'select' || controlKind(el) === 'cascader')
+  ) {
+    const owner = getCustomControlOwner(el);
+    if (owner && isVisible(el)) return el;
+    const visibleInput = owner && Array.from(owner.querySelectorAll<HTMLInputElement>('input'))
+      .find((candidate) => isVisible(candidate) && !candidate.disabled);
+    if (visibleInput) return visibleInput;
+  }
+
   let container: HTMLElement | null = el.parentElement;
   for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
     const controls = Array.from(container.querySelectorAll<HTMLElement>(
@@ -302,18 +505,30 @@ function findSelectionTrigger(el: HTMLElement): HTMLElement | null {
 
 function isSupportedDialogSelection(el: HTMLElement): boolean {
   if (!(el instanceof HTMLInputElement)) return false;
+  const kind = controlKind(el);
+  if (kind === 'date-picker') return false;
   return Boolean(findSelectionTrigger(el));
 }
 
 function isSupportedDatePicker(el: HTMLElement): boolean {
-  if (!(el instanceof HTMLInputElement) || !el.readOnly) return false;
-  const trigger = el.getAttribute('onclick') ?? '';
-  const text = joinUnique([findLabel(el), el.name, el.id, el.placeholder]);
-  return /WdatePicker|datePicker|datepicker/i.test(trigger) && /日期|年月|时间|入学|毕业/.test(text);
+  if (!(el instanceof HTMLInputElement) || el.disabled) return false;
+  return controlKind(el) === 'date-picker';
+}
+
+function findDatePickerTrigger(el: HTMLInputElement): HTMLElement {
+  const owner = getCustomControlOwner(el);
+  const candidates = [
+    owner?.querySelector<HTMLElement>('.el-icon-date'),
+    owner?.querySelector<HTMLElement>('.el-input__prefix'),
+    owner?.querySelector<HTMLElement>('.el-date-editor'),
+    el,
+  ];
+  return candidates.find((candidate) => candidate && isVisible(candidate)) ?? el;
 }
 
 function isFillable(el: HTMLElement): boolean {
   if (!el.matches(SCANNABLE_SELECTOR)) return false;
+  if (isInsideEphemeralOverlay(el)) return false;
   if (el instanceof HTMLInputElement && el.type === 'file') {
     return isVisible(el) || hasVisibleFileTrigger(el);
   }
@@ -354,13 +569,17 @@ function getOptions(el: HTMLElement): string[] {
 }
 
 function getCurrentValue(el: HTMLElement): string {
+  el = resolveLiveControl(el);
   if (el instanceof HTMLInputElement && el.type === 'file') {
     return Array.from(el.files ?? []).map((file) => file.name).join(', ');
   }
   if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
     return el.checked ? (el.value || 'true') : '';
   }
-  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.value;
+  if (el instanceof HTMLInputElement) {
+    return collectDisplayValueCandidates(buildDomControlProbe(el))[0] ?? '';
+  }
+  if (el instanceof HTMLTextAreaElement) return el.value;
   if (el instanceof HTMLSelectElement) {
     return normalizeText(el.selectedOptions[0]?.textContent ?? el.value);
   }
@@ -512,8 +731,8 @@ function findGroupText(el: HTMLElement, table: HTMLTableElement | null): string 
   return joinUnique(parts);
 }
 
-function inferProfileGroupFromTable(table: HTMLTableElement): string {
-  const headers = Array.from(table.querySelectorAll<HTMLElement>('th,thead td'))
+function inferProfileGroupFromTable(tableRoot: HTMLElement): string {
+  const headers = Array.from(tableRoot.querySelectorAll<HTMLElement>('th,thead td'))
     .map((cell) => textWithoutControls(cell))
     .filter(Boolean);
   return classifyRepeatableHeaderSchema(headers);
@@ -521,7 +740,7 @@ function inferProfileGroupFromTable(table: HTMLTableElement): string {
 
 function findNearestHeadingText(el: HTMLElement): string {
   const headings = Array.from(document.querySelectorAll<HTMLElement>(
-    'h1,h2,h3,h4,legend,.title,.form-title,.panel-title,.info-group',
+    'h1,h2,h3,h4,legend,.title,.form-title,.panel-title,.info-group,.res-title',
   ));
   const preceding = headings.filter((heading) => (
     heading === el || Boolean(heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)
@@ -608,13 +827,90 @@ function getRepeatFieldMeta(el: HTMLElement): RepeatFieldMeta {
   };
 }
 
-function repeatDataRows(table: HTMLTableElement): HTMLTableRowElement[] {
-  return Array.from(table.querySelectorAll<HTMLTableRowElement>('tr'))
+function repeatDataRows(tableRoot: HTMLElement): HTMLElement[] {
+  return Array.from(tableRoot.querySelectorAll<HTMLElement>('tr'))
     .filter((candidate) => countEditables(candidate) >= 2);
 }
 
-function findRepeatTable(groupLabel: string): HTMLTableElement | undefined {
-  return Array.from(document.querySelectorAll<HTMLTableElement>('table')).find((table) => {
+const REPEAT_GROUP_HEADING_SELECTOR = 'h1,h2,h3,h4,legend,.title,.form-title,.panel-title,.info-group,.res-title';
+const REPEAT_GROUP_TABLE_ROOT_SELECTOR = 'table,.adv-vxe-table,adv-vxe-table';
+const REPEAT_ADD_CONTROL_SELECTOR = 'button,a,[role="button"],span,input[type="button"]';
+
+interface RepeatGroupSurface {
+  groupLabel: string;
+  tableRoot: HTMLElement;
+  addControl?: HTMLElement;
+  presentation: 'adjacent' | 'legacy-table';
+}
+
+function isRepeatAddControlCandidate(candidate: HTMLElement): boolean {
+  if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+  if (candidate instanceof HTMLSpanElement) {
+    const style = (candidate.ownerDocument.defaultView ?? window).getComputedStyle(candidate);
+    const clickable = candidate.getAttribute('role') === 'button'
+      || candidate.hasAttribute('onclick')
+      || candidate.tabIndex >= 0
+      || style.cursor === 'pointer';
+    if (!clickable) return false;
+  }
+  const visibleText = normalizeText(
+    candidate instanceof HTMLInputElement ? candidate.value : candidate.textContent ?? '',
+  ).replace(/\s+/g, '');
+  const accessibleLabel = normalizeText([
+    candidate.getAttribute('aria-label') ?? '',
+    candidate.getAttribute('title') ?? '',
+  ].join(' ')).replace(/\s+/g, '').toLowerCase();
+  return isAddRowLabel(visibleText) || isAddRowLabel(accessibleLabel);
+}
+
+function findAddControlWithin(root: HTMLElement): HTMLElement | undefined {
+  const candidates = [
+    ...(root.matches(REPEAT_ADD_CONTROL_SELECTOR) ? [root] : []),
+    ...Array.from(root.querySelectorAll<HTMLElement>(REPEAT_ADD_CONTROL_SELECTOR)),
+  ];
+  return candidates.find(isRepeatAddControlCandidate);
+}
+
+function adjacentRepeatGroupSurface(
+  heading: HTMLElement,
+  targetGroup: string,
+): RepeatGroupSurface | undefined {
+  const headingGroup = detectProfileGroup(textWithoutControls(heading));
+  const following: Array<RepeatGroupSurfaceNode<HTMLElement>> = [];
+  let sibling = heading.nextElementSibling as HTMLElement | null;
+  for (let step = 0; sibling && step < 12; step++, sibling = sibling.nextElementSibling as HTMLElement | null) {
+    const nextHeadingGroup = sibling.matches(REPEAT_GROUP_HEADING_SELECTOR)
+      ? detectProfileGroup(textWithoutControls(sibling))
+      : '';
+    const addControl = findAddControlWithin(sibling);
+    const kind = nextHeadingGroup
+      ? 'heading'
+      : sibling.matches(REPEAT_GROUP_TABLE_ROOT_SELECTOR)
+        ? 'table'
+        : addControl
+          ? 'add'
+          : 'other';
+    following.push({
+      id: kind === 'add' && addControl ? addControl : sibling,
+      kind,
+      visible: kind === 'add' && addControl ? isVisible(addControl) : isVisible(sibling),
+    });
+    if (kind === 'heading') break;
+  }
+  const selection = selectAdjacentRepeatGroupSurface({ targetGroup, headingGroup, following });
+  if (!selection.tableId) return undefined;
+  return {
+    groupLabel: targetGroup,
+    tableRoot: selection.tableId,
+    addControl: selection.addControlId,
+    presentation: 'adjacent',
+  };
+}
+
+function findLegacyRepeatTable(groupLabel: string): HTMLTableElement | undefined {
+  return Array.from(document.querySelectorAll<HTMLTableElement>('table'))
+    .filter((table) => !table.closest('.adv-vxe-table,adv-vxe-table'))
+    .find((table) => {
     const localHeading = findNearestHeadingText(table);
     const detectedGroup = inferProfileGroupFromTable(table) || detectProfileGroup(joinUnique([
       normalizeText(table.caption?.textContent ?? ''),
@@ -624,11 +920,32 @@ function findRepeatTable(groupLabel: string): HTMLTableElement | undefined {
   });
 }
 
-function findAddRowControl(table: HTMLTableElement): HTMLElement | undefined {
+function findRepeatGroupSurface(groupLabel: string): RepeatGroupSurface | undefined {
+  const adjacent = Array.from(document.querySelectorAll<HTMLElement>(REPEAT_GROUP_HEADING_SELECTOR))
+    .filter(isVisible)
+    .map((heading) => adjacentRepeatGroupSurface(heading, groupLabel))
+    .filter((surface): surface is RepeatGroupSurface => Boolean(surface));
+  if (adjacent.length === 1) return adjacent[0];
+  if (adjacent.length > 1) return undefined;
+
+  const table = findLegacyRepeatTable(groupLabel);
+  return table ? {
+    groupLabel,
+    tableRoot: table,
+    presentation: 'legacy-table',
+  } : undefined;
+}
+
+function findAddRowControl(surface: RepeatGroupSurface): HTMLElement | undefined {
+  if (surface.addControl?.isConnected && isRepeatAddControlCandidate(surface.addControl)) {
+    return surface.addControl;
+  }
+  const table = surface.tableRoot;
+  if (!(table instanceof HTMLTableElement)) return undefined;
   let container: HTMLElement | null = table.parentElement;
   for (let depth = 0; container && container !== document.body && depth < 5; depth++, container = container.parentElement) {
     const control = Array.from(container.querySelectorAll<HTMLElement>('button,a,[role="button"],span')).find((candidate) => {
-      if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+      if (!isRepeatAddControlCandidate(candidate)) return false;
       const candidateTable = candidate.closest<HTMLTableElement>('table');
       if (candidateTable && candidateTable !== table) return false;
       if (!candidateTable) {
@@ -639,39 +956,82 @@ function findAddRowControl(table: HTMLTableElement): HTMLElement | undefined {
           .at(-1);
         if (precedingTable !== table) return false;
       }
-      if (candidate instanceof HTMLSpanElement) {
-        const style = (candidate.ownerDocument.defaultView ?? window).getComputedStyle(candidate);
-        const clickable = candidate.getAttribute('role') === 'button'
-          || candidate.hasAttribute('onclick')
-          || candidate.tabIndex >= 0
-          || style.cursor === 'pointer';
-        if (!clickable) return false;
-      }
-      const visibleText = normalizeText(candidate.textContent ?? '').replace(/\s+/g, '');
-      const accessibleLabel = normalizeText([
-        candidate.getAttribute('aria-label') ?? '',
-        candidate.getAttribute('title') ?? '',
-      ].join(' ')).replace(/\s+/g, '').toLowerCase();
-      if (
-        isAddRowLabel(visibleText)
-        || isAddRowLabel(accessibleLabel)
-      ) return true;
-      return false;
+      return true;
     });
     if (control) return control;
   }
   return undefined;
 }
 
+function repeatTableHeaders(tableRoot: HTMLElement): string[] {
+  const headers = Array.from(tableRoot.querySelectorAll<HTMLElement>('th,thead td'))
+    .map((cell) => textWithoutControls(cell))
+    .filter(Boolean);
+  if (headers.length > 0) return [...new Set(headers)];
+  const firstStaticRow = Array.from(tableRoot.querySelectorAll<HTMLTableRowElement>('tr'))
+    .find((row) => countEditables(row) === 0);
+  return firstStaticRow
+    ? [...new Set(Array.from(firstStaticRow.cells).map((cell) => textWithoutControls(cell)).filter(Boolean))]
+    : [];
+}
+
+function observeRepeatGroups(): RepeatableGroupObservation[] {
+  const scanned = scanFields().map((result) => ({ ...result.field, index: result.index }));
+  const labels = new Set<string>();
+  for (const field of scanned) {
+    const label = normalizeText(field.repeatGroup || field.groupLabel);
+    if (label) labels.add(label);
+  }
+  for (const heading of Array.from(document.querySelectorAll<HTMLElement>(REPEAT_GROUP_HEADING_SELECTOR)).filter(isVisible)) {
+    const label = detectProfileGroup(textWithoutControls(heading));
+    if (label) labels.add(label);
+  }
+  for (const table of Array.from(document.querySelectorAll<HTMLElement>(REPEAT_GROUP_TABLE_ROOT_SELECTOR)).filter(isVisible)) {
+    const label = inferProfileGroupFromTable(table) || detectProfileGroup(findGroupText(table, table instanceof HTMLTableElement ? table : null));
+    if (label) labels.add(label);
+  }
+
+  return [...labels].map((groupLabel) => {
+    const fields = scanned.filter((field) => normalizeText(field.repeatGroup || field.groupLabel) === groupLabel);
+    const surface = findRepeatGroupSurface(groupLabel);
+    const matchingDialog = findVisibleRepeatDialogForGroup(groupLabel);
+    let nearbyAdd: HTMLElement | undefined;
+    if (surface) nearbyAdd = findAddRowControl(surface);
+    if (!nearbyAdd) {
+      const heading = Array.from(document.querySelectorAll<HTMLElement>(REPEAT_GROUP_HEADING_SELECTOR))
+        .filter(isVisible)
+        .find((candidate) => detectProfileGroup(textWithoutControls(candidate)) === groupLabel);
+      if (heading) {
+        let sibling = heading.nextElementSibling as HTMLElement | null;
+        for (let step = 0; sibling && step < 12 && !nearbyAdd; step++, sibling = sibling.nextElementSibling as HTMLElement | null) {
+          nearbyAdd = findAddControlWithin(sibling);
+          if (sibling.matches(REPEAT_GROUP_HEADING_SELECTOR)) break;
+        }
+      }
+    }
+    const rowIndexes = [...new Set(fields.map((field) => field.rowIndex).filter((value): value is number => value != null))];
+    return {
+      groupLabel,
+      presentation: matchingDialog ? 'dialog' : surface?.presentation === 'legacy-table' ? 'inline' : surface ? 'inline' : 'unknown',
+      tableHeaders: surface ? repeatTableHeaders(surface.tableRoot) : [],
+      fieldLabels: [...new Set(fields.map((field) => normalizeText(field.columnLabel || field.label)).filter(Boolean))],
+      currentRowCount: surface ? repeatDataRows(surface.tableRoot).length : rowIndexes.length,
+      hasAddControl: Boolean(nearbyAdd),
+      addControlLabel: nearbyAdd ? normalizeText(nearbyAdd instanceof HTMLInputElement ? nearbyAdd.value : nearbyAdd.textContent ?? '') : undefined,
+      dialogVisible: Boolean(matchingDialog),
+    } satisfies RepeatableGroupObservation;
+  });
+}
+
 async function waitForRowOrRepeatDialog(
-  table: HTMLTableElement,
+  tableRoot: HTMLElement,
   previousCount: number,
   groupLabel: string,
   beforeRoots: ReadonlySet<HTMLElement>,
 ): Promise<'row' | 'dialog' | 'ambiguous-dialog' | 'none'> {
   for (let attempt = 0; attempt < 16; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 75));
-    if (repeatDataRows(table).length > previousCount) return 'row';
+    if (repeatDataRows(tableRoot).length > previousCount) return 'row';
     const dialog = findUniqueRepeatDialogRoot(groupLabel, beforeRoots);
     if (dialog.root) return 'dialog';
     if (dialog.reason === 'ambiguous-dialog-root') return 'ambiguous-dialog';
@@ -685,13 +1045,12 @@ async function prepareRepeatRows(
   let added = 0;
   const failures: PrepareRepeatRowsResult['failures'] = [];
   const dialogGroups = new Set<string>();
-  for (const target of targets) {
-    const table = findRepeatTable(target.groupLabel);
-    if (!table) {
-      if (classifyRepeatPreparation({ tableMatch: 'none', hasAddControl: false }) === 'skip') continue;
-      continue;
+  await forEachRepeatPreparationTarget(targets, async (target) => {
+    const surface = findRepeatGroupSurface(target.groupLabel);
+    if (!surface) {
+      return 'continue';
     }
-    const currentRows = repeatDataRows(table).length;
+    const currentRows = repeatDataRows(surface.tableRoot).length;
     const preparationPlan = planRepeatRowPreparation(target.requiredRows, currentRows);
     if (preparationPlan.truncated) {
       failures.push({
@@ -699,9 +1058,9 @@ async function prepareRepeatRows(
         reason: `Requested row count requires more than ${MAX_REPEAT_ROW_ADDITIONS_PER_PASS} additions in one pass`,
       });
     }
-    while (repeatDataRows(table).length < preparationPlan.targetRows) {
-      const previousCount = repeatDataRows(table).length;
-      const control = findAddRowControl(table);
+    while (repeatDataRows(surface.tableRoot).length < preparationPlan.targetRows) {
+      const previousCount = repeatDataRows(surface.tableRoot).length;
+      const control = findAddRowControl(surface);
       if (!control) {
         if (classifyRepeatPreparation({ tableMatch: 'strong', hasAddControl: false }) === 'failure') {
           failures.push({ groupLabel: target.groupLabel, reason: 'No visible add-row control found' });
@@ -711,10 +1070,10 @@ async function prepareRepeatRows(
       try {
         const beforeRoots = new Set(getVisibleDialogRoots());
         control.click();
-        const outcome = await waitForRowOrRepeatDialog(table, previousCount, target.groupLabel, beforeRoots);
+        const outcome = await waitForRowOrRepeatDialog(surface.tableRoot, previousCount, target.groupLabel, beforeRoots);
         if (outcome === 'dialog') {
           dialogGroups.add(target.groupLabel);
-          break;
+          return 'stop';
         }
         if (outcome === 'ambiguous-dialog') {
           failures.push({ groupLabel: target.groupLabel, reason: 'Add-row control opened multiple matching record dialogs or drawers' });
@@ -730,7 +1089,8 @@ async function prepareRepeatRows(
       }
       added++;
     }
-  }
+    return 'continue';
+  });
   return { added, failures, dialogGroups: [...dialogGroups] };
 }
 
@@ -770,6 +1130,69 @@ function getPageMeta(): { label: string; url: string; signature: string } {
   };
 }
 
+const AGENT_PAGE_TEXT_SELECTOR = [
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'legend',
+  'label',
+  'th',
+  'caption',
+  '[role="heading"]',
+  '.page-title',
+  '.form-title',
+  '.panel-title',
+  '.section-title',
+  '.card-title',
+  '.help-block',
+  '.help-text',
+  '.form-text',
+  '.tip',
+  '.tips',
+  '.hint',
+  '.notice',
+  '.description',
+  '.remark',
+  '.instruction',
+  '.el-form-item__label',
+  '.ant-form-item-label',
+  '.ivu-form-item-label',
+  '.layui-form-label',
+  'nav .active',
+  'aside .active',
+  '[role="navigation"] .active',
+  '[aria-current="step"]',
+  '.steps .active',
+  '.step.active',
+  '.el-step__title.is-process',
+  '.ant-steps-item-process .ant-steps-item-title',
+].join(',');
+
+function safeAgentPageText(element: HTMLElement): string {
+  if (element.closest('script,style,noscript,template')) return '';
+  const text = textWithoutControls(element);
+  return normalizeAgentPageText(text);
+}
+
+function getAgentPageContext(): AgentPageSemanticContext {
+  const meta = getPageMeta();
+  const semantic = buildAgentPageSemanticText(
+    Array.from(document.querySelectorAll<HTMLElement>(AGENT_PAGE_TEXT_SELECTOR))
+      .filter(isVisible)
+      .map(safeAgentPageText)
+      .filter(Boolean),
+  );
+  const title = normalizeText(document.title);
+  return {
+    title: title && !isSensitiveAgentPageText(title) ? title : meta.label,
+    stepText: meta.label,
+    ...semantic,
+  };
+}
+
 function findSafeNextControl(): HTMLElement | null {
   const candidates = Array.from(document.querySelectorAll<HTMLElement>(
     'button,input[type="button"],input[type="submit"],a,[role="button"]',
@@ -799,7 +1222,7 @@ async function advanceToNextStep(): Promise<{ clicked: boolean; advanced: boolea
 
 function getProtection(el: HTMLElement, fieldText: string, isFile: boolean): { protected: boolean; reason: string } {
   if (isFile) return { protected: true, reason: '文件上传需本人确认' };
-  if ((el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled && !isSupportedDialogSelection(el)) {
+  if ((el as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).disabled) {
     return { protected: true, reason: '页面已锁定该字段' };
   }
   if (
@@ -986,7 +1409,11 @@ function extractField(el: HTMLElement): FormField {
   const renderedSize = getRenderedSize(el);
   const context = findContext(el);
   const repeatMeta = getRepeatFieldMeta(el);
-  const label = repeatMeta.columnLabel || getPairedSelectorLabel(el) || findLabel(el);
+  const label = repeatMeta.columnLabel
+    || getControlAttribute(el, 'label')
+    || getControlAttribute(el, 'caption')
+    || getPairedSelectorLabel(el)
+    || findLabel(el);
   const hint = findHint(el, label, context);
   const fieldText = joinUnique([repeatMeta.groupLabel, repeatMeta.columnLabel, label, hint, context]);
   const protection = getProtection(el, fieldText, isFile);
@@ -994,6 +1421,9 @@ function extractField(el: HTMLElement): FormField {
   const explicitDateFormat = [
     el.getAttribute('data-date-format'),
     el.getAttribute('data-datefmt'),
+    getControlAttribute(el, 'value-format'),
+    getControlAttribute(el, 'format'),
+    getControlAttribute(el, 'pattern'),
     el.getAttribute('onclick')?.match(/dateFmt\s*:\s*['"]([^'"]+)['"]/i)?.[1],
   ].find(Boolean) ?? '';
   const rules = extractAgentFieldRules({
@@ -1008,11 +1438,11 @@ function extractField(el: HTMLElement): FormField {
     kind: isFile ? 'file' : 'text',
     tag,
     type: (el as HTMLInputElement).type ?? tag,
-    name: el.getAttribute('name') ?? '',
+    name: getControlAttribute(el, 'name') || getControlAttribute(el, 'prop'),
     id: el.getAttribute('id') ?? '',
     label,
     hint,
-    placeholder: el.getAttribute('placeholder') ?? '',
+    placeholder: el.getAttribute('placeholder') ?? getControlAttribute(el, 'placeholder'),
     ariaLabel: el.getAttribute('aria-label') ?? '',
     title: el.getAttribute('title') ?? '',
     dateFormat: rules.dateFormat,
@@ -1055,6 +1485,15 @@ function scanFields(): FieldResult[] {
   });
 
   return results;
+}
+
+async function waitForVisibleEditableSurface(timeoutMs = 3500): Promise<void> {
+  if (Array.from(document.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR)).some(isFillable)) return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    if (Array.from(document.querySelectorAll<HTMLElement>(SCANNABLE_SELECTOR)).some(isFillable)) return;
+  }
 }
 
 function isAcceptedFileType(accept: string, fileName: string, fileType: string): boolean {
@@ -1101,11 +1540,14 @@ function ensureMarkerStyles(): void {
 }
 
 function markField(el: HTMLElement, status: 'verified' | 'review' | 'mismatch', message?: string): void {
+  el = resolveLiveControl(el);
   ensureMarkerStyles();
   if (el.dataset.autoFillerOriginalTitle == null) {
     el.dataset.autoFillerOriginalTitle = el.getAttribute('title') ?? '';
   }
   el.dataset.autoFillerStatus = status;
+  const questionCell = findRepeatableQuestionCell(el);
+  if (questionCell) alignRepeatableQuestionCell(questionCell);
   const markerTitle = message ?? (status === 'verified'
     ? '保填：已填写并回读一致'
     : status === 'review'
@@ -1124,6 +1566,7 @@ function clearPreviewMarkers(): void {
       delete el.dataset.autoFillerOriginalTitle;
     }
   });
+  document.querySelectorAll<HTMLElement>('[data-baotian-layout-adjusted]').forEach(restoreRepeatableQuestionCell);
 }
 
 function markPreviewFields(items: MarkPreviewMessage['items']): number {
@@ -1191,17 +1634,40 @@ async function waitForElementValue(
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!el.isConnected) return false;
-    if (valueMatches(el, expected)) return true;
+    const live = resolveLiveControl(el);
+    if (!live.isConnected) return false;
+    if (valueMatches(live, expected)) return true;
     await new Promise((resolve) => setTimeout(resolve, 40));
   }
-  return el.isConnected && valueMatches(el, expected);
+  const live = resolveLiveControl(el);
+  return live.isConnected && valueMatches(live, expected);
 }
 
 function collectVisibleDialogRoots(): HTMLElement[] {
-  const roots = Array.from(document.querySelectorAll<HTMLElement>(
-    '[role="dialog"],.modal,.dialog,.popup,.drawer,.layui-layer,.ui-dialog,.el-dialog,.el-drawer,.ant-modal,.ant-drawer,.ivu-drawer,.vxe-modal,.window',
-  )).filter(isVisible);
+  const rootSelector = [
+    '[role="dialog"]',
+    '.modal',
+    '.dialog',
+    '.popup',
+    '.drawer',
+    '.layui-layer',
+    '.ui-dialog',
+    '.el-dialog',
+    '.el-drawer',
+    '.ant-modal',
+    '.ant-drawer',
+    '.ivu-drawer',
+    '.vxe-modal',
+    '.window',
+    ...getOverlayRootSelectors('select'),
+    ...getOverlayRootSelectors('cascader'),
+    ...getOverlayRootSelectors('date-picker'),
+  ].join(',');
+  const visibleRoots = Array.from(document.querySelectorAll<HTMLElement>(rootSelector))
+    .filter((candidate) => isVisible(candidate) || isActionableOverlayRoot(candidate));
+  const roots = visibleRoots.filter((candidate) => !visibleRoots.some(
+    (other) => other !== candidate && other.contains(candidate),
+  ));
   for (const frame of Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe')).filter(isVisible)) {
     try {
       const body = frame.contentDocument?.body;
@@ -1296,6 +1762,10 @@ function findUniqueRepeatDialogRoot(
   return { root: selection.id, reason: selection.reason };
 }
 
+function findVisibleRepeatDialogForGroup(groupLabel: string): HTMLElement | undefined {
+  return findUniqueRepeatDialogRoot(groupLabel).root;
+}
+
 async function waitForRepeatDialogRoot(
   groupLabel: string,
   timeoutMs = 1600,
@@ -1315,11 +1785,11 @@ async function waitForRepeatDialogRoot(
 }
 
 function captureRepeatGroupSnapshot(groupLabel: string): { recordCount: number; text: string } {
-  const table = findRepeatTable(groupLabel);
-  if (!table) return { recordCount: 0, text: '' };
+  const surface = findRepeatGroupSurface(groupLabel);
+  if (!surface) return { recordCount: 0, text: '' };
   return {
-    recordCount: repeatDataRows(table).length,
-    text: textWithoutControls(table),
+    recordCount: repeatDataRows(surface.tableRoot).length,
+    text: textWithoutControls(surface.tableRoot),
   };
 }
 
@@ -1364,6 +1834,36 @@ function findSafeRepeatDialogSaveControl(
   };
 }
 
+function findSafeRepeatDialogCancelControl(
+  root: HTMLElement,
+): { control?: HTMLElement; reason: 'record-cancel' | 'ambiguous-record-cancel' | 'no-record-cancel' } {
+  const candidates = Array.from(root.querySelectorAll<HTMLElement>('button,a,input[type="button"],[role="button"]'))
+    .filter((control) => isVisible(control) && !(control as HTMLButtonElement).disabled)
+    .map((control) => ({
+      id: control,
+      label: visibleControlLabel(control),
+      recordAssociated: isRecordAssociatedRepeatDialogSaveControl(root, control),
+    }));
+  const selection = selectRepeatDialogCancelCandidate(candidates);
+  return { control: selection.id, reason: selection.reason };
+}
+
+async function dismissRepeatDialog(root: HTMLElement, timeoutMs = 1200): Promise<boolean> {
+  const cancel = findSafeRepeatDialogCancelControl(root);
+  if (!cancel.control) return false;
+  try {
+    cancel.control.click();
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!root.isConnected || !isVisible(root)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  return !root.isConnected || !isVisible(root);
+}
+
 async function fillRepeatDialogRecord(
   root: HTMLElement,
   fields: Array<{ key: string; value: string }>,
@@ -1375,7 +1875,7 @@ async function fillRepeatDialogRecord(
   }
   const classified = classifyRepeatDialogFields(entries.map((entry) => ({
     index: entry.index,
-    label: joinUnique([entry.field.columnLabel, entry.field.label, entry.field.hint, entry.field.context]),
+    label: pickRepeatDialogFieldLabel(entry.field),
     value: entry.field.value,
     required: entry.field.required,
     kind: entry.field.kind,
@@ -1430,11 +1930,56 @@ async function waitForRepeatDialogSave(
   return 'unverified';
 }
 
+async function commitRepeatRecord(groupLabel: string): Promise<CommitRepeatRecordResult> {
+  const dialog = findUniqueRepeatDialogRoot(groupLabel);
+  const root = dialog.root;
+  if (!root) {
+    return { groupLabel, committed: false, reason: dialog.reason };
+  }
+  if (findUnsafeRepeatDialogControl(root)) {
+    return { groupLabel, committed: false, reason: 'protected-control-visible' };
+  }
+  const entries = collectRepeatDialogEntries(root);
+  const validation = validateRepeatDialogCommit(entries.map((entry) => ({
+    required: Boolean(entry.field.required),
+    protected: Boolean(entry.field.protected),
+    kind: entry.field.kind,
+    value: getCurrentValue(entry.el),
+  })));
+  if (!validation.safe) {
+    return { groupLabel, committed: false, reason: validation.reason };
+  }
+  const save = findSafeRepeatDialogSaveControl(root);
+  if (!save.control) {
+    return { groupLabel, committed: false, reason: save.reason };
+  }
+  const beforeSnapshot = captureRepeatGroupSnapshot(groupLabel);
+  const assignedValues = entries
+    .map((entry) => getCurrentValue(entry.el).trim())
+    .filter(Boolean);
+  if (assignedValues.length === 0) {
+    return { groupLabel, committed: false, reason: 'record-empty' };
+  }
+  try {
+    save.control.click();
+  } catch {
+    return { groupLabel, committed: false, reason: 'record-save-click-failed' };
+  }
+  const verification = await waitForRepeatDialogSave(root, groupLabel, beforeSnapshot, assignedValues);
+  return {
+    groupLabel,
+    committed: verification !== 'unverified',
+    reason: verification,
+  };
+}
+
 async function prepareRepeatRecords(
   targets: PrepareRepeatRecordsMessage['targets'],
 ): Promise<PrepareRepeatRecordsResult> {
   let added = 0;
   let processed = 0;
+  let blocked = false;
+  const dismissedGroups = new Set<string>();
   const failures: PrepareRepeatRecordsResult['failures'] = [];
   for (const target of targets) {
     const recordBatch = limitRepeatRecordBatch(target.records);
@@ -1446,8 +1991,8 @@ async function prepareRepeatRecords(
       });
     }
     for (const record of recordBatch.records) {
-      const table = findRepeatTable(target.groupLabel);
-      if (!table) {
+      const surface = findRepeatGroupSurface(target.groupLabel);
+      if (!surface) {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Repeatable group table not found' });
         break;
       }
@@ -1458,7 +2003,7 @@ async function prepareRepeatRecords(
           failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Multiple matching record dialogs or drawers are open' });
           break;
         }
-        const control = findAddRowControl(table);
+        const control = findAddRowControl(surface);
         if (!control) {
           failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'No visible add-record control found' });
           break;
@@ -1488,6 +2033,11 @@ async function prepareRepeatRecords(
       const fillResult = await fillRepeatDialogRecord(root, record.fields);
       if (fillResult.reason) {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: fillResult.reason });
+        if (await dismissRepeatDialog(root)) {
+          dismissedGroups.add(target.groupLabel);
+        } else {
+          blocked = true;
+        }
         break;
       }
       const save = findSafeRepeatDialogSaveControl(root);
@@ -1500,6 +2050,11 @@ async function prepareRepeatRecords(
             ? 'Multiple record-level save controls are open; unable to choose safely'
             : 'No safe record-level save control found in dialog',
         });
+        if (await dismissRepeatDialog(root)) {
+          dismissedGroups.add(target.groupLabel);
+        } else {
+          blocked = true;
+        }
         break;
       }
       try {
@@ -1516,6 +2071,7 @@ async function prepareRepeatRecords(
       );
       if (verification === 'unverified') {
         failures.push({ groupLabel: target.groupLabel, itemIndex: record.itemIndex, presentation: 'dialog', reason: 'Record save could not be verified; dialog remains open' });
+        blocked = true;
         break;
       }
       added++;
@@ -1526,7 +2082,7 @@ async function prepareRepeatRecords(
       }
     }
   }
-  return { added, processed, failures };
+  return { added, processed, blocked, dismissedGroups: [...dismissedGroups], failures };
 }
 
 function normalizeSelectionText(text: string): string {
@@ -1539,18 +2095,26 @@ async function waitForDialogChoice(root: HTMLElement, value: string, timeoutMs =
   const comparable = (text: string) => normalizeSelectionText(text).replace(/^\d{4,12}\s*/, '');
   while (Date.now() < deadline) {
     const candidates = Array.from(root.querySelectorAll<HTMLElement>(
-      '[role="option"],li,td,a,button,.option,.item,.tree-node,.el-tree-node__label,.ant-select-item-option-content',
-    )).filter((candidate) => isVisible(candidate) && candidate.childElementCount <= 3);
+      '[role="option"],[role="menuitem"],li,td,a,button,.option,.item,.tree-node,.el-tree-node__label,.el-cascader-node,.el-cascader-node__label,.ant-select-item-option-content,.ant-cascader-menu-item',
+    )).filter((candidate) => (
+      (isVisible(candidate) || isActionableOverlayChoice(root, candidate))
+      && candidate.childElementCount <= 3
+    ));
     const exact = candidates
       .filter((candidate) => {
         const text = normalizeSelectionText(candidate.textContent ?? '');
-        return text === wanted || comparable(text) === comparable(wanted);
+        return text === wanted
+          || comparable(text) === comparable(wanted)
+          || selectionTextsEquivalent(text, wanted);
       })
       .sort((a, b) => normalizeSelectionText(a.textContent ?? '').length - normalizeSelectionText(b.textContent ?? '').length)[0];
     if (exact) {
       const clickableChild = Array.from(exact.querySelectorAll<HTMLElement>(
-        'a,button,[role="option"],[role="treeitem"],.option,.item,.tree-node,.el-tree-node__label,.ant-select-item-option-content',
-      )).find((candidate) => comparable(candidate.textContent ?? '') === comparable(wanted));
+        'a,button,[role="option"],[role="menuitem"],[role="treeitem"],.option,.item,.tree-node,.el-tree-node__label,.el-cascader-node,.el-cascader-node__label,.ant-select-item-option-content,.ant-cascader-menu-item',
+      )).find((candidate) => (
+        comparable(candidate.textContent ?? '') === comparable(wanted)
+        || selectionTextsEquivalent(candidate.textContent ?? '', wanted)
+      ));
       return clickableChild ?? exact;
     }
     await new Promise((resolve) => setTimeout(resolve, 80));
@@ -1594,8 +2158,22 @@ async function searchDialogChoice(root: HTMLElement, value: string): Promise<HTM
 }
 
 function dialogValueMatches(el: HTMLElement, expected: string): boolean {
+  const live = resolveLiveControl(el);
+  const rawValue = live instanceof HTMLInputElement || live instanceof HTMLTextAreaElement
+    ? live.value
+    : '';
+  if (datePickerValuesEquivalent(rawValue, expected)) return true;
+  if (selectionTextsEquivalent(rawValue, expected)) return true;
+  const compactRaw = normalizeSelectionText(rawValue).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
+  const compactExpected = normalizeSelectionText(expected).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
+  if (compactRaw && compactExpected && (compactRaw.includes(compactExpected) || compactExpected.includes(compactRaw))) {
+    return true;
+  }
   if (valueMatches(el, expected)) return true;
-  const actual = normalizeSelectionText(getCurrentValue(el)).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
+  const currentValue = getCurrentValue(el);
+  if (datePickerValuesEquivalent(currentValue, expected)) return true;
+  if (selectionTextsEquivalent(currentValue, expected)) return true;
+  const actual = normalizeSelectionText(currentValue).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
   const wanted = normalizeSelectionText(expected).replace(/^\d{4,12}/, '').replace(/[|/>\\,，;；\s-]+/g, '');
   return Boolean(actual && wanted && (actual.includes(wanted) || wanted.includes(actual)));
 }
@@ -1614,6 +2192,11 @@ async function waitForSelectionDialogRoot(
 ): Promise<HTMLElement | null> {
   const deadline = Date.now() + timeoutMs;
   const keyword = selectionFieldKeyword(fieldText);
+  // Element UI creates the dropdown immediately, but its enter transition can
+  // leave the root at zero height for a short period. Returning that root too
+  // early makes the option click race the close state machine and leaves the
+  // dropdown covering the next field. Keep it as a last-resort fallback only.
+  let enteringFallback: HTMLElement | null = null;
   while (Date.now() < deadline) {
     const roots = collectVisibleDialogRoots();
     const newlyOpened = roots.filter((root) => !beforeRoots.has(root));
@@ -1629,10 +2212,23 @@ async function waitForSelectionDialogRoot(
       };
     });
     const selected = selectNewDialogRoot(candidates);
-    if (selected != null) return roots[Number(selected)] ?? null;
+    if (selected != null) {
+      const root = roots[Number(selected)] ?? null;
+      if (root) {
+        const rect = root.getBoundingClientRect();
+        const style = (root.ownerDocument.defaultView ?? window).getComputedStyle(root);
+        const entering = /(?:^|\s)el-[^\s]*-enter-active(?:\s|$)/u.test(style.cssText || '')
+          || /(?:^|\s)el-[^\s]*-enter-active(?:\s|$)/u.test(typeof root.className === 'string' ? root.className : '');
+        // isVisible() intentionally accepts an element with only width or
+        // height. For a transient popper that is too permissive: Element UI
+        // can expose a width while the enter transition still has zero height.
+        if (isVisible(root) && rect.width > 0 && rect.height > 0 && !entering) return root;
+      }
+      if (root && isActionableOverlayRoot(root)) enteringFallback = root;
+    }
     await new Promise((resolve) => setTimeout(resolve, 80));
   }
-  return null;
+  return enteringFallback;
 }
 
 function findScopedSelectionConfirm(root: HTMLElement): HTMLElement | null {
@@ -1656,11 +2252,212 @@ async function waitForDialogValue(el: HTMLElement, value: string, timeoutMs = 14
   return dialogValueMatches(el, value);
 }
 
+function cascaderCandidates(root: HTMLElement): Array<{ element: HTMLElement; label: string }> {
+  const controls = Array.from(root.querySelectorAll<HTMLElement>(
+    '.el-cascader-node,[role="menuitem"],.ant-cascader-menu-item',
+  )).filter((candidate) => (
+    isVisible(candidate)
+    && !candidate.classList.contains('is-disabled')
+    && candidate.getAttribute('aria-disabled') !== 'true'
+  ));
+  return controls.map((element) => ({
+    element,
+    label: normalizeSelectionText(
+      element.querySelector<HTMLElement>('.el-cascader-node__label')?.textContent
+      ?? element.textContent
+      ?? '',
+    ),
+  })).filter((candidate) => Boolean(candidate.label));
+}
+
+function firstLevelCascaderCandidates(root: HTMLElement): Array<{ element: HTMLElement; label: string }> {
+  const firstMenu = root.matches('.el-cascader-menu,.ant-cascader-menu')
+    ? root
+    : root.querySelector<HTMLElement>('.el-cascader-menu,.ant-cascader-menu');
+  if (!firstMenu) return cascaderCandidates(root);
+  return cascaderCandidates(firstMenu).filter((candidate) => (
+    candidate.element.closest('.el-cascader-menu,.ant-cascader-menu') === firstMenu
+  ));
+}
+
+async function waitForCascaderSegment(
+  root: HTMLElement,
+  remaining: string,
+  timeoutMs = 1800,
+): Promise<{ element: HTMLElement; label: string; remaining: string } | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const candidates = cascaderCandidates(root);
+    const segment = pickHierarchicalSegment(remaining, candidates.map((candidate) => candidate.label));
+    if (segment) {
+      const candidate = candidates.find((item) => item.label === segment.label);
+      if (candidate) return { ...candidate, remaining: segment.remaining };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  return null;
+}
+
+function activateCascaderNode(element: HTMLElement, isTerminal: boolean): void {
+  const node = element.closest<HTMLElement>('.el-cascader-node,[role="menuitem"],.ant-cascader-menu-item')
+    ?? element;
+  const target = getCascaderNodeActivationSelectors(isTerminal)
+    .map((selector) => (node.matches(selector) ? node : node.querySelector<HTMLElement>(selector)))
+    .find((candidate): candidate is HTMLElement => Boolean(candidate && isVisible(candidate)));
+  (target ?? element).click();
+}
+
+async function searchCascaderBranches(root: HTMLElement, value: string): Promise<HTMLElement | null> {
+  const initialCandidates = firstLevelCascaderCandidates(root);
+  const branchLabels = pickCascaderExplorationLabels(
+    value,
+    initialCandidates.map((candidate) => candidate.label),
+  );
+  lastCascaderTrace.push(`branches:${branchLabels.length}`);
+  for (const label of branchLabels.slice(0, 60)) {
+    const branch = firstLevelCascaderCandidates(root).find((candidate) => candidate.label === label);
+    if (!branch) continue;
+    activateCascaderNode(branch.element, false);
+    const direct = await waitForDialogChoice(root, value, 320);
+    if (direct) {
+      lastCascaderTrace.push(`matched:${label}`);
+      return direct;
+    }
+  }
+  lastCascaderTrace.push('matched:none');
+  return null;
+}
+
+async function fillCascaderSelection(
+  el: HTMLElement,
+  root: HTMLElement,
+  value: string,
+  confidence: 'high' | 'medium' | 'low',
+): Promise<boolean> {
+  lastCascaderTrace = [`target:${value}`];
+  let remaining = normalizeSelectionText(value).replace(/[>／/、,，\s]+/g, '');
+  for (let depth = 0; remaining && depth < 8; depth++) {
+    const segment = await waitForCascaderSegment(root, remaining, depth === 0 ? 900 : 1800);
+    if (!segment) {
+      let direct = await waitForDialogChoice(root, value, 160);
+      const search = Array.from(root.querySelectorAll<HTMLInputElement>(
+        '.base-select-filter input,input[type="search"],input[type="text"],input:not([type])',
+      )).find((input) => input !== el && isVisible(input) && !input.readOnly && !input.disabled);
+      if (!direct && search) {
+        setDialogSearchValue(search, value);
+        direct = await waitForDialogChoice(root, value, 2200);
+      }
+      if (!direct && !search) direct = await searchCascaderBranches(root, value);
+      if (!direct) {
+        markField(el, 'review');
+        return false;
+      }
+      activateCascaderNode(direct, true);
+      remaining = '';
+      break;
+    }
+    activateCascaderNode(segment.element, segment.remaining === '');
+    remaining = segment.remaining;
+    if (remaining) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  await waitForDialogValue(el, value, 1200);
+  const verified = dialogValueMatches(el, value);
+  markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+  return verified;
+}
+
+function elementPickerMonth(root: HTMLElement): { year: number; month: number } | null {
+  const labels = Array.from(root.querySelectorAll<HTMLElement>('.el-date-picker__header-label'))
+    .map((label) => normalizeText(label.textContent ?? ''));
+  const year = Number(labels.find((label) => /\d{4}\s*年/.test(label))?.match(/\d{4}/)?.[0]);
+  const month = Number(labels.find((label) => /\d{1,2}\s*月/.test(label))?.match(/\d{1,2}/)?.[0]);
+  return Number.isInteger(year) && Number.isInteger(month) && month >= 1 && month <= 12
+    ? { year, month }
+    : null;
+}
+
+async function waitForElementPickerMonth(
+  root: HTMLElement,
+  previous: { year: number; month: number },
+  timeoutMs = 700,
+): Promise<{ year: number; month: number } | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const current = elementPickerMonth(root);
+    if (current && (current.year !== previous.year || current.month !== previous.month)) return current;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  return elementPickerMonth(root);
+}
+
+async function fillDatePicker(
+  el: HTMLInputElement,
+  value: string,
+  confidence: 'high' | 'medium' | 'low',
+): Promise<boolean> {
+  const target = parseDatePickerTarget(value);
+  if (!target) return false;
+  const beforeRoots = new Set(collectVisibleDialogRoots());
+  findDatePickerTrigger(el).click();
+  const field = extractField(el);
+  const fieldText = joinUnique([field.label, field.hint, field.context, field.ariaLabel, field.title]);
+  const root = await waitForSelectionDialogRoot(fieldText, beforeRoots);
+  if (!root) {
+    markField(el, 'review');
+    return false;
+  }
+
+  let current = elementPickerMonth(root);
+  if (!current) {
+    markField(el, 'review');
+    return false;
+  }
+  for (let steps = 0; steps < 240; steps++) {
+    const delta = (target.year - current.year) * 12 + (target.month - current.month);
+    if (delta === 0) break;
+    const selector = delta < 0
+      ? '.el-date-picker__prev-btn.el-icon-arrow-left'
+      : '.el-date-picker__next-btn.el-icon-arrow-right';
+    const control = root.querySelector<HTMLElement>(selector);
+    if (!control || !isVisible(control)) {
+      markField(el, 'review');
+      return false;
+    }
+    control.click();
+    const next = await waitForElementPickerMonth(root, current);
+    if (!next || (next.year === current.year && next.month === current.month)) {
+      markField(el, 'review');
+      return false;
+    }
+    current = next;
+  }
+  if (current.year !== target.year || current.month !== target.month) {
+    markField(el, 'review');
+    return false;
+  }
+
+  const wantedDay = String(target.day ?? 1);
+  const dayCell = Array.from(root.querySelectorAll<HTMLElement>(
+    '.el-date-table td.available:not(.prev-month):not(.next-month)',
+  )).find((cell) => normalizeText(cell.querySelector('.cell')?.textContent ?? cell.textContent ?? '') === wantedDay);
+  if (!dayCell) {
+    markField(el, 'review');
+    return false;
+  }
+  (dayCell.querySelector<HTMLElement>('.cell') ?? dayCell).click();
+  await waitForDialogValue(el, value, 1400);
+  const verified = dialogValueMatches(el, value);
+  markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
+  return verified;
+}
+
 async function fillDialogSelection(
   el: HTMLElement,
   value: string,
   confidence: 'high' | 'medium' | 'low',
 ): Promise<boolean> {
+  const interactionPlan = createDomControlInteractionPlan(buildDomControlProbe(el));
   const trigger = findSelectionTrigger(el);
   if (!trigger) return false;
   const field = extractField(el);
@@ -1671,6 +2468,9 @@ async function fillDialogSelection(
   if (!dialogRoot) {
     markField(el, 'review');
     return false;
+  }
+  if (interactionPlan.kind === 'cascader') {
+    return fillCascaderSelection(el, dialogRoot, value, confidence);
   }
   let choice = await waitForDialogChoice(dialogRoot, value, 1200);
 
@@ -1707,8 +2507,23 @@ async function fillDialogSelection(
   }
 
   const verified = dialogValueMatches(el, value);
-  markField(el, verified ? (confidence === 'high' ? 'verified' : 'review') : 'mismatch');
-  return verified;
+  if (verified) {
+    markField(el, confidence === 'high' ? 'verified' : 'review');
+    return true;
+  }
+
+  // Some page frameworks finish propagating a programmatic option click only
+  // after the extension message task unwinds. The exact option was found and
+  // clicked, so keep the task moving and perform the authoritative readback in
+  // a later task instead of reporting a false failure immediately.
+  markField(el, 'review');
+  window.setTimeout(() => {
+    const deferredVerified = dialogValueMatches(el, value);
+    markField(el, deferredVerified
+      ? (confidence === 'high' ? 'verified' : 'review')
+      : 'mismatch');
+  }, 350);
+  return true;
 }
 
 async function fillElementAsync(
@@ -1716,8 +2531,10 @@ async function fillElementAsync(
   value: string,
   confidence: 'high' | 'medium' | 'low' = 'medium',
 ): Promise<boolean> {
+  const field = extractField(el);
+  if (field.protected) return false;
+  if (isSupportedDatePicker(el)) return fillDatePicker(el as HTMLInputElement, value, confidence);
   if (isSupportedDialogSelection(el)) return fillDialogSelection(el, value, confidence);
-  if (extractField(el).protected) return false;
   const immediate = fillElement(el, value, confidence);
   if (immediate) return true;
   const verified = await waitForElementValue(el, value);
@@ -1997,8 +2814,21 @@ export default defineContentScript({
     chrome.runtime.onMessage.addListener(
       (message: Message, _sender, sendResponse) => {
         if (message.type === 'scan') {
-          const results = scanFields();
-          sendResponse(results);
+          waitForVisibleEditableSurface()
+            .then(() => sendResponse(scanFields()))
+            .catch(() => sendResponse(scanFields()));
+        } else if (message.type === 'observeRepeatGroups') {
+          sendResponse(observeRepeatGroups());
+        } else if (message.type === 'commitRepeatRecord') {
+          commitRepeatRecord(message.groupLabel)
+            .then(sendResponse)
+            .catch(() => sendResponse({
+              groupLabel: message.groupLabel,
+              committed: false,
+              reason: 'unexpected-record-commit-error',
+            } satisfies CommitRepeatRecordResult));
+        } else if (message.type === 'getAgentPageContext') {
+          sendResponse(getAgentPageContext());
         } else if (message.type === 'getPageMeta') {
           sendResponse(getPageMeta());
         } else if (message.type === 'getAuditPageSnapshot') {
@@ -2084,7 +2914,21 @@ export default defineContentScript({
           sendResponse({ ok: true });
         } else if (message.type === 'fillField') {
           fillOneField(message.index, message.value, message.confidence)
-            .then((success) => sendResponse({ ok: success }))
+            .then((success) => {
+              const element = elementMap.get(message.index);
+              const liveElement = element ? resolveLiveControl(element) : undefined;
+              sendResponse({
+                ok: success,
+                observed: element ? getCurrentValue(element) : '',
+                matched: element ? dialogValueMatches(element, message.value) : false,
+                connected: element?.isConnected ?? false,
+                rebound: Boolean(element && liveElement && element !== liveElement),
+                rawValue: liveElement instanceof HTMLInputElement || liveElement instanceof HTMLTextAreaElement
+                  ? liveElement.value
+                  : '',
+                cascaderTrace: [...lastCascaderTrace],
+              });
+            })
             .catch(() => sendResponse({ ok: false }));
         } else if (message.type === 'manualFill') {
           if (!lastFocusedElement) sendResponse({ ok: false });

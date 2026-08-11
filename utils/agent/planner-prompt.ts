@@ -123,6 +123,7 @@ export function buildAgentPlannerPrompt(
         label: group.label,
         kind: group.kind,
         columns: group.columns,
+        observation: group.observation ?? null,
         fields: group.fields.filter((field) => !rowTargetIds.has(field.targetId)).map(safeField),
         rows: group.rows.map((row) => ({ rowIndex: row.rowIndex, fields: row.fields.map(safeField) })),
       };

@@ -20,6 +20,13 @@ export interface AgentMaterialContext {
   existingFiles: string[];
 }
 
+export interface AgentPageSemanticContext {
+  title: string;
+  stepText: string;
+  visibleTexts: string[];
+  instructions: string[];
+}
+
 export interface AgentTargetField {
   targetId: string;
   index: number;
@@ -63,6 +70,15 @@ export interface AgentFieldGroup {
   columns: Array<{ columnId: string; label: string }>;
   fields: AgentTargetField[];
   rows: AgentFieldRow[];
+  observation?: {
+    presentation: 'inline' | 'dialog' | 'unknown';
+    tableHeaders: string[];
+    fieldLabels: string[];
+    currentRowCount: number;
+    hasAddControl: boolean;
+    addControlLabel?: string;
+    dialogVisible: boolean;
+  };
 }
 
 export interface CompleteAgentFieldGroup extends Omit<AgentFieldGroup, 'fields' | 'rows'> {

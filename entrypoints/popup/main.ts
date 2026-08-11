@@ -13,6 +13,7 @@ import type { ApplicationPageAnalysis } from '@/utils/page-analysis';
 import type { RepeatableRecordPlan } from '@/utils/repeatable-records';
 import { buildPopupTaskSummary } from '@/utils/audit-view-model';
 import { buildAgentViewModel } from '@/utils/agent/view-model';
+import { buildAgentBatchProgressView } from '@/utils/agent/batch-view';
 import { materialFieldDisplayLabel } from '@/utils/material-field-context';
 import { computeMaterialReviewState } from '@/utils/material-review';
 
@@ -37,6 +38,9 @@ interface ScanResponse {
     cached?: boolean;
     reviewed: number;
     error: string;
+    agent?: boolean;
+    pendingActions?: number;
+    reviewItems?: number;
   };
 }
 
@@ -330,6 +334,7 @@ function renderAgentTaskPanel(task: ApplicationTask | undefined): string {
   const checkpoint = task?.runner?.agent;
   const view = buildAgentViewModel(checkpoint);
   if (!checkpoint || !view) return '';
+  const batchView = buildAgentBatchProgressView(task?.runner);
   const actionLabels = {
     add_rows: '新增表格行',
     fill_field: '填写字段',
@@ -351,11 +356,12 @@ function renderAgentTaskPanel(task: ApplicationTask | undefined): string {
   return `
     <section class="agent-task-panel ${view.phaseTone}">
       <div class="agent-task-head">
-        <div><strong>保填 Agent 2.0</strong><span>页面级理解 · 整行执行 · 写后回读</span></div>
+        <div><strong>保填 Agent 2.1</strong><span>页面级理解 · 跨页规划 · 整行执行 · 写后回读</span></div>
         <em>${escapeHtml(view.phaseLabel)}</em>
       </div>
       <div class="agent-task-meta">
         <span>计划 ${view.planned} 项</span>
+        ${batchView ? `<span class="batch-${batchView.tone}">${escapeHtml(batchView.label)}${batchView.pageCount ? ` · ${batchView.pageCount} 页` : ''}</span>` : ''}
         ${view.cached ? '<span class="cache">已复用本页计划</span>' : '<span>本页新计划</span>'}
         ${view.retries ? `<span>已修复 ${view.retries} 次</span>` : ''}
       </div>
@@ -916,7 +922,9 @@ function renderResult(scanResp: ScanResponse) {
       ${scanResp.ai.error
         ? `AI 调用失败：${escapeHtml(scanResp.ai.error)}`
         : scanResp.ai.attempted
-          ? `AI 已真实调用 · ${scanResp.ai.mode === 'enhanced' ? '增强复核' : '补漏'} · 返回 ${scanResp.ai.reviewed} 项`
+          ? scanResp.ai.agent
+            ? `Agent 已真实调用 · 页面规划 ${scanResp.ai.reviewed} 项${scanResp.ai.pendingActions ? ` · 待处理结构 ${scanResp.ai.pendingActions}` : ''}`
+            : `AI 已真实调用 · ${scanResp.ai.mode === 'enhanced' ? '增强复核' : '补漏'} · 返回 ${scanResp.ai.reviewed} 项`
           : scanResp.ai.configured
             ? 'AI 已配置，本页没有需要发送的安全字段'
             : 'AI 未配置，本次仅使用本地规则'}
@@ -938,11 +946,6 @@ function renderResult(scanResp: ScanResponse) {
         <div class="stat-value protected">${reviewCount}</div>
         <div class="stat-label">需检查</div>
       </div>
-    </div>
-    <div class="fill-policy" role="group" aria-label="填充策略"${materialItems.length === displayItems.length ? ' hidden' : ''}>
-      <button data-policy="cautious">保守</button>
-      <button data-policy="standard" class="active">标准</button>
-      <button data-policy="aggressive">尽量填充</button>
     </div>
     <div class="field-list-card">
       <div class="field-list-header">
@@ -1055,10 +1058,6 @@ function renderResult(scanResp: ScanResponse) {
     if (first) previewMaterial(first.index, first.fileRecordId, queue);
   });
 
-  main.querySelectorAll<HTMLButtonElement>('.fill-policy button').forEach((button) => {
-    button.addEventListener('click', () => applyFillPolicy(button.dataset.policy ?? 'standard'));
-  });
-
   syncPageMarkers();
   renderFooter(checkedCount);
   updateFooterButton();
@@ -1099,28 +1098,6 @@ function getStatusHtml(item: DisplayItem): string {
   };
   const sourceLabel = item.match?.source === 'ai' ? 'AI' : item.match?.source === 'ai_reviewed' ? 'AI复核' : '本地';
   return `<span class="status-tag ${confidence}">${sourceLabel}${labelMap[confidence]}</span>`;
-}
-
-function applyFillPolicy(policy: string): void {
-  document.querySelectorAll('.fill-policy button').forEach((button) => {
-    button.classList.toggle('active', (button as HTMLElement).dataset.policy === policy);
-  });
-  displayItems.forEach((item) => {
-    if (item.status !== 'matched' && item.status !== 'pending') return;
-    if (item.kind === 'file') {
-      item.checked = false;
-      return;
-    }
-    item.checked = policy === 'aggressive'
-      ? true
-      : policy === 'cautious'
-        ? item.confidence === 'high' || item.fillMode === 'long'
-        : item.confidence !== 'low' || item.fillMode === 'long';
-    const checkbox = document.querySelector<HTMLInputElement>(`input[type="checkbox"][data-idx="${item.index}"]`);
-    if (checkbox) checkbox.checked = item.checked;
-  });
-  updateFooterButton();
-  persistCurrentPageAnalysis();
 }
 
 function escapeHtml(text: string): string {

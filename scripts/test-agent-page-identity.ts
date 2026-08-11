@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   formatAgentApplicationDisplayName,
   inferAgentApplicationIdentity,
+  inferAgentApplicationIdentityFromPage,
 } from '../utils/agent/page-identity';
 
 const identity = inferAgentApplicationIdentity({
@@ -41,5 +42,33 @@ assert.equal(inferAgentApplicationIdentity({
   visibleTexts: ['合肥工业大学'],
   profileInstitution: '合肥工业大学',
 }).institutionName, '');
+
+assert.deepEqual(inferAgentApplicationIdentity({
+  title: '在线报名 - 预推免',
+  url: 'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance#/tmfwksdExemptionOnlineSignUp',
+  visibleTexts: ['670 计算机学院', '预推免'],
+  profileInstitution: '合肥工业大学',
+}), {
+  institutionName: '中山大学',
+  departmentName: '计算机学院',
+  projectName: '预推免',
+});
+
+assert.deepEqual(inferAgentApplicationIdentityFromPage({
+  title: '在线报名 - 预推免',
+  url: 'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance',
+  pageLabel: '报名信息',
+  fields: [{
+    label: '申请院系所',
+    groupLabel: '报名信息',
+    value: '670 计算机学院',
+    context: '*申请院系所',
+  }],
+  profileInstitution: '合肥工业大学',
+}), {
+  institutionName: '中山大学',
+  departmentName: '计算机学院',
+  projectName: '预推免',
+});
 
 console.log('agent page identity tests passed');

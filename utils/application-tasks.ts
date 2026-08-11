@@ -2,6 +2,8 @@ import type {
   ApplicationPageAnalysis,
   ApplicationRunnerCheckpoint,
 } from './page-analysis';
+import { formatAgentApplicationDisplayName } from './agent/page-identity';
+import type { AgentApplicationIdentity } from './agent/types';
 
 export const APPLICATION_TASKS_KEY = 'applicationTasks:v1';
 export const APPLICATION_TASK_BINDINGS_KEY = 'applicationTaskBindings:v1';
@@ -127,6 +129,7 @@ function clonePageAnalysis(analysis: ApplicationPageAnalysis): ApplicationPageAn
       }])),
     },
     ai: { ...analysis.ai },
+    ...(analysis.agentSnapshot ? { agentSnapshot: structuredClone(analysis.agentSnapshot) } : {}),
   };
 }
 
@@ -135,6 +138,8 @@ function cloneRunnerCheckpoint(checkpoint: ApplicationRunnerCheckpoint): Applica
     ...checkpoint,
     history: checkpoint.history.map((entry) => ({ ...entry })),
     ...(checkpoint.agent ? { agent: structuredClone(checkpoint.agent) } : {}),
+    ...(checkpoint.batchBlueprint ? { batchBlueprint: structuredClone(checkpoint.batchBlueprint) } : {}),
+    ...(checkpoint.batchPlan ? { batchPlan: structuredClone(checkpoint.batchPlan) } : {}),
   };
 }
 
@@ -231,6 +236,22 @@ export function createApplicationTask(input: CreateApplicationTaskInput): Applic
     createdAt: input.now,
     updatedAt: input.now,
     lastOpenedAt: input.now,
+  };
+}
+
+export function updateTaskApplicationIdentity(
+  task: ApplicationTask,
+  identity: AgentApplicationIdentity,
+  now = Date.now(),
+): ApplicationTask {
+  const displayName = formatAgentApplicationDisplayName(identity);
+  if (!displayName) return task;
+  return {
+    ...task,
+    siteTitle: identity.institutionName || task.siteTitle,
+    displayName,
+    updatedAt: Math.max(task.updatedAt, now),
+    lastOpenedAt: Math.max(task.lastOpenedAt, now),
   };
 }
 

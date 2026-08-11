@@ -502,7 +502,9 @@ body {
 }
 
 .material-preview-question strong {
+  min-width: 0;
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .material-preview-body {
@@ -583,24 +585,27 @@ body {
 
 .field-label {
   flex: 1;
+  min-width: 0;
   color: #1F2937;
   font-weight: 500;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .field-value {
   flex: 1;
+  min-width: 0;
   color: #667085;
   text-align: right;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .field-status {
   width: 56px;
+  min-width: 56px;
   text-align: right;
   flex-shrink: 0;
 }
@@ -786,6 +791,8 @@ body {
 .agent-task-meta { flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .agent-task-meta span { padding: 2px 6px; border-radius: 999px; color: #52657b; background: rgba(255, 255, 255, .86); font-size: 9px; }
 .agent-task-meta .cache { color: #1769e6; background: #e7f1ff; }
+.agent-task-meta .batch-active { color: #1769e6; background: #e7f1ff; }
+.agent-task-meta .batch-warning { color: #b45309; background: #fff0d9; }
 
 .agent-task-metrics {
   display: grid;
@@ -877,33 +884,6 @@ body {
   margin-bottom: 2px;
   color: #0F172A;
   font-size: 16px;
-}
-
-/* ===== Fill policy ===== */
-.fill-policy {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 4px;
-  padding: 4px;
-  margin-bottom: 12px;
-  border-radius: 9px;
-  background: #E9EEF6;
-}
-
-.fill-policy button {
-  padding: 6px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: #64748B;
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.fill-policy button.active {
-  background: #FFFFFF;
-  color: #257FFD;
-  font-weight: 600;
 }
 
 /* ===== Manual quick fill ===== */

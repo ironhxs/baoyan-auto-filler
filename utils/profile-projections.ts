@@ -8,6 +8,15 @@ export interface TargetFieldSchema {
     label: string;
     required?: boolean;
     multiline?: boolean;
+    currentValue?: string;
+    protected?: boolean;
+    options?: string[];
+    placeholder?: string;
+    formatHints?: string[];
+    forbiddenCharacters?: string[];
+    maxLength?: number;
+    questionText?: string;
+    annotations?: string[];
   }>;
 }
 
@@ -25,6 +34,8 @@ export interface ProfileProjectionCandidate {
 type SourceSectionId = ProfileProjectionCandidate['sourceSectionId'];
 
 const REPEAT_SECTION_IDS: SourceSectionId[] = [
+  'family',
+  'language',
   'education_career',
   'research_training',
   'internship_practice',
@@ -41,7 +52,7 @@ function normalize(text: string): string {
     .replace(/[\s　：:，,。；;（）()【】\[\]\/|｜_*#]/g, '');
 }
 
-function getSourceSection(block: BlockCategory): SourceSectionId {
+export function getProfileProjectionSourceSectionId(block: BlockCategory): SourceSectionId {
   return (block.sectionId && REPEAT_SECTION_IDS.includes(block.sectionId as SourceSectionId)
     ? block.sectionId
     : 'custom') as SourceSectionId;
@@ -50,6 +61,8 @@ function getSourceSection(block: BlockCategory): SourceSectionId {
 function sourceSectionsForTarget(target: TargetFieldSchema): SourceSectionId[] {
   const label = normalize(target.groupLabel);
   const targetFields = normalize(target.fields.map((field) => `${field.key}${field.label}`).join(''));
+  if (/\u5bb6\u5ead.*\u6210\u5458|\u5bb6\u5ead\u60c5\u51b5|\u4e3b\u8981\u6210\u5458/.test(label)) return ['family'];
+  if (/\u5916\u8bed|\u8bed\u8a00.*\u6c34\u5e73|\u82f1\u8bed.*\u6210\u7ee9/.test(label)) return ['language'];
   const chronologyTarget = /学习和工作经历|从高中|教育经历|学习经历/.test(label)
     || (
       /(起始时间|开始时间)/.test(targetFields)
@@ -92,6 +105,21 @@ function splitAwardLevelAndGrade(value: string): { level: string; grade: string 
 
 function resolveSourceField(target: string, sourceSectionId: SourceSectionId): { keys: string[]; transform?: (value: string) => string; derived?: boolean; reason: string } | undefined {
   const label = normalize(target);
+
+  if (sourceSectionId === 'family') {
+    if (/\u59d3\u540d/.test(label)) return { keys: ['\u59d3\u540d'], reason: '\u5bb6\u5ead\u6210\u5458\u59d3\u540d\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u5173\u7cfb|\u79f0\u8c13/.test(label)) return { keys: ['\u5173\u7cfb'], reason: '\u5bb6\u5ead\u6210\u5458\u5173\u7cfb\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u5355\u4f4d|\u804c\u4e1a|\u804c\u52a1|\u5de5\u4f5c/.test(label)) return { keys: ['\u5de5\u4f5c\u5355\u4f4d\u53ca\u804c\u52a1'], reason: '\u5bb6\u5ead\u6210\u5458\u5de5\u4f5c\u5355\u4f4d\u53ca\u804c\u52a1\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u7535\u8bdd|\u624b\u673a|\u8054\u7cfb\u65b9\u5f0f/.test(label)) return { keys: ['\u8054\u7cfb\u7535\u8bdd'], reason: '\u5bb6\u5ead\u6210\u5458\u8054\u7cfb\u7535\u8bdd\u6309\u8bed\u4e49\u6620\u5c04' };
+  }
+
+  if (sourceSectionId === 'language') {
+    if (/\u8003\u8bd5|\u8bed\u79cd|\u8bc1\u4e66\u540d\u79f0/.test(label)) return { keys: ['\u8003\u8bd5\u540d\u79f0'], reason: '\u5916\u8bed\u8003\u8bd5\u540d\u79f0\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u6210\u7ee9|\u5206\u6570/.test(label)) return { keys: ['\u6210\u7ee9'], reason: '\u5916\u8bed\u6210\u7ee9\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u65e5\u671f|\u65f6\u95f4|\u5e74\u6708/.test(label)) return { keys: ['\u8003\u8bd5\u65e5\u671f'], reason: '\u5916\u8bed\u8003\u8bd5\u65e5\u671f\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u5907\u6ce8|\u8bf4\u660e/.test(label)) return { keys: ['\u5907\u6ce8'], reason: '\u5916\u8bed\u5907\u6ce8\u6309\u8bed\u4e49\u6620\u5c04' };
+    if (/\u8bc1\u4e66\u7f16\u53f7|\u8bc1\u4e66\u53f7/.test(label)) return { keys: ['\u8bc1\u4e66\u7f16\u53f7'], reason: '\u5916\u8bed\u8bc1\u4e66\u7f16\u53f7\u6309\u8bed\u4e49\u6620\u5c04' };
+  }
 
   if (sourceSectionId === 'education_career') {
     if (/起始|开始/.test(label)) return { keys: ['起始时间'], reason: '履历起始时间按语义映射' };
@@ -161,7 +189,8 @@ function resolveSourceField(target: string, sourceSectionId: SourceSectionId): {
   }
 
   if (sourceSectionId === 'honors_awards') {
-    if (/级别|等级/.test(label)) return { keys: ['获奖等级'], reason: '荣誉奖励级别按语义映射' };
+    if (/级别/.test(label)) return { keys: ['获奖等级'], transform: (value) => splitAwardLevelAndGrade(value).level, derived: true, reason: '从合并的荣誉奖励等级中拆分奖项级别' };
+    if (/等级|等次/.test(label)) return { keys: ['获奖等级'], transform: (value) => splitAwardLevelAndGrade(value).grade, derived: true, reason: '从合并的荣誉奖励等级中拆分奖项等级' };
     if (/名称|奖项|奖励|荣誉/.test(label)) return { keys: ['获奖名称'], reason: '荣誉奖励名称按语义映射' };
     if (/时间|日期|年月/.test(label)) return { keys: ['获奖时间'], reason: '荣誉奖励时间按语义映射' };
     if (/主办|颁发|授予|组织/.test(label)) return { keys: ['主办单位'], reason: '荣誉奖励授予单位按语义映射' };
@@ -181,7 +210,7 @@ export function projectProfileToTargetSchema(
   const candidates: ProfileProjectionCandidate[] = [];
 
   for (const block of blocks) {
-    const sourceSectionId = getSourceSection(block);
+    const sourceSectionId = getProfileProjectionSourceSectionId(block);
     if (!sourceIds.includes(sourceSectionId)) continue;
     block.items.forEach((item, sourceItemIndex) => {
       for (const targetField of target.fields) {

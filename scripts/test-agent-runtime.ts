@@ -291,4 +291,91 @@ function validated(plan: AgentPagePlan): AgentValidatedRunPlan {
   assert.equal(outcome.canAdvance, false);
 }
 
+{
+  const base = fixture('structure-page');
+  const initialSnapshot: AgentPageSnapshot = {
+    ...base.snapshot,
+    groups: [{
+      groupId: 'family-group',
+      label: '家庭成员',
+      kind: 'repeatable',
+      columns: [{ columnId: 'name-column', label: '姓名' }],
+      fields: [],
+      rows: [],
+      observation: {
+        presentation: 'dialog', tableHeaders: ['姓名'], fieldLabels: [],
+        currentRowCount: 0, hasAddControl: true, addControlLabel: '新增', dialogVisible: false,
+      },
+    }],
+  };
+  const expandedSnapshot: AgentPageSnapshot = {
+    ...initialSnapshot,
+    groups: [{
+      ...initialSnapshot.groups[0],
+      fields: [{
+        targetId: 'family-name-0', index: 10, rowIndex: 0, columnId: 'name-column', label: '姓名',
+        currentValue: '', required: true, protected: false, kind: 'text', options: [], placeholder: '',
+        formatHints: [], forbiddenCharacters: [],
+      }],
+      rows: [{ rowIndex: 0, fields: [{
+        targetId: 'family-name-0', index: 10, rowIndex: 0, columnId: 'name-column', label: '姓名',
+        currentValue: '', required: true, protected: false, kind: 'text', options: [], placeholder: '',
+        formatHints: [], forbiddenCharacters: [],
+      }] }],
+      observation: {
+        presentation: 'dialog', tableHeaders: ['姓名'], fieldLabels: ['姓名'],
+        currentRowCount: 1, hasAddControl: true, addControlLabel: '新增', dialogVisible: true,
+      },
+    }],
+  };
+  const addPlan: AgentPagePlan = {
+    version: 1, pageKey: initialSnapshot.pageKey, snapshotFingerprint: 'initial', profileFingerprint: 'profile',
+    reviewItems: [],
+    actions: [{ actionId: 'add-family', type: 'add_rows', groupId: 'family-group', count: 1, confidence: 1, reason: '新增一条家庭成员' }],
+  };
+  const fillPlan: AgentPagePlan = {
+    version: 1, pageKey: expandedSnapshot.pageKey, snapshotFingerprint: 'expanded', profileFingerprint: 'profile',
+    reviewItems: [],
+    actions: [{
+      actionId: 'fill-family', type: 'fill_row', groupId: 'family-group', rowIndex: 0,
+      sourceRecordId: 'basic:0', values: [{
+        targetId: 'family-name-0', value: '测试同学', evidenceFields: ['姓名'],
+        confidence: 1, needsReview: false, reason: '家庭成员姓名',
+      }],
+    }],
+  };
+  let observeCount = 0;
+  let planCount = 0;
+  const executed: string[][] = [];
+  const outcome = await runAgentPage({
+    observe: async () => (++observeCount === 1 ? initialSnapshot : expandedSnapshot),
+    retrieve: async () => base.records,
+    plan: async () => (++planCount === 1 ? addPlan : fillPlan),
+    validate: (value) => validated(value),
+    prepare: async (value) => value.executableActions.some((action) => action.type === 'add_rows')
+      ? {
+          structureChanged: true,
+          results: [{
+            actionId: 'add-family', status: 'verified', observed: '1', reason: 'row-created', updatedAt: 1,
+          }],
+        }
+      : undefined,
+    execute: async (value) => {
+      executed.push(value.executableActions.map((action) => action.actionId));
+      return { results: [{
+        actionId: 'fill-family', targetId: 'family-name-0', status: 'verified',
+        observed: '测试同学', reason: 'readback', updatedAt: 2,
+      }] };
+    },
+    verify: async (_value, report) => ({
+      results: report.results, complete: true, needsRepair: false, failedActionIds: [], canAdvance: true,
+    }),
+    save: async () => undefined,
+  });
+  assert.equal(outcome.status, 'complete');
+  assert.equal(planCount, 2, 'a changed repeatable structure must force a fresh Agent plan');
+  assert.deepEqual(executed, [['fill-family']], 'the obsolete add-only plan must not execute after the row appears');
+  assert.equal(outcome.checkpoint.results.some((result) => result.actionId === 'add-family'), true);
+}
+
 console.log('agent runtime tests passed');

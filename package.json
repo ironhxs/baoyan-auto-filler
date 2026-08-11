@@ -1,7 +1,7 @@
 {
   "name": "baotian",
   "description": "保填",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -20,7 +20,9 @@
     "test:repeatable-records": "tsx scripts/test-repeatable-records.ts",
     "test:repeatable-row-request": "tsx scripts/test-repeatable-row-request.ts",
     "test:repeatable-dialog": "tsx scripts/test-repeatable-dialog.ts",
+    "test:repeat-group-surface": "tsx scripts/test-repeat-group-surface.ts",
     "test:dom-selection-policy": "tsx scripts/test-dom-selection-policy.ts",
+    "test:dom-controls": "tsx scripts/test-dom-control-adapter.ts",
     "test:tasks": "tsx scripts/test-application-tasks.ts",
     "test:page-analysis-recovery": "tsx scripts/test-page-analysis-recovery.ts",
     "test:audit": "tsx scripts/test-final-audit.ts",
@@ -44,7 +46,10 @@
     "test:agent:execution": "tsx scripts/test-agent-execution.ts",
     "test:agent:cache": "tsx scripts/test-agent-cache.ts",
     "test:agent:runtime": "tsx scripts/test-agent-runtime.ts",
+    "test:agent:repeat-dialog": "tsx scripts/test-agent-repeat-dialog-completion.ts",
     "test:agent:activation": "tsx scripts/test-agent-activation.ts",
+    "test:agent:preview": "tsx scripts/test-agent-preview.ts",
+    "test:agent:batch": "tsx scripts/test-agent-batch-planning.ts && tsx scripts/test-agent-batch-state.ts && tsx scripts/test-agent-batch-coordinator.ts && tsx scripts/test-agent-batch-view.ts",
     "test:agent:ui": "tsx scripts/test-agent-ui.ts",
     "test:firefox:privacy": "tsx scripts/test-firefox-privacy-manifest.ts",
     "postinstall": "wxt prepare"

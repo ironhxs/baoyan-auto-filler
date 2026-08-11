@@ -2,7 +2,23 @@ import type { AgentApplicationIdentity } from './types';
 
 export interface InferAgentApplicationIdentityInput {
   title?: string;
+  url?: string;
   visibleTexts?: string[];
+  profileInstitution?: string;
+}
+
+export interface AgentIdentityFieldLike {
+  label?: string;
+  groupLabel?: string;
+  value?: string;
+  context?: string;
+}
+
+export interface InferAgentApplicationIdentityFromPageInput {
+  title?: string;
+  url?: string;
+  pageLabel?: string;
+  fields: AgentIdentityFieldLike[];
   profileInstitution?: string;
 }
 
@@ -28,6 +44,32 @@ function isExplicitProjectName(text: string): boolean {
   return /(?:夏令营|冬令营|预推免|推免|优秀大学生|招生项目|报名项目|专项计划|选拔计划|申请项目)/u.test(text);
 }
 
+function projectNameFromTitle(text: string): string {
+  const normalized = normalizeText(text);
+  return normalizeText(normalized.match(/(?:预推免|推免|夏令营|冬令营|优秀大学生(?:夏令营)?|专项计划|选拔计划|招生项目|报名项目|申请项目)/u)?.[0]);
+}
+
+const OFFICIAL_INSTITUTION_DOMAINS: Array<[suffix: string, name: string]> = [
+  ['sysu.edu.cn', '中山大学'],
+  ['fudan.edu.cn', '复旦大学'],
+  ['seu.edu.cn', '东南大学'],
+];
+
+function institutionFromUrl(value: string | undefined): string {
+  try {
+    const hostname = new URL(value ?? '').hostname.toLowerCase();
+    return OFFICIAL_INSTITUTION_DOMAINS.find(([suffix]) => (
+      hostname === suffix || hostname.endsWith(`.${suffix}`)
+    ))?.[1] ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizeDepartmentName(value: string): string {
+  return normalizeText(value).replace(/^\d{2,12}\s*/u, '');
+}
+
 export function inferAgentApplicationIdentity(
   input: InferAgentApplicationIdentityInput,
 ): AgentApplicationIdentity {
@@ -35,9 +77,11 @@ export function inferAgentApplicationIdentity(
   const visibleTexts = unique(input.visibleTexts ?? []);
   const profileInstitution = normalizeText(input.profileInstitution);
   const titleInstitution = extractInstitution(title);
+  const urlInstitution = institutionFromUrl(input.url);
 
   const exactInstitutions = visibleTexts.filter((text) => /(?:大学|学院)$/u.test(text));
   const institutionCandidates = unique([
+    urlInstitution,
     titleInstitution,
     ...exactInstitutions,
     ...visibleTexts.map(extractInstitution),
@@ -49,20 +93,42 @@ export function inferAgentApplicationIdentity(
     ?? institutionCandidates[0]
     ?? '';
 
-  const departmentName = visibleTexts.find((text) => (
-    text !== institutionName
-    && text !== profileInstitution
-    && isDepartmentName(text)
-    && !isExplicitProjectName(text)
-  )) ?? '';
+  const departmentName = visibleTexts
+    .map(normalizeDepartmentName)
+    .find((text) => (
+      text !== institutionName
+      && text !== profileInstitution
+      && isDepartmentName(text)
+      && !isExplicitProjectName(text)
+    )) ?? '';
 
   const projectName = visibleTexts.find((text) => (
     text !== institutionName
     && text !== departmentName
     && isExplicitProjectName(text)
-  )) ?? (isExplicitProjectName(title) ? title : '');
+  )) ?? projectNameFromTitle(title);
 
   return { institutionName, departmentName, projectName };
+}
+
+export function inferAgentApplicationIdentityFromPage(
+  input: InferAgentApplicationIdentityFromPageInput,
+): AgentApplicationIdentity {
+  const visibleTexts = unique([
+    input.pageLabel ?? '',
+    ...input.fields.flatMap((field) => [
+      field.groupLabel ?? '',
+      field.label ?? '',
+      field.context ?? '',
+      field.value && field.value.length <= 80 ? field.value : '',
+    ]),
+  ]);
+  return inferAgentApplicationIdentity({
+    title: input.title,
+    url: input.url,
+    visibleTexts,
+    profileInstitution: input.profileInstitution,
+  });
 }
 
 export function formatAgentApplicationDisplayName(identity: AgentApplicationIdentity): string {

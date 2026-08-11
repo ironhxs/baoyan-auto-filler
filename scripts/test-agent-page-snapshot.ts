@@ -110,6 +110,59 @@ assert.equal(singleSnapshot.groups[0].fields[0].placeholder, '请输入姓名');
 assert.equal(singleSnapshot.groups[0].fields[0].maxLength, 20);
 assert.deepEqual(singleSnapshot.groups[0].fields[0].forbiddenCharacters, ['#']);
 
+const sysuSnapshot = buildAgentPageSnapshot({
+  pageKey: 'sysu-application',
+  url: 'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance',
+  title: '在线报名 - 预推免',
+  visibleTexts: ['670 计算机学院', '预推免'],
+  profileInstitution: '合肥工业大学',
+  instructions: [],
+  fields: [],
+});
+assert.deepEqual(sysuSnapshot.identity, {
+  institutionName: '中山大学',
+  departmentName: '计算机学院',
+  projectName: '预推免',
+});
+
+const emptyFamilySnapshot = buildAgentPageSnapshot({
+  pageKey: 'sysu-family-empty',
+  url: 'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance',
+  title: '家庭成员',
+  stepText: '家庭成员',
+  instructions: ['请通过新增按钮逐条填写家庭成员'],
+  fields: [],
+  repeatGroups: [{
+    groupLabel: '家庭成员',
+    presentation: 'dialog',
+    tableHeaders: ['姓名', '关系', '工作单位及职务', '联系电话'],
+    fieldLabels: [],
+    currentRowCount: 0,
+    hasAddControl: true,
+    addControlLabel: '新增',
+    dialogVisible: false,
+  }],
+});
+assert.equal(emptyFamilySnapshot.groups.length, 1);
+assert.equal(emptyFamilySnapshot.groups[0].kind, 'repeatable');
+assert.deepEqual(emptyFamilySnapshot.groups[0].columns.map((column) => column.label), [
+  '姓名',
+  '关系',
+  '工作单位及职务',
+  '联系电话',
+]);
+assert.deepEqual(emptyFamilySnapshot.groups[0].fields, []);
+assert.deepEqual(emptyFamilySnapshot.groups[0].rows, []);
+assert.deepEqual(emptyFamilySnapshot.groups[0].observation, {
+  presentation: 'dialog',
+  tableHeaders: ['姓名', '关系', '工作单位及职务', '联系电话'],
+  fieldLabels: [],
+  currentRowCount: 0,
+  hasAddControl: true,
+  addControlLabel: '新增',
+  dialogVisible: false,
+});
+
 const sensitiveSnapshot = buildAgentPageSnapshot({
   pageKey: 'security',
   url: 'https://example.test/basic?access_token=TEST_ONLY_TOKEN&redirect=Authorization%3A%20Bearer%20TEST_ONLY_REDIRECT&view=1',

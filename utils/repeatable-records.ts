@@ -1,6 +1,13 @@
 import type { BlockCategory, BlockItem, TextField } from './db';
 import type { FormFieldInfo } from './matcher';
+import type { AgentSourceRecord } from './agent/profile-retriever';
 import { getBlockSection, inferLanguageItems } from './profile-schema';
+import {
+  getProfileProjectionSourceSectionId,
+  projectProfileToTargetSchema,
+  type ProfileProjectionCandidate,
+  type TargetFieldSchema,
+} from './profile-projections';
 
 export interface RepeatableGroupPlan {
   groupLabel: string;
@@ -25,6 +32,7 @@ export interface RepeatRowTarget {
 export interface RepeatDialogRecordTarget {
   itemIndex: number;
   fields: Array<{ key: string; value: string }>;
+  sourceRecord: AgentSourceRecord;
 }
 
 export interface RepeatDialogTarget {
@@ -41,6 +49,8 @@ export interface PrepareRepeatRowsResult {
 export interface PrepareRepeatRecordsResult {
   added: number;
   processed: number;
+  blocked?: boolean;
+  dismissedGroups?: string[];
   failures: Array<{
     groupLabel: string;
     itemIndex?: number;
@@ -49,12 +59,30 @@ export interface PrepareRepeatRecordsResult {
   }>;
 }
 
+export interface RepeatableGroupObservation {
+  groupLabel: string;
+  presentation: 'inline' | 'dialog' | 'unknown';
+  tableHeaders: string[];
+  fieldLabels: string[];
+  currentRowCount: number;
+  hasAddControl: boolean;
+  addControlLabel?: string;
+  dialogVisible: boolean;
+}
+
+export interface CommitRepeatRecordResult {
+  groupLabel: string;
+  committed: boolean;
+  reason: string;
+}
+
 export interface RepeatableRowScanResult<T> {
   scanResults: T[];
   preparation: PrepareRepeatRowsResult;
 }
 
 export const MAX_REPEAT_ROW_ADDITIONS_PER_PASS = 24;
+export const MAX_REPEAT_DIALOG_PASSES_PER_SCAN = 12;
 
 export function planRepeatRowPreparation(
   requiredRows: number,
@@ -76,10 +104,43 @@ export function limitRepeatRecordBatch<T>(
   return { records: limitedRecords, truncated: records.length > limitedRecords.length };
 }
 
+export async function forEachRepeatPreparationTarget<T>(
+  targets: T[],
+  visit: (target: T) => Promise<'continue' | 'stop'>,
+): Promise<void> {
+  for (const target of targets) {
+    if (await visit(target) === 'stop') return;
+  }
+}
+
+export async function runSequentialRepeatPreparationPasses<T extends {
+  dialogGroups: string[];
+  stop?: boolean;
+}>(
+  runPass: (passIndex: number) => Promise<T>,
+  maxPasses = MAX_REPEAT_DIALOG_PASSES_PER_SCAN,
+): Promise<{ passes: T[]; truncated: boolean }> {
+  const passes: T[] = [];
+  const limit = Math.max(Math.floor(maxPasses), 1);
+  for (let passIndex = 0; passIndex < limit; passIndex++) {
+    const pass = await runPass(passIndex);
+    passes.push(pass);
+    if (pass.stop || pass.dialogGroups.length === 0) {
+      return { passes, truncated: false };
+    }
+  }
+  return { passes, truncated: true };
+}
+
 interface RepeatableSourceGroup {
   label: string;
   sectionId?: string;
   items: BlockItem[];
+  origins: Array<{
+    sourceSectionId: ProfileProjectionCandidate['sourceSectionId'];
+    sourceItemIndex: number;
+    sourceRecord: AgentSourceRecord;
+  }>;
 }
 
 const ADD_ROW_LABEL_PATTERN = /^(?:\u65b0\u589e|\u6dfb\u52a0)(?:\u4e00\u884c|\u884c|\u4e00\u6761|\u6210\u5458|\u7ecf\u5386|\u8bb0\u5f55|\u5956\u52b1|\u83b7\u5956|\u6210\u679c|\u8003\u8bd5)?$/;
@@ -129,19 +190,80 @@ function sameText(left: string | undefined, right: string | undefined): boolean 
   return Boolean(a && b && (a === b || a.includes(b) || b.includes(a)));
 }
 
+function repeatableGroupKind(label: string | undefined): string {
+  const value = normalize(label);
+  if (/\u5bb6\u5ead.*\u6210\u5458|\u5bb6\u5ead\u60c5\u51b5|\u4e3b\u8981\u6210\u5458/.test(value)) return 'family';
+  if (/\u5916\u8bed|\u8bed\u8a00.*\u6c34\u5e73|\u82f1\u8bed.*\u6210\u7ee9/.test(value)) return 'language';
+  if (/\u8bba\u6587/.test(value)) return 'papers';
+  if (/\u83b7\u5956|\u5956\u52b1|\u8363\u8a89|\u7ade\u8d5b/.test(value)) return 'awards';
+  if (/\u9879\u76ee|\u79d1\u7814\u8bad\u7ec3|\u79d1\u7814\u5b9e\u8df5/.test(value)) return 'projects';
+  if (/\u5b66\u4e60.*\u5de5\u4f5c.*\u7ecf\u5386|\u6559\u80b2\u7ecf\u5386/.test(value)) return 'education-career';
+  return '';
+}
+
+export function sameRepeatableGroupLabel(left: string | undefined, right: string | undefined): boolean {
+  if (sameText(left, right)) return true;
+  const leftKind = repeatableGroupKind(left);
+  return Boolean(leftKind && leftKind === repeatableGroupKind(right));
+}
+
+function sourceRecordFor(block: BlockCategory, sourceItemIndex: number): AgentSourceRecord {
+  const fields = Object.fromEntries((block.items[sourceItemIndex]?.fields ?? [])
+    .map((field) => [field.key.trim(), field.value.trim()] as const)
+    .filter(([key, value]) => Boolean(key && value)));
+  const configuredId = block.sectionId?.trim();
+  const categoryId = configuredId || getProfileProjectionSourceSectionId(block);
+  const categoryLabel = block.title.trim() || categoryId;
+  const recordPrefix = configuredId || `${categoryId}:${categoryLabel}`;
+  return {
+    recordId: `${recordPrefix}:${sourceItemIndex}`,
+    categoryId,
+    categoryLabel,
+    itemIndex: sourceItemIndex,
+    fields,
+    searchText: Object.entries(fields).map(([key, value]) => `${key}: ${value}`).join('；'),
+  };
+}
+
 function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): RepeatableSourceGroup[] {
   const groups = blocks.flatMap((block) => {
     const section = getBlockSection(block);
+    const origins = block.items.map((_item, sourceItemIndex) => ({
+      sourceSectionId: getProfileProjectionSourceSectionId(block),
+      sourceItemIndex,
+      sourceRecord: sourceRecordFor(block, sourceItemIndex),
+    }));
     if (!section || section.kind !== 'repeat') {
       return block.items.length > 0 && block.title.trim()
-        ? [{ label: block.title, sectionId: block.sectionId, items: block.items }]
+        ? [{ label: block.title, sectionId: block.sectionId, items: block.items, origins }]
         : [];
     }
-    return [{ label: section.title, sectionId: section.id, items: block.items }];
+    return [{ label: section.title, sectionId: section.id, items: block.items, origins }];
   });
   if (!groups.some((group) => group.label === '外语水平')) {
     const inferred = inferLanguageItems(textFields);
-    if (inferred.length > 0) groups.push({ label: '外语水平', sectionId: 'language', items: inferred });
+    if (inferred.length > 0) groups.push({
+      label: '外语水平',
+      sectionId: 'language',
+      items: inferred,
+      origins: inferred.map((item, sourceItemIndex) => {
+        const fields = Object.fromEntries(item.fields
+          .map((field) => [field.key.trim(), field.value.trim()] as const)
+          .filter(([key, value]) => Boolean(key && value)));
+        return {
+          sourceSectionId: 'custom' as const,
+          sourceItemIndex,
+          sourceRecord: {
+            recordId: `custom:外语水平:${sourceItemIndex}`,
+            categoryId: 'custom',
+            categoryLabel: '外语水平',
+            itemIndex: sourceItemIndex,
+            fields,
+            searchText: Object.entries(fields).map(([key, value]) => `${key}: ${value}`).join('；'),
+          },
+        };
+      }),
+    });
   }
   const sourceBySection = new Map(groups.filter((group) => group.sectionId).map((group) => [group.sectionId!, group]));
   const mergedGroups: RepeatableSourceGroup[] = [
@@ -149,6 +271,7 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
       label: '学习和工作经历',
       sectionId: 'education_career',
       items: [...(sourceBySection.get('education_career')?.items ?? [])],
+      origins: [...(sourceBySection.get('education_career')?.origins ?? [])],
     },
     {
       label: '项目经历',
@@ -157,16 +280,26 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
         ...(sourceBySection.get('internship_practice')?.items ?? []),
         ...(sourceBySection.get('social_work')?.items ?? []),
       ],
+      origins: [
+        ...(sourceBySection.get('research_training')?.origins ?? []),
+        ...(sourceBySection.get('internship_practice')?.origins ?? []),
+        ...(sourceBySection.get('social_work')?.origins ?? []),
+      ],
     },
     {
       label: '论文情况',
       items: [...(sourceBySection.get('published_papers')?.items ?? [])],
+      origins: [...(sourceBySection.get('published_papers')?.origins ?? [])],
     },
     {
       label: '获奖情况',
       items: [
         ...(sourceBySection.get('subject_competitions')?.items ?? []),
         ...(sourceBySection.get('honors_awards')?.items ?? []),
+      ],
+      origins: [
+        ...(sourceBySection.get('subject_competitions')?.origins ?? []),
+        ...(sourceBySection.get('honors_awards')?.origins ?? []),
       ],
     },
     {
@@ -177,11 +310,20 @@ function sourceGroups(blocks: BlockCategory[], textFields: TextField[]): Repeata
         ...(sourceBySection.get('granted_patents')?.items ?? []),
         ...(sourceBySection.get('subject_competitions')?.items ?? []),
       ],
+      origins: [
+        ...(sourceBySection.get('research_training')?.origins ?? []),
+        ...(sourceBySection.get('published_papers')?.origins ?? []),
+        ...(sourceBySection.get('granted_patents')?.origins ?? []),
+        ...(sourceBySection.get('subject_competitions')?.origins ?? []),
+      ],
     },
     {
       label: '奖励情况',
       items: [
         ...(sourceBySection.get('honors_awards')?.items ?? []),
+      ],
+      origins: [
+        ...(sourceBySection.get('honors_awards')?.origins ?? []),
       ],
     },
   ];
@@ -299,25 +441,124 @@ export function buildRepeatRowTargets(plan: RepeatableRecordPlan): RepeatRowTarg
     }));
 }
 
+export function buildRepeatDialogTargetSchemas(
+  fields: FormFieldInfo[],
+  observations: RepeatableGroupObservation[],
+): TargetFieldSchema[] {
+  return observations
+    .filter((observation) => observation.dialogVisible || observation.presentation === 'dialog')
+    .flatMap((observation) => {
+      const groupFields = fields.filter((field) => sameText(
+        field.repeatGroup || field.groupLabel,
+        observation.groupLabel,
+      ));
+      const usedIndexes = new Set<number>();
+      const orderedFields = observation.fieldLabels.flatMap((label) => {
+        const matchIndex = groupFields.findIndex((field, index) => (
+          !usedIndexes.has(index)
+          && sameText(field.columnLabel || field.label, label)
+        ));
+        if (matchIndex < 0) return [];
+        usedIndexes.add(matchIndex);
+        return [groupFields[matchIndex]];
+      });
+      groupFields.forEach((field, index) => {
+        if (!usedIndexes.has(index)) orderedFields.push(field);
+      });
+      const schemaFields = orderedFields.length > 0
+        ? orderedFields.map((field) => {
+            const label = (field.columnLabel || field.label || field.ariaLabel || field.placeholder).trim();
+            const formatHints = [...new Set([field.dateFormat ?? ''].map((value) => value.trim()).filter(Boolean))];
+            const annotations = [...new Set([
+              field.hint ?? '',
+              field.dateFormat ?? '',
+              field.context ?? '',
+            ].map((value) => value.replace(/\s+/g, ' ').trim()).filter(Boolean))];
+            const options = [...new Set((field.options ?? []).map((value) => value.trim()).filter(Boolean))];
+            const forbiddenCharacters = [...new Set((field.forbiddenCharacters ?? []).filter(Boolean))];
+            const currentValue = field.value?.trim() ?? '';
+            const semanticQuestionParts = [
+              field.title ?? '',
+              field.ariaLabel ?? '',
+              field.context ?? '',
+            ].map((value) => value.replace(/\s+/g, ' ').trim())
+              .filter((value) => Boolean(value && value !== label));
+            const questionText = semanticQuestionParts.length > 0
+              ? [observation.groupLabel, label, ...semanticQuestionParts].join(' ')
+              : '';
+            return {
+              key: label,
+              label,
+              required: Boolean(field.required),
+              multiline: field.tag.toLowerCase() === 'textarea' || field.fillMode === 'long',
+              ...(currentValue ? { currentValue } : {}),
+              ...(field.protected ? { protected: true } : {}),
+              ...(options.length > 0 ? { options } : {}),
+              ...(field.placeholder.trim() ? { placeholder: field.placeholder.trim() } : {}),
+              ...(formatHints.length > 0 ? { formatHints } : {}),
+              ...(forbiddenCharacters.length > 0 ? { forbiddenCharacters } : {}),
+              ...(field.maxLength != null ? { maxLength: field.maxLength } : {}),
+              ...(questionText && questionText !== label ? { questionText } : {}),
+              ...(annotations.length > 0 ? { annotations } : {}),
+            };
+          }).filter((field) => field.key)
+        : observation.fieldLabels
+            .map((label) => label.trim())
+            .filter(Boolean)
+            .map((label) => ({ key: label, label }));
+      return schemaFields.length > 0
+        ? [{ groupLabel: observation.groupLabel, fields: schemaFields }]
+        : [];
+    });
+}
+
 export function buildRepeatDialogTargets(
   plan: RepeatableRecordPlan,
   blocks: BlockCategory[],
+  targetSchemas: TargetFieldSchema[] = [],
 ): RepeatDialogTarget[] {
   const sources = sourceGroups(blocks, []);
   return Object.values(plan.groups)
     .filter((group) => group.missingItemIndexes.length > 0)
     .flatMap((group) => {
-      const source = sources.find((candidate) => sameText(candidate.label, group.groupLabel));
+      const source = sources.find((candidate) => sameText(candidate.label, group.groupLabel))
+        ?? sources.find((candidate) => sameRepeatableGroupLabel(candidate.label, group.groupLabel));
       if (!source) return [];
+      const targetSchema = targetSchemas.find((candidate) => sameText(candidate.groupLabel, group.groupLabel))
+        ?? targetSchemas.find((candidate) => sameRepeatableGroupLabel(candidate.groupLabel, group.groupLabel));
+      const projectedCandidates = targetSchema
+        ? projectProfileToTargetSchema(targetSchema, blocks, [])
+        : [];
       const records = group.missingItemIndexes
-        .map((itemIndex) => ({ itemIndex, item: source.items[itemIndex] }))
-        .filter((candidate): candidate is { itemIndex: number; item: BlockItem } => Boolean(candidate.item))
-        .map(({ itemIndex, item }) => ({
-          itemIndex,
-          fields: item.fields
-            .filter((field) => field.key.trim() && field.value.trim())
-            .map((field) => ({ key: field.key, value: field.value })),
-        }))
+        .map((itemIndex) => ({ itemIndex, item: source.items[itemIndex], origin: source.origins[itemIndex] }))
+        .filter((candidate): candidate is {
+          itemIndex: number;
+          item: BlockItem;
+          origin: RepeatableSourceGroup['origins'][number];
+        } => Boolean(candidate.item && candidate.origin))
+        .map(({ itemIndex, item, origin }) => {
+          const recordProjection = projectedCandidates.filter((candidate) => (
+            candidate.sourceSectionId === origin.sourceSectionId
+            && candidate.sourceItemIndex === origin.sourceItemIndex
+          ));
+          const projectedFields = targetSchema
+            ? targetSchema.fields.flatMap((targetField) => {
+                const projected = recordProjection.find((candidate) => candidate.targetFieldKey === targetField.key);
+                return projected?.value.trim()
+                  ? [{ key: targetField.key, value: projected.value.trim() }]
+                  : [];
+              })
+            : [];
+          return {
+            itemIndex,
+            sourceRecord: origin.sourceRecord,
+            fields: projectedFields.length > 0
+              ? projectedFields
+              : item.fields
+                  .filter((field) => field.key.trim() && field.value.trim())
+                  .map((field) => ({ key: field.key, value: field.value })),
+          };
+        })
         .filter((record) => record.fields.length > 0);
       return records.length > 0 ? [{ groupLabel: group.groupLabel, records }] : [];
     });
@@ -328,10 +569,12 @@ export async function prepareRepeatableRowScan<T extends { index: number; field:
   prepareRows: (targets: RepeatRowTarget[]) => Promise<PrepareRepeatRowsResult>,
   blocks: BlockCategory[],
   textFields: TextField[],
+  excludedGroupLabels: ReadonlySet<string> = new Set(),
 ): Promise<RepeatableRowScanResult<T>> {
   const initialScan = await scan();
   const initialFields = initialScan.map((result) => ({ ...result.field, index: result.index }));
-  const targets = buildRepeatRowTargets(planRepeatableRecords(initialFields, blocks, textFields));
+  const targets = buildRepeatRowTargets(planRepeatableRecords(initialFields, blocks, textFields))
+    .filter((target) => ![...excludedGroupLabels].some((label) => sameText(label, target.groupLabel)));
   if (targets.length === 0) {
     return {
       scanResults: initialScan,

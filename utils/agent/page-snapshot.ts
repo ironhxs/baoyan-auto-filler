@@ -7,6 +7,7 @@ import type {
   CompleteAgentTargetField,
 } from './types';
 import { inferAgentApplicationIdentity } from './page-identity';
+import type { RepeatableGroupObservation } from '../repeatable-records';
 
 export interface BuildAgentPageSnapshotInput {
   pageKey: string;
@@ -17,6 +18,7 @@ export interface BuildAgentPageSnapshotInput {
   visibleTexts?: string[];
   profileInstitution?: string;
   fields: FormFieldInfo[];
+  repeatGroups?: RepeatableGroupObservation[];
   capturedAt?: number;
 }
 
@@ -317,6 +319,37 @@ export function buildAgentPageSnapshot(input: BuildAgentPageSnapshotInput): Comp
   const groups: CompleteAgentFieldGroup[] = [...groupedFields.entries()]
     .map(([label, fields]) => buildRepeatableGroup(input.pageKey, label, fields, instructions));
 
+  const observedLabels = new Set(groups.map((group) => normalizeText(group.label)));
+  for (const observation of input.repeatGroups ?? []) {
+    const label = normalizeText(observation.groupLabel);
+    if (!label || observedLabels.has(label)) continue;
+    const columns = unique([
+      ...observation.tableHeaders,
+      ...observation.fieldLabels,
+    ]).map((columnLabel) => ({
+      columnId: `column_${shortHash(`${label}\u241f${columnLabel}`)}`,
+      label: columnLabel,
+    }));
+    groups.push({
+      groupId: `group_${shortHash(`${input.pageKey}\u241f${label}`)}`,
+      label,
+      kind: 'repeatable',
+      columns,
+      fields: [],
+      rows: [],
+      observation: {
+        presentation: observation.presentation,
+        tableHeaders: unique(observation.tableHeaders),
+        fieldLabels: unique(observation.fieldLabels),
+        currentRowCount: observation.currentRowCount,
+        hasAddControl: observation.hasAddControl,
+        addControlLabel: normalizeText(observation.addControlLabel),
+        dialogVisible: observation.dialogVisible,
+      },
+    });
+    observedLabels.add(label);
+  }
+
   if (singleFields.length > 0) {
     const label = normalizeText(input.title) || '普通字段';
     const fields = singleFields.map((field) => toTargetField(input.pageKey, field, instructions));
@@ -361,6 +394,7 @@ export function buildAgentPageSnapshot(input: BuildAgentPageSnapshotInput): Comp
   ]);
   const identity = inferAgentApplicationIdentity({
     title: safeTitle,
+    url: input.url,
     visibleTexts: safeSemanticTexts(input.visibleTexts ?? []),
     profileInstitution: input.profileInstitution,
   });

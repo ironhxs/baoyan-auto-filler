@@ -33,6 +33,30 @@ export interface RepeatDialogSaveControlClassification {
   reason: 'record-save' | 'protected-action' | 'unknown-action';
 }
 
+export interface RepeatDialogCommitFieldState {
+  required: boolean;
+  protected: boolean;
+  kind: 'text' | 'file';
+  value: string;
+}
+
+export interface RepeatDialogCommitValidation {
+  safe: boolean;
+  reason: 'ready' | 'protected-required' | 'required-file' | 'required-empty';
+}
+
+export function validateRepeatDialogCommit(
+  fields: RepeatDialogCommitFieldState[],
+): RepeatDialogCommitValidation {
+  for (const field of fields) {
+    if (!field.required) continue;
+    if (field.protected) return { safe: false, reason: 'protected-required' };
+    if (field.kind === 'file') return { safe: false, reason: 'required-file' };
+    if (!field.value.trim()) return { safe: false, reason: 'required-empty' };
+  }
+  return { safe: true, reason: 'ready' };
+}
+
 export interface RepeatDialogSaveCandidate<T = string> {
   id: T;
   label: string;
@@ -42,6 +66,11 @@ export interface RepeatDialogSaveCandidate<T = string> {
 export interface RepeatDialogSaveCandidateSelection<T = string> {
   id: T | undefined;
   reason: 'record-save' | 'ambiguous-record-save' | 'no-record-save';
+}
+
+export interface RepeatDialogCancelCandidateSelection<T = string> {
+  id: T | undefined;
+  reason: 'record-cancel' | 'ambiguous-record-cancel' | 'no-record-cancel';
 }
 
 export interface RepeatDialogRootCandidate<T = string> {
@@ -59,6 +88,23 @@ export interface RepeatDialogRootSelection<T = string> {
 export interface RepeatRecordSnapshot {
   recordCount: number;
   text: string;
+}
+
+export interface RepeatDialogFieldLabelSource {
+  columnLabel?: string;
+  label?: string;
+  hint?: string;
+  context?: string;
+}
+
+export function pickRepeatDialogFieldLabel(source: RepeatDialogFieldLabelSource): string {
+  const primary = [source.columnLabel, source.label]
+    .map((value) => value?.trim() ?? '')
+    .find(Boolean);
+  if (primary) return primary;
+  return [source.hint, source.context]
+    .map((value) => value?.trim() ?? '')
+    .find((value) => Boolean(value && value !== '*' && !/^\d+\/\d+$/.test(value))) ?? '';
 }
 
 export function normalizeRepeatDialogText(value: string | undefined): string {
@@ -84,7 +130,7 @@ export function semanticKeyForRepeatDialogLabel(value: string | undefined): Repe
   if (/结束日期|终止日期/.test(label)) return 'endDate';
   if (/日期|时间|年月/.test(value ?? '') || /日期/.test(label)) return 'date';
   if (/单位|学校|院校|机构|刊物|期刊|主办方|工作地点|在何.*工作/.test(label)) return 'organization';
-  if (/职务|职称|担任|身份/.test(label)) return 'role';
+  if (/职务|职称|担任|身份|角色/.test(label)) return 'role';
   if (/类型|类别|种类|性质|形式/.test(label)) return 'type';
   if (/备注|描述|简介|说明|内容|主要事迹|工作内容/.test(label)) return 'description';
   if (/姓名|名称|题目|标题|论文题名|专利名|项目名|奖项名|成果名/.test(label)) return 'name';
@@ -170,14 +216,30 @@ export function planRepeatDialogAssignments(
       if (field.required) failures.push({ code: 'protected-required-field', index: field.index });
       continue;
     }
+
+    const exactCandidates = storedFields
+      .map((source, index) => ({ source, index }))
+      .filter(({ source, index }) => !claimedSourceIndexes.has(index) && normalizedSourceKey(source.key) === normalizedSourceKey(field.label));
+    if (exactCandidates.length === 1) {
+      const candidate = exactCandidates[0];
+      claimedSourceIndexes.add(candidate.index);
+      assignments.push({
+        index: field.index,
+        value: candidate.source.value,
+        semanticKey: field.semanticKey,
+        sourceKey: candidate.source.key,
+      });
+      continue;
+    }
+    if (exactCandidates.length > 1) {
+      if (field.required) failures.push({ code: 'ambiguous-required-field', index: field.index });
+      continue;
+    }
     if (field.ambiguous && !singleAggregateCandidate) {
       if (field.required) failures.push({ code: 'ambiguous-required-field', index: field.index });
       continue;
     }
 
-    const exactCandidates = storedFields
-      .map((source, index) => ({ source, index }))
-      .filter(({ source, index }) => !claimedSourceIndexes.has(index) && normalizedSourceKey(source.key) === normalizedSourceKey(field.label));
     const semanticCandidates = storedFields
       .map((source, index) => ({ source, index, semanticKey: semanticKeyForRepeatDialogLabel(source.key) }))
       .filter(({ source, index, semanticKey }) => (
@@ -186,7 +248,7 @@ export function planRepeatDialogAssignments(
         semanticKey !== 'other' &&
         semanticKey === field.semanticKey
       ));
-    const candidates = exactCandidates.length > 0 ? exactCandidates : semanticCandidates;
+    const candidates = semanticCandidates;
     if (candidates.length === 1) {
       const candidate = candidates[0];
       claimedSourceIndexes.add(candidate.index);
@@ -232,7 +294,7 @@ export function planRepeatDialogAssignments(
       }
     }
   }
-  return { assignments, failures };
+  return { assignments: failures.length > 0 ? [] : assignments, failures };
 }
 
 const PROTECTED_ACTION_PATTERN = /(?:提交报名|确认报名|最终提交|提交申请|确认申请|下一步|上一步|志愿|导师|调剂|承诺|协议|验证码|短信码|图形码|支付|缴费|付款|删除|取消报名|submitapplication|finalsubmit|submitrequest|confirmapplication|confirmrequest|nextstep|previousstep|preference|advisor|supervisor|transfer|agreement|commitment|captcha|verificationcode|smscode|payment|paynow|delete|cancelapplication)/;
@@ -271,6 +333,18 @@ export function selectRepeatDialogSaveCandidate<T>(
   const best = safeCandidates.filter((candidate) => recordSavePriority(candidate.label) === bestPriority);
   if (best.length !== 1) return { id: undefined, reason: 'ambiguous-record-save' };
   return { id: best[0].id, reason: 'record-save' };
+}
+
+export function selectRepeatDialogCancelCandidate<T>(
+  candidates: RepeatDialogSaveCandidate<T>[],
+): RepeatDialogCancelCandidateSelection<T> {
+  const safeCandidates = candidates.filter((candidate) => (
+    candidate.recordAssociated
+    && /^(?:取消|cancel)$/.test(normalizeRepeatDialogText(candidate.label))
+  ));
+  if (safeCandidates.length === 0) return { id: undefined, reason: 'no-record-cancel' };
+  if (safeCandidates.length !== 1) return { id: undefined, reason: 'ambiguous-record-cancel' };
+  return { id: safeCandidates[0].id, reason: 'record-cancel' };
 }
 
 export function selectRepeatDialogRoot<T>(

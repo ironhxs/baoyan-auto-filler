@@ -26,6 +26,12 @@ export interface AgentVerificationReport {
   reason?: string;
 }
 
+export interface AgentPreparationReport {
+  structureChanged: boolean;
+  results?: AgentActionResult[];
+  reason?: string;
+}
+
 export interface AgentRuntimeDeps {
   observe(): Promise<AgentPageSnapshot>;
   retrieve(snapshot: AgentPageSnapshot): Promise<AgentSourceRecord[]>;
@@ -35,7 +41,7 @@ export interface AgentRuntimeDeps {
     snapshot: AgentPageSnapshot,
     records: AgentSourceRecord[],
   ): AgentValidatedRunPlan;
-  prepare?(plan: AgentValidatedRunPlan): Promise<void>;
+  prepare?(plan: AgentValidatedRunPlan): Promise<AgentPreparationReport | void>;
   execute(plan: AgentValidatedRunPlan): Promise<AgentExecutionReport>;
   verify(
     plan: AgentValidatedRunPlan,
@@ -149,6 +155,7 @@ export async function runAgentPage(
   existingCheckpoint?: AgentCheckpoint,
 ): Promise<AgentRunOutcome> {
   let checkpoint = initialCheckpoint(existingCheckpoint);
+  let structureReplans = 0;
   try {
     checkpoint = await persist(deps, checkpoint, 'observing');
     let snapshot = await deps.observe();
@@ -185,7 +192,39 @@ export async function runAgentPage(
 
       if (deps.prepare) {
         checkpoint = await persist(deps, checkpoint, 'preparing');
-        await deps.prepare(pending);
+        const preparation = await deps.prepare(pending);
+        if (preparation?.results?.length) {
+          checkpoint = updateAgentCheckpoint(checkpoint, {
+            results: mergeResults(checkpoint.results, preparation.results),
+            updatedAt: Date.now(),
+          });
+        }
+        if (preparation?.structureChanged) {
+          structureReplans += 1;
+          if (structureReplans > 2) {
+            const reason = preparation.reason || 'Agent repeatable-structure replan limit reached';
+            checkpoint = await persist(deps, checkpoint, 'paused', { error: reason });
+            return { status: 'paused', checkpoint, canAdvance: false, reason };
+          }
+          const latestSnapshot = await deps.observe();
+          if (latestSnapshot.pageKey !== snapshot.pageKey) {
+            checkpoint = resetForPage(checkpoint, latestSnapshot.pageKey);
+          }
+          snapshot = latestSnapshot;
+          records = await deps.retrieve(snapshot);
+          checkpoint = await persist(deps, checkpoint, 'planning');
+          plan = await deps.plan(snapshot, records);
+          checkpoint = updateAgentCheckpoint(checkpoint, {
+            plan,
+            nextActionIndex: 0,
+            updatedAt: Date.now(),
+          });
+          checkpoint = await persist(deps, checkpoint, 'validating', { plan });
+          validated = deps.validate(plan, snapshot, records);
+          plan = validated.plan;
+          checkpoint = updateAgentCheckpoint(checkpoint, { plan, updatedAt: Date.now() });
+          continue;
+        }
       }
       checkpoint = await persist(deps, checkpoint, 'executing');
       const execution = await deps.execute(pending);

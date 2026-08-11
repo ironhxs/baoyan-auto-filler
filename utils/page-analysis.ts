@@ -8,7 +8,8 @@ import type {
   ApplicationTaskPauseReason,
 } from './application-tasks';
 import { semanticPageKey } from './page-identity';
-import type { AgentCheckpoint } from './agent/types';
+import type { AgentCheckpoint, AgentPageSnapshot } from './agent/types';
+import type { AgentBatchBlueprint, AgentBatchPlan } from './agent/batch-types';
 
 export type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 
@@ -26,6 +27,9 @@ export interface PageAnalysisAiState {
   cached: boolean;
   reviewed: number;
   error: string;
+  agent?: boolean;
+  pendingActions?: number;
+  reviewItems?: number;
 }
 
 export interface ApplicationPageAnalysis {
@@ -39,6 +43,7 @@ export interface ApplicationPageAnalysis {
   checkedIndexes: number[];
   repeatPlan: RepeatableRecordPlan;
   ai: PageAnalysisAiState;
+  agentSnapshot?: AgentPageSnapshot;
   capturedAt: number;
 }
 
@@ -122,6 +127,9 @@ export interface ApplicationRunnerCheckpoint {
   confirmedMaterialPageKey?: string;
   resumeAfter?: number;
   agent?: AgentCheckpoint;
+  batchPhase?: 'collecting' | 'planning' | 'executing' | 'review';
+  batchBlueprint?: AgentBatchBlueprint;
+  batchPlan?: AgentBatchPlan;
   updatedAt: number;
 }
 
