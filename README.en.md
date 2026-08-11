@@ -5,7 +5,7 @@
   <p>A local-first graduate application form assistant for Chrome, Edge, and Firefox.</p>
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-2.0.1-2563eb" />
+    <img alt="Version" src="https://img.shields.io/badge/version-2.1.1-2563eb" />
     <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.9-3178c6" />
     <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-16a34a" />
   </p>
@@ -23,6 +23,17 @@
 Graduate recommendation and early-admission systems repeatedly ask for the same profile, family, education, language, project, publication, patent, competition, and award data. Baotian keeps those records in the browser and helps inspect, plan, fill, and verify each application page.
 
 Version 2.0 introduces a page-level form Agent. Instead of matching keywords in isolation, it receives the actual page groups, rows, columns, format rules, and only the relevant saved records. This allows one profile to be transformed into different school-specific structures while remaining grounded in stored facts.
+
+## 2.1.1: understand the whole application before filling it
+
+With Agent automation enabled, Baotian first collects every page that can be reached safely without entering data. The complete question text, annotations, date examples, forbidden characters, table headers, and control structure are combined into one cross-page blueprint. After the global plan is ready, Baotian returns through safe Previous controls and executes the plan from the first page. If required-field validation prevents read-only discovery, it falls back safely to incremental planning without submitting or bypassing validation.
+
+- Task names prefer `school · department`; when no trustworthy department exists, they use stable `project 1/2/3` numbering and can be renamed by the user.
+- Applicant source school, department, and major are excluded from target-application identity inference.
+- Explicit project identifiers isolate separate applications on the same website, even after reusing one browser tab.
+- Dynamic Add-record dialogs are completed one source record at a time against the live schema, with evidence validation, bounded repair, and readback.
+- Preview and execution now receive the same complete page context. The old conservative/standard/aggressive selector has been removed.
+- Field markers use non-layout outlines, while nested long-table question cells receive a reversible top-alignment fix.
 
 <div align="center">
   <img src="assets/1-popup.png" width="30%" alt="Current-site status" />
@@ -137,8 +148,8 @@ Download from [GitHub Releases](https://github.com/ironhxs/baoyan-auto-filler/re
 
 | File | Browser |
 |---|---|
-| `baotian-2.0.1-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
-| `baotian-2.0.1-firefox.zip` | Firefox temporary loading or later signed distribution |
+| `baotian-2.1.1-chrome.zip` | Chrome, Edge, Brave, and other Chromium browsers |
+| `baotian-2.1.1-firefox.zip` | Firefox temporary loading or later signed distribution |
 
 For Chrome / Edge, extract the archive, open `chrome://extensions/` or `edge://extensions/`, enable Developer mode, and choose **Load unpacked**.
 

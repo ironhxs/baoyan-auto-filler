@@ -125,6 +125,35 @@ assert.deepEqual(sysuSnapshot.identity, {
   projectName: '预推免',
 });
 
+const applicantSourceIdentitySnapshot = buildAgentPageSnapshot({
+  pageKey: 'source-identity-must-not-be-target',
+  url: 'https://example.test/application/basic',
+  title: '基本信息',
+  visibleTexts: ['合肥工业大学', '计算机与信息学院', '计算机科学与技术'],
+  profileInstitution: '合肥工业大学',
+  profileDepartment: '计算机与信息学院',
+  profileMajor: '计算机科学与技术',
+  instructions: [],
+  fields: [{
+    index: 20,
+    kind: 'text',
+    tag: 'input',
+    type: 'text',
+    name: 'sourceDepartment',
+    id: 'sourceDepartment',
+    label: '本科院系',
+    placeholder: '',
+    ariaLabel: '本科院系',
+    value: '计算机与信息学院',
+    context: '本科就读信息',
+  }],
+});
+assert.deepEqual(applicantSourceIdentitySnapshot.identity, {
+  institutionName: '',
+  departmentName: '',
+  projectName: '',
+});
+
 const emptyFamilySnapshot = buildAgentPageSnapshot({
   pageKey: 'sysu-family-empty',
   url: 'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance',

@@ -10,6 +10,7 @@ import type {
 import { semanticPageKey } from './page-identity';
 import type { AgentCheckpoint, AgentPageSnapshot } from './agent/types';
 import type { AgentBatchBlueprint, AgentBatchPlan } from './agent/batch-types';
+import type { AgentPageDiscoveryCheckpoint } from './agent/page-discovery';
 
 export type PageMarkerStatus = 'verified' | 'review' | 'mismatch';
 
@@ -130,6 +131,7 @@ export interface ApplicationRunnerCheckpoint {
   batchPhase?: 'collecting' | 'planning' | 'executing' | 'review';
   batchBlueprint?: AgentBatchBlueprint;
   batchPlan?: AgentBatchPlan;
+  pageDiscovery?: AgentPageDiscoveryCheckpoint;
   updatedAt: number;
 }
 

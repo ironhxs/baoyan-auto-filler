@@ -5,6 +5,8 @@ export interface InferAgentApplicationIdentityInput {
   url?: string;
   visibleTexts?: string[];
   profileInstitution?: string;
+  profileDepartment?: string;
+  profileMajor?: string;
 }
 
 export interface AgentIdentityFieldLike {
@@ -18,8 +20,11 @@ export interface InferAgentApplicationIdentityFromPageInput {
   title?: string;
   url?: string;
   pageLabel?: string;
+  visibleTexts?: string[];
   fields: AgentIdentityFieldLike[];
   profileInstitution?: string;
+  profileDepartment?: string;
+  profileMajor?: string;
 }
 
 function normalizeText(value: string | undefined): string {
@@ -70,23 +75,58 @@ function normalizeDepartmentName(value: string): string {
   return normalizeText(value).replace(/^\d{2,12}\s*/u, '');
 }
 
+function isTargetIdentityField(field: AgentIdentityFieldLike): boolean {
+  const label = normalizeText(`${field.groupLabel ?? ''} ${field.label ?? ''} ${field.context ?? ''}`);
+  if (/本科|毕业|原学校|原院系|所在院系/u.test(label)) return false;
+  return /申请院系|报考院系|招生院系|目标院系|申请院系所|报考院系所|招生单位|报考单位|申请项目|报名项目/u.test(label);
+}
+
+export function collectAgentApplicationPageEvidence(
+  input: InferAgentApplicationIdentityFromPageInput,
+): string[] {
+  const sourceValues = new Set([
+    input.profileInstitution,
+    input.profileDepartment,
+    input.profileMajor,
+  ].map(normalizeText).filter(Boolean));
+  return unique([
+    input.title ?? '',
+    input.pageLabel ?? '',
+    ...(input.visibleTexts ?? []),
+    ...input.fields.flatMap((field) => (
+      isTargetIdentityField(field) && field.value && field.value.length <= 80 ? [field.value] : []
+    )),
+  ]).filter((value) => (
+    !sourceValues.has(value)
+    && ![...sourceValues].some((sourceValue) => value.includes(sourceValue))
+    && !/(?:本科|毕业|原学校|原院系|所在院系)/u.test(value)
+  ));
+}
+
 export function inferAgentApplicationIdentity(
   input: InferAgentApplicationIdentityInput,
 ): AgentApplicationIdentity {
   const title = normalizeText(input.title);
   const visibleTexts = unique(input.visibleTexts ?? []);
   const profileInstitution = normalizeText(input.profileInstitution);
+  const sourceIdentityValues = new Set([
+    profileInstitution,
+    normalizeText(input.profileDepartment),
+    normalizeText(input.profileMajor),
+  ].filter(Boolean));
   const titleInstitution = extractInstitution(title);
   const urlInstitution = institutionFromUrl(input.url);
 
-  const exactInstitutions = visibleTexts.filter((text) => /(?:大学|学院)$/u.test(text));
+  const exactInstitutions = visibleTexts.filter((text) => (
+    /(?:大学|学院)$/u.test(text) && !sourceIdentityValues.has(text)
+  ));
   const institutionCandidates = unique([
     urlInstitution,
     titleInstitution,
     ...exactInstitutions,
     ...visibleTexts.map(extractInstitution),
   ]).filter((candidate) => (
-    candidate !== profileInstitution
+    !sourceIdentityValues.has(candidate)
     || candidate === titleInstitution
   ));
   const institutionName = institutionCandidates.find((candidate) => candidate.endsWith('大学'))
@@ -97,7 +137,7 @@ export function inferAgentApplicationIdentity(
     .map(normalizeDepartmentName)
     .find((text) => (
       text !== institutionName
-      && text !== profileInstitution
+      && !sourceIdentityValues.has(text)
       && isDepartmentName(text)
       && !isExplicitProjectName(text)
     )) ?? '';
@@ -114,20 +154,15 @@ export function inferAgentApplicationIdentity(
 export function inferAgentApplicationIdentityFromPage(
   input: InferAgentApplicationIdentityFromPageInput,
 ): AgentApplicationIdentity {
-  const visibleTexts = unique([
-    input.pageLabel ?? '',
-    ...input.fields.flatMap((field) => [
-      field.groupLabel ?? '',
-      field.label ?? '',
-      field.context ?? '',
-      field.value && field.value.length <= 80 ? field.value : '',
-    ]),
-  ]);
+  const title = normalizeText(input.title);
+  const visibleTexts = collectAgentApplicationPageEvidence(input).filter((value) => value !== title);
   return inferAgentApplicationIdentity({
     title: input.title,
     url: input.url,
     visibleTexts,
     profileInstitution: input.profileInstitution,
+    profileDepartment: input.profileDepartment,
+    profileMajor: input.profileMajor,
   });
 }
 

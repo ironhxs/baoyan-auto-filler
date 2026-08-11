@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 
-import { waitForPageTransition } from '../utils/navigation-wait';
+import { isSafePreviousStepLabel, waitForPageTransition } from '../utils/navigation-wait';
+
+assert.equal(isSafePreviousStepLabel('上一步'), true);
+assert.equal(isSafePreviousStepLabel('前一步'), true);
+assert.equal(isSafePreviousStepLabel('返回上一步'), true);
+assert.equal(isSafePreviousStepLabel('返回首页'), false);
+assert.equal(isSafePreviousStepLabel('提交'), false);
 
 const original = {
   url: 'https://example.test/application/basic',

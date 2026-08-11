@@ -52,7 +52,15 @@ const snapshot: AgentPageSnapshot = {
   url: 'https://example.test/basic',
   title: '基本信息',
   stepText: '第1步',
-  instructions: [],
+  instructions: ['REMOTE_HINT_AGENT_FULL_CONTEXT'],
+  visiblePageText: ['REMOTE_VISIBLE_TEXT_AGENT_FULL_CONTEXT'],
+  questionContext: {
+    fullText: 'REMOTE_QUESTION_AGENT_FULL_CONTEXT，日期格式 2026-07，内容不得含有 #',
+    annotations: ['REMOTE_ANNOTATION_AGENT_FULL_CONTEXT'],
+    dateExamples: ['2026-07'],
+    forbiddenCharacters: ['#'],
+    maxLength: 240,
+  },
   capturedAt: 1,
   groups: [{
     groupId: 'basic',
@@ -81,6 +89,12 @@ const naturalCompositionPrompt = buildAgentPlannerPrompt({
   snapshotFingerprint: agentFingerprint(snapshot),
   profileFingerprint: agentFingerprint(records),
 });
+assert.match(naturalCompositionPrompt, /REMOTE_VISIBLE_TEXT_AGENT_FULL_CONTEXT/);
+assert.match(naturalCompositionPrompt, /REMOTE_QUESTION_AGENT_FULL_CONTEXT/);
+assert.match(naturalCompositionPrompt, /REMOTE_ANNOTATION_AGENT_FULL_CONTEXT/);
+assert.match(naturalCompositionPrompt, /2026-07/);
+assert.match(naturalCompositionPrompt, /"forbiddenCharacters":\["#"\]/);
+assert.match(naturalCompositionPrompt, /"maxLength":240/);
 assert.match(naturalCompositionPrompt, /先理解整道题和同一行各列的分工/);
 assert.match(naturalCompositionPrompt, /不要套用固定的括号拼接模板/);
 assert.match(naturalCompositionPrompt, /避免重复已经写入同一行其他列的信息/);

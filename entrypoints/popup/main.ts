@@ -399,7 +399,14 @@ function renderCurrentTaskSummary(): string {
   const currentHtml = current ? `
     <section class="current-task-summary">
       <div class="current-task-head">
-        <div><span>当前网站</span><strong>${escapeHtml(current.name)}</strong></div>
+        <div>
+          <span>当前网站</span>
+          <div class="task-name-line">
+            <strong>${escapeHtml(current.name)}</strong>
+            <button type="button" id="renameCurrentTaskBtn" class="task-name-action" title="自定义名称">改名</button>
+            ${task?.customDisplayName ? '<button type="button" id="restoreAutomaticTaskNameBtn" class="task-name-action muted">恢复自动名称</button>' : ''}
+          </div>
+        </div>
         <em class="task-state-${current.status}">${statusLabel}</em>
       </div>
       <div class="current-page-name">${escapeHtml(latestPage?.label || task?.history.at(-1)?.label || '当前页面')}</div>
@@ -474,6 +481,8 @@ function renderIdle(apiReady = true) {
   document.getElementById('reviewMaterialsBtn')?.addEventListener('click', startScan);
   document.getElementById('stopAutoRunBtn')?.addEventListener('click', stopAutoRun);
   document.getElementById('stopTaskAgentBtn')?.addEventListener('click', stopAutoRun);
+  document.getElementById('renameCurrentTaskBtn')?.addEventListener('click', renameCurrentApplicationTask);
+  document.getElementById('restoreAutomaticTaskNameBtn')?.addEventListener('click', restoreAutomaticTaskName);
   document.getElementById('retryAgentBtn')?.addEventListener('click', () => controlPageAgent('retry_failed'));
   document.getElementById('replanAgentBtn')?.addEventListener('click', () => controlPageAgent('replan_page'));
   document.getElementById('locateAgentIssueBtn')?.addEventListener('click', async () => {
@@ -492,6 +501,38 @@ function renderIdle(apiReady = true) {
     const response = await sendRuntimeMessage<{ ok: boolean } | ErrorResponse>({ type: 'openAuditCenter' });
     if (response.ok) window.close();
   });
+}
+
+async function renameCurrentApplicationTask(): Promise<void> {
+  const task = applicationTasks.find((item) => item.id === currentTaskId);
+  if (!task) return;
+  const name = prompt('自定义当前报名任务名称（最多 60 个字符）', task.customDisplayName || task.displayName);
+  if (name == null) return;
+  const response = await sendRuntimeMessage<{ ok: true; task: ApplicationTask } | ErrorResponse>({
+    type: 'renameApplicationTask',
+    payload: { taskId: task.id, customDisplayName: name },
+  });
+  if (!response.ok) {
+    showError(response.error);
+    return;
+  }
+  await refreshApplicationTasks();
+  renderIdle(apiAvailable);
+}
+
+async function restoreAutomaticTaskName(): Promise<void> {
+  const task = applicationTasks.find((item) => item.id === currentTaskId);
+  if (!task) return;
+  const response = await sendRuntimeMessage<{ ok: true; task: ApplicationTask } | ErrorResponse>({
+    type: 'restoreAutomaticTaskName',
+    payload: { taskId: task.id },
+  });
+  if (!response.ok) {
+    showError(response.error);
+    return;
+  }
+  await refreshApplicationTasks();
+  renderIdle(apiAvailable);
 }
 
 async function controlPageAgent(command: 'retry_failed' | 'replan_page'): Promise<void> {

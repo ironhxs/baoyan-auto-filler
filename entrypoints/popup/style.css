@@ -709,6 +709,10 @@ body {
   justify-content: space-between;
   gap: 10px;
 }
+.task-name-line { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.task-name-line strong { min-width: 0; overflow-wrap: anywhere; }
+.task-name-action { border: 0; background: transparent; color: #2563eb; padding: 1px 3px; font-size: 11px; cursor: pointer; }
+.task-name-action.muted { color: #64748b; }
 
 .current-task-head > div { min-width: 0; }
 .current-task-head span, .current-task-head strong { display: block; }

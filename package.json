@@ -1,7 +1,7 @@
 {
   "name": "baotian",
   "description": "保填",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -50,7 +50,10 @@
     "test:agent:activation": "tsx scripts/test-agent-activation.ts",
     "test:agent:preview": "tsx scripts/test-agent-preview.ts",
     "test:agent:batch": "tsx scripts/test-agent-batch-planning.ts && tsx scripts/test-agent-batch-state.ts && tsx scripts/test-agent-batch-coordinator.ts && tsx scripts/test-agent-batch-view.ts",
+    "test:agent:identity": "tsx scripts/test-agent-page-identity.ts && tsx scripts/test-agent-application-identity.ts",
+    "test:agent:discovery": "tsx scripts/test-agent-page-discovery.ts",
     "test:agent:ui": "tsx scripts/test-agent-ui.ts",
+    "test:release": "tsx scripts/test-version-release.ts",
     "test:firefox:privacy": "tsx scripts/test-firefox-privacy-manifest.ts",
     "postinstall": "wxt prepare"
   },

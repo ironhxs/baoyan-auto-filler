@@ -31,7 +31,10 @@ import {
   createApplicationTaskId,
   getApplicationTask,
   getApplicationTasks,
+  renameApplicationTask,
+  restoreAutomaticApplicationTaskName,
   saveApplicationTask,
+  shouldReuseApplicationTaskForUrl,
   unbindTaskFromTab,
   updateApplicationTask,
   updateTaskRunnerCheckpoint,
@@ -73,18 +76,36 @@ import {
   type RepeatableGroupObservation,
 } from '@/utils/repeatable-records';
 import { buildAgentPageSnapshot } from '@/utils/agent/page-snapshot';
-import { inferAgentApplicationIdentityFromPage } from '@/utils/agent/page-identity';
+import {
+  collectAgentApplicationPageEvidence,
+  inferAgentApplicationIdentityFromPage,
+} from '@/utils/agent/page-identity';
+import {
+  buildAgentApplicationIdentityPrompt,
+  mergeAgentApplicationIdentity,
+  needsAgentApplicationIdentity,
+  parseAndValidateAgentApplicationIdentity,
+} from '@/utils/agent/application-identity';
 import { buildAgentPreview } from '@/utils/agent/preview';
 import { retrieveAgentSourceRecords } from '@/utils/agent/profile-retriever';
 import {
   completeRepeatDialogRecordWithAgent,
   requestAgentPagePlan,
 } from '@/utils/agent/planner';
+import { agentFingerprint } from '@/utils/agent/planner';
 import { sanitizeAgentSourceRecords } from '@/utils/agent/batch-prompt';
 import { requestAgentBatchPlan } from '@/utils/agent/batch-planner';
 import { findReusableAgentBatchPagePlan, mergeAgentBatchPages, refreshAgentBatchPage } from '@/utils/agent/batch-state';
 import { coordinateAgentBatchPlanning } from '@/utils/agent/batch-coordinator';
 import type { AgentBatchBlueprint, AgentBatchPageInput, AgentBatchPlan } from '@/utils/agent/batch-types';
+import {
+  beginOrRecordAgentPageDiscovery,
+  decideAgentPageDiscoveryNavigation,
+  markAgentPageDiscoveryExecuting,
+  markAgentPageDiscoveryFallback,
+  markAgentPageDiscoveryReturning,
+  type AgentPageDiscoveryCheckpoint,
+} from '@/utils/agent/page-discovery';
 import {
   AGENT_PROTOCOL_VERSION,
   createAgentPlanCacheKey,
@@ -145,6 +166,8 @@ interface MessageMap {
   };
   listApplicationTasks: undefined;
   archiveApplicationTask: { taskId: string };
+  renameApplicationTask: { taskId: string; customDisplayName: string };
+  restoreAutomaticTaskName: { taskId: string };
   openAuditCenter: undefined;
   getAuditPreflight: { taskIds: string[] };
   runFinalAudit: { taskIds: string[]; force: boolean; confirmed: boolean };
@@ -260,6 +283,7 @@ interface AutoRunState {
   batchPhase?: 'collecting' | 'planning' | 'executing' | 'review';
   batchBlueprint?: AgentBatchBlueprint;
   batchPlan?: AgentBatchPlan;
+  pageDiscovery?: AgentPageDiscoveryCheckpoint;
 }
 
 interface AutoRunSuccessResponse extends AutoRunState {
@@ -549,7 +573,7 @@ async function ensureTaskForTab(tab: chrome.tabs.Tab, preferredTaskId?: string):
   const existingTaskId = preferredTaskId || boundTaskId;
   if (existingTaskId) {
     const existing = await getApplicationTask(existingTaskId);
-    if (existing && existing.status !== 'archived') {
+    if (existing && existing.status !== 'archived' && shouldReuseApplicationTaskForUrl(existing, tab.url ?? '')) {
       const now = Date.now();
       const refreshed = { ...existing, lastOpenedAt: now, updatedAt: Math.max(existing.updatedAt, now) };
       await Promise.all([saveApplicationTask(refreshed), setTaskBinding(tab.id, refreshed.id)]);
@@ -619,6 +643,7 @@ async function saveAutoRunState(state: AutoRunState): Promise<void> {
         batchPhase: state.batchPhase,
         batchBlueprint: state.batchBlueprint,
         batchPlan: state.batchPlan,
+        pageDiscovery: state.pageDiscovery,
         updatedAt: state.updatedAt,
       };
       return updateTaskRunnerCheckpoint(nextTask, checkpoint);
@@ -681,6 +706,10 @@ export async function resumeTaskForTab(tabId: number): Promise<void> {
         history: runner.history,
         confirmedMaterialPageKey: runner.confirmedMaterialPageKey,
         agent: runner.agent,
+        batchPhase: runner.batchPhase,
+        batchBlueprint: runner.batchBlueprint,
+        batchPlan: runner.batchPlan,
+        pageDiscovery: runner.pageDiscovery,
         lastPageKey: semanticPageKey(meta),
       };
   state.lastPageKey = semanticPageKey(meta);
@@ -725,17 +754,65 @@ async function savePageAnalysis(
   const profileInstitution = profileFields.find((field) => (
     /^(?:学校|所在学校|本科院校|毕业院校)$/u.test(field.key.trim())
   ))?.value ?? '';
-  const identity = inferAgentApplicationIdentityFromPage({
+  const profileDepartment = profileFields.find((field) => (
+    /^(?:院系|学院|本科院系|所在院系)$/u.test(field.key.trim())
+  ))?.value ?? '';
+  const profileMajor = profileFields.find((field) => (
+    /^(?:专业|本科专业|所学专业)$/u.test(field.key.trim())
+  ))?.value ?? '';
+  const identityInput = {
     title: applicationTitle || scan.pageLabel,
     url: scan.pageUrl,
     pageLabel: scan.pageLabel,
+    visibleTexts: scan.visibleTexts,
     fields: scan.fields,
     profileInstitution,
-  });
+    profileDepartment,
+    profileMajor,
+  };
+  let identity = inferAgentApplicationIdentityFromPage(identityInput);
+  if (needsAgentApplicationIdentity(identity)) {
+    const [configured, apiConfig] = await Promise.all([isApiConfigured(), getApiConfig()]);
+    if (configured && apiConfig.aiEnhanced) {
+      const context = {
+        title: identityInput.title,
+        url: scan.pageUrl,
+        pageEvidenceTexts: collectAgentApplicationPageEvidence(identityInput),
+        applicantIdentity: {
+          institutionName: profileInstitution,
+          departmentName: profileDepartment,
+          majorName: profileMajor,
+        },
+      };
+      const cacheKey = `agentApplicationIdentity:v1:${agentFingerprint({
+        context,
+        api: [apiConfig.baseUrl, apiConfig.model, apiConfig.providerId, apiConfig.apiMode],
+      })}`;
+      try {
+        const cached = (await chrome.storage.local.get(cacheKey))[cacheKey] as { identity?: typeof identity } | undefined;
+        let agentIdentity = cached?.identity;
+        if (!agentIdentity) {
+          const text = await requestAgentModelDurably(
+            apiConfig,
+            buildAgentApplicationIdentityPrompt(context),
+            { stream: false },
+          );
+          agentIdentity = parseAndValidateAgentApplicationIdentity(text, context);
+          await chrome.storage.local.set({ [cacheKey]: { identity: agentIdentity, cachedAt: Date.now() } });
+        }
+        identity = mergeAgentApplicationIdentity(identity, agentIdentity);
+      } catch {
+        // Identity failure must not block page analysis or stable project numbering.
+      }
+    }
+  }
   const capturedAt = Date.now();
   const agentSnapshot = buildSnapshotForAgent({
     ...scan,
     applicationTitle: applicationTitle || scan.applicationTitle,
+    profileInstitution,
+    profileDepartment,
+    profileMajor,
   });
   await updateApplicationTask(taskId, (task) => upsertTaskPageAnalysis(
     updateTaskApplicationIdentity(task, identity, capturedAt),
@@ -1453,6 +1530,12 @@ async function handleMessage(request: Request): Promise<Response> {
   if (request.type === 'archiveApplicationTask') {
     return handleArchiveApplicationTask(request.payload!.taskId);
   }
+  if (request.type === 'renameApplicationTask') {
+    return handleRenameApplicationTask(request.payload!.taskId, request.payload!.customDisplayName);
+  }
+  if (request.type === 'restoreAutomaticTaskName') {
+    return handleRestoreAutomaticTaskName(request.payload!.taskId);
+  }
   if (request.type === 'openAuditCenter') {
     return handleOpenAuditCenter();
   }
@@ -1535,6 +1618,25 @@ async function handleListApplicationTasks(): Promise<Response> {
 async function handleArchiveApplicationTask(taskId: string): Promise<Response> {
   const task = await archiveApplicationTask(taskId);
   return { ok: true, type: 'applicationTask', task };
+}
+
+async function handleRenameApplicationTask(taskId: string, customDisplayName: string): Promise<Response> {
+  try {
+    const task = await updateApplicationTask(taskId, (current) => (
+      renameApplicationTask(current, customDisplayName)
+    ));
+    if (!task) return errorResponse('申请任务不存在或已删除');
+    return { ok: true, type: 'applicationTask', task };
+  } catch (error) {
+    return errorResponse(error instanceof Error ? error.message : '任务名称保存失败');
+  }
+}
+
+async function handleRestoreAutomaticTaskName(taskId: string): Promise<Response> {
+  const task = await updateApplicationTask(taskId, (current) => restoreAutomaticApplicationTaskName(current));
+  return task
+    ? { ok: true, type: 'applicationTask', task }
+    : errorResponse('申请任务不存在或已删除');
 }
 
 async function handleOpenAuditCenter(): Promise<Response> {
@@ -1694,21 +1796,23 @@ async function handleStartAutoRun(): Promise<Response> {
   if (!tab?.id) return errorResponse('No active tab found');
   const previous = await getAutoRunState(tab.id);
   const task = await ensureTaskForTab(tab, previous?.taskId);
+  const resumeSameTask = previous?.status === 'paused' && previous.taskId === task.id;
   const state: AutoRunState = {
     tabId: tab.id,
     taskId: task.id,
     batchId: task.batchId,
     status: 'running',
-    pageCount: previous?.status === 'paused' ? previous.pageCount : 0,
-    filledCount: previous?.status === 'paused' ? previous.filledCount : 0,
+    pageCount: resumeSameTask ? previous.pageCount : 0,
+    filledCount: resumeSameTask ? previous.filledCount : 0,
     message: '后台正在填写当前页面',
     updatedAt: Date.now(),
-    history: previous?.status === 'paused' ? previous.history : [],
-    confirmedMaterialPageKey: previous?.confirmedMaterialPageKey,
-    agent: previous?.status === 'paused' ? previous.agent : undefined,
-    batchPhase: previous?.status === 'paused' ? previous.batchPhase : undefined,
-    batchBlueprint: previous?.status === 'paused' ? previous.batchBlueprint : undefined,
-    batchPlan: previous?.status === 'paused' ? previous.batchPlan : undefined,
+    history: resumeSameTask ? previous.history : [],
+    confirmedMaterialPageKey: resumeSameTask ? previous.confirmedMaterialPageKey : undefined,
+    agent: resumeSameTask ? previous.agent : undefined,
+    batchPhase: resumeSameTask ? previous.batchPhase : undefined,
+    batchBlueprint: resumeSameTask ? previous.batchBlueprint : undefined,
+    batchPlan: resumeSameTask ? previous.batchPlan : undefined,
+    pageDiscovery: resumeSameTask ? previous.pageDiscovery : undefined,
   };
   await saveAutoRunState(state);
   void processAutoRun(tab.id);
@@ -1734,6 +1838,7 @@ async function handleStopAutoRun(): Promise<Response> {
     batchPhase: previous?.batchPhase,
     batchBlueprint: previous?.batchBlueprint,
     batchPlan: previous?.batchPlan,
+    pageDiscovery: previous?.pageDiscovery,
   };
   await saveAutoRunState(state);
   return autoRunResponse(state);
@@ -2246,6 +2351,8 @@ function buildSnapshotForAgent(
     applicationTitle?: string;
     stepText?: string;
     profileInstitution?: string;
+    profileDepartment?: string;
+    profileMajor?: string;
     repeatGroups?: RepeatableGroupObservation[];
   },
 ): AgentPageSnapshot {
@@ -2272,6 +2379,8 @@ function buildSnapshotForAgent(
       ]),
     ],
     profileInstitution: scan.profileInstitution,
+    profileDepartment: scan.profileDepartment,
+    profileMajor: scan.profileMajor,
     fields: scan.fields,
     repeatGroups: scan.repeatGroups,
   });
@@ -2350,6 +2459,140 @@ async function prepareAgentBatchPlanForCurrentPage(
   }
 }
 
+async function runAgentPageDiscoveryPass(input: {
+  tabId: number;
+  state: AutoRunState;
+  scan: ScanSuccessResponse;
+  snapshot: AgentPageSnapshot;
+  apiConfig: Awaited<ReturnType<typeof getApiConfig>>;
+  historyEntry: AutoRunHistoryEntry;
+}): Promise<'deferred' | 'execute'> {
+  const { tabId, state, scan, snapshot, apiConfig, historyEntry } = input;
+  const pageKey = snapshot.pageKey;
+  const existing = state.pageDiscovery;
+
+  if (existing?.phase === 'executing' || existing?.phase === 'fallback') return 'execute';
+  if (existing?.phase === 'returning') {
+    if (pageKey !== existing.startPageKey) {
+      state.message = '已生成全局方案，正在返回第一个页面';
+      const returnAttempts = existing.returnAttempts ?? 0;
+      let previous: { clicked: boolean; advanced: boolean; reason: string };
+      try {
+        previous = await sendToContentScript(tabId, { type: 'returnToPreviousStep' }, false);
+      } catch {
+        state.pageDiscovery = { ...existing, returnAttempts: returnAttempts + 1 };
+        await saveAutoRunState(state);
+        if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 700);
+        return 'deferred';
+      }
+      if (previous.clicked && previous.advanced) {
+        state.pageDiscovery = { ...existing, returnAttempts: returnAttempts + 1 };
+        await saveAutoRunState(state);
+        if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 400);
+        return 'deferred';
+      }
+      if (returnAttempts === 0 && existing.startUrl && scan.pageUrl !== existing.startUrl) {
+        state.pageDiscovery = { ...existing, returnAttempts: 1 };
+        await saveAutoRunState(state);
+        await chrome.tabs.update(tabId, { url: existing.startUrl });
+        if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 800);
+        return 'deferred';
+      }
+      state.status = 'paused';
+      state.pauseReason = 'navigation';
+      state.message = `全局方案已经生成，但无法自动返回第一个页面：${previous.reason || '未找到安全的上一步按钮'}。请手动返回第一步后继续。`;
+      await saveAutoRunState(state);
+      return 'deferred';
+    }
+    state.pageDiscovery = markAgentPageDiscoveryExecuting(existing);
+    state.batchPhase = 'executing';
+    state.pageCount = 0;
+    state.message = `已收集 ${existing.visitedPageKeys.length} 页并生成全局方案，开始逐页执行`;
+    await saveAutoRunState(state);
+    return 'execute';
+  }
+
+  const recorded = beginOrRecordAgentPageDiscovery(existing, {
+    pageKey,
+    url: scan.pageUrl,
+  });
+  state.pageDiscovery = recorded.checkpoint;
+  state.batchPhase = 'collecting';
+  state.message = `正在收集第 ${recorded.checkpoint.visitedPageKeys.length} 页题目、注释和控件结构，暂不填写`;
+  historyEntry.message = '已收集页面语义，等待跨页统一规划';
+  historyEntry.updatedAt = Date.now();
+  await saveAutoRunState(state);
+
+  let advance: { clicked: boolean; advanced: boolean; reason: string };
+  try {
+    advance = await sendToContentScript(tabId, { type: 'advanceToNextStep' }, false);
+  } catch {
+    state.pageCount += 1;
+    historyEntry.status = 'checked';
+    historyEntry.message = '本页仅完成收集，正在读取下一页';
+    historyEntry.updatedAt = Date.now();
+    await saveAutoRunState(state);
+    if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 700);
+    return 'deferred';
+  }
+
+  const decision = decideAgentPageDiscoveryNavigation({
+    clicked: advance.clicked,
+    advanced: advance.advanced,
+    alreadyVisited: recorded.alreadyVisited,
+  });
+  if (decision === 'continue-collecting') {
+    state.pageCount += 1;
+    historyEntry.status = 'checked';
+    historyEntry.message = '本页仅完成收集，正在读取下一页';
+    historyEntry.updatedAt = Date.now();
+    await saveAutoRunState(state);
+    if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 300);
+    return 'deferred';
+  }
+
+  if (decision === 'fallback-execution') {
+    state.pageDiscovery = markAgentPageDiscoveryFallback(recorded.checkpoint);
+    state.batchPhase = recorded.checkpoint.visitedPageKeys.length > 1 ? 'planning' : 'review';
+    state.message = advance.reason
+      ? `页面不允许只读进入下一步，已安全降级为边填写边规划：${advance.reason}`
+      : '无法继续只读收集，已安全降级为边填写边规划';
+    historyEntry.message = state.message;
+    historyEntry.updatedAt = Date.now();
+    await saveAutoRunState(state);
+    return 'execute';
+  }
+
+  const currentPlan = await prepareAgentBatchPlanForCurrentPage(state, snapshot, apiConfig);
+  if (!state.batchBlueprint || !state.batchPlan || state.batchBlueprint.pages.length < 2) {
+    state.pageDiscovery = markAgentPageDiscoveryFallback(recorded.checkpoint);
+    state.batchPhase = 'review';
+    state.message = '当前任务只收集到一个页面，按单页完整语义执行';
+    historyEntry.message = state.message;
+    historyEntry.updatedAt = Date.now();
+    await saveAutoRunState(state);
+    return 'execute';
+  }
+
+  state.pageDiscovery = markAgentPageDiscoveryReturning(recorded.checkpoint);
+  state.batchPhase = 'executing';
+  state.agent = undefined;
+  state.pageCount = 0;
+  historyEntry.status = 'checked';
+  historyEntry.message = `已完成 ${state.batchBlueprint.pages.length} 页收集和全局规划`;
+  historyEntry.updatedAt = Date.now();
+  state.message = '全局方案已生成，正在返回第一个页面开始填写';
+  await saveAutoRunState(state);
+
+  if (pageKey === recorded.checkpoint.startPageKey) {
+    state.pageDiscovery = markAgentPageDiscoveryExecuting(state.pageDiscovery);
+    await saveAutoRunState(state);
+    return currentPlan ? 'execute' : 'deferred';
+  }
+  if (state.taskId) await scheduleTaskResume(state.taskId, tabId, 150);
+  return 'deferred';
+}
+
 interface AgentPreviewRunResult {
   matches: MatchResult[];
   attempted: boolean;
@@ -2360,8 +2603,19 @@ interface AgentPreviewRunResult {
   error: string;
 }
 
-function profileInstitutionFromTextFields(fields: Awaited<ReturnType<typeof getAllTextFields>>): string {
-  return fields.find((field) => /^(?:学校|所在学校|本科院校|毕业院校)$/u.test(field.key.trim()))?.value?.trim() ?? '';
+function profileIdentityFromTextFields(fields: Awaited<ReturnType<typeof getAllTextFields>>): {
+  profileInstitution: string;
+  profileDepartment: string;
+  profileMajor: string;
+} {
+  const find = (pattern: RegExp): string => (
+    fields.find((field) => pattern.test(field.key.trim()))?.value?.trim() ?? ''
+  );
+  return {
+    profileInstitution: find(/^(?:学校|所在学校|本科院校|毕业院校)$/u),
+    profileDepartment: find(/^(?:院系|学院|本科院系|所在院系)$/u),
+    profileMajor: find(/^(?:专业|本科专业|所学专业)$/u),
+  };
 }
 
 async function runAgentPreviewForScan(
@@ -2390,7 +2644,7 @@ async function runAgentPreviewForScan(
     visibleTexts: scan.visibleTexts,
     instructions: scan.instructions,
     repeatGroups: scan.repeatGroups,
-    profileInstitution: profileInstitutionFromTextFields(textFields),
+    ...profileIdentityFromTextFields(textFields),
   });
   const sourceRecords = retrieveAgentSourceRecords(snapshot, blocks, textFields);
   if (sourceRecords.length === 0) return { ...empty, attempted: true };
@@ -2469,7 +2723,8 @@ async function runAgentForScan(
   preplannedPlan?: AgentPagePlan | null,
 ): Promise<AgentScanRunResult> {
   const apiConfig = await getApiConfig();
-  let currentSnapshot = buildSnapshotForAgent(initialScan);
+  const profileIdentity = profileIdentityFromTextFields(await getAllTextFields());
+  let currentSnapshot = buildSnapshotForAgent({ ...initialScan, ...profileIdentity });
   let cached = false;
   let reviewed = 0;
   let lastBeforeValues: Record<string, string> = agentSnapshotValues(currentSnapshot);
@@ -2499,6 +2754,7 @@ async function runAgentForScan(
       instructions: pageContext.instructions,
       fields: (results ?? []).map((result) => ({ ...result.field, index: result.index })),
       repeatGroups,
+      ...profileIdentity,
     });
     return currentSnapshot;
   };
@@ -2895,6 +3151,23 @@ async function processAutoRun(tabId: number): Promise<void> {
         : Promise.resolve(),
     ]);
     let scannedFieldByIndex = new Map(scan.fields.map((field) => [field.index, field]));
+    const [apiConfig, configured] = await Promise.all([getApiConfig(), isApiConfigured()]);
+    const agentAutomationEnabled = configured && apiConfig.aiEnhanced;
+    if (agentAutomationEnabled) {
+      const discoverySnapshot = buildSnapshotForAgent({
+        ...scan,
+        ...profileIdentityFromTextFields(await getAllTextFields()),
+      });
+      const discovery = await runAgentPageDiscoveryPass({
+        tabId,
+        state,
+        scan,
+        snapshot: discoverySnapshot,
+        apiConfig,
+        historyEntry,
+      });
+      if (discovery === 'deferred') return;
+    }
     const fileFields = scan.fields.filter((field) => field.kind === 'file');
     const currentMaterialPageKey = semanticPageKey({
       url: scan.pageUrl,
@@ -2926,8 +3199,8 @@ async function processAutoRun(tabId: number): Promise<void> {
       await Promise.all([saveAutoRunState(state), persistScanSnapshot(state, scan)]);
       return;
     }
-    const [apiConfig, configured] = await Promise.all([getApiConfig(), isApiConfigured()]);
-    const usePageAgent = shouldUsePageAgent(scan, configured, apiConfig.aiEnhanced);
+    const usePageAgent = shouldUsePageAgent(scan, configured, apiConfig.aiEnhanced)
+      || Boolean(agentAutomationEnabled && state.batchPlan);
     if (Object.values(scan.repeatPlan.groups).some((group) => group.rowsToAdd > 0)) {
       const preparedScan = await collectTabScan(tabId, true, true, true);
       if (!(await isSamePage(tabId, preparedScan))) {
@@ -2951,7 +3224,10 @@ async function processAutoRun(tabId: number): Promise<void> {
     }
     let result: { success: number; failure: number };
     if (usePageAgent) {
-      const currentAgentSnapshot = buildSnapshotForAgent(scan);
+      const currentAgentSnapshot = buildSnapshotForAgent({
+        ...scan,
+        ...profileIdentityFromTextFields(await getAllTextFields()),
+      });
       state.message = '保填 Agent 正在汇总已识别页面并生成当前页计划';
       historyEntry.message = state.message;
       historyEntry.updatedAt = Date.now();

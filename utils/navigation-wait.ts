@@ -8,6 +8,11 @@ export interface PageTransitionOutcome {
   current: PageTransitionIdentity;
 }
 
+export function isSafePreviousStepLabel(value: string): boolean {
+  const label = value.replace(/\s+/g, '');
+  return /^(?:上一步|前一步|返回上一步|返回前一步)$/u.test(label);
+}
+
 export async function waitForPageTransition(options: {
   initial: PageTransitionIdentity;
   readCurrent: () => Promise<PageTransitionIdentity> | PageTransitionIdentity;

@@ -6,7 +6,7 @@ import type {
   CompleteAgentPageSnapshot,
   CompleteAgentTargetField,
 } from './types';
-import { inferAgentApplicationIdentity } from './page-identity';
+import { inferAgentApplicationIdentityFromPage } from './page-identity';
 import type { RepeatableGroupObservation } from '../repeatable-records';
 
 export interface BuildAgentPageSnapshotInput {
@@ -17,6 +17,8 @@ export interface BuildAgentPageSnapshotInput {
   instructions?: string[];
   visibleTexts?: string[];
   profileInstitution?: string;
+  profileDepartment?: string;
+  profileMajor?: string;
   fields: FormFieldInfo[];
   repeatGroups?: RepeatableGroupObservation[];
   capturedAt?: number;
@@ -392,11 +394,15 @@ export function buildAgentPageSnapshot(input: BuildAgentPageSnapshotInput): Comp
       field.context,
     ]),
   ]);
-  const identity = inferAgentApplicationIdentity({
+  const identity = inferAgentApplicationIdentityFromPage({
     title: safeTitle,
     url: input.url,
+    pageLabel: safeStepText,
     visibleTexts: safeSemanticTexts(input.visibleTexts ?? []),
+    fields: safeFields,
     profileInstitution: input.profileInstitution,
+    profileDepartment: input.profileDepartment,
+    profileMajor: input.profileMajor,
   });
 
   return {

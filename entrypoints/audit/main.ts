@@ -118,6 +118,7 @@ function renderTasks(model: ReturnType<typeof buildAuditViewModel>): void {
     return;
   }
   for (const row of model.tasks) {
+    const sourceTask = tasks.find((task) => task.id === row.id);
     const wrapper = element('article', `task-row${row.isCurrent ? ' current' : ''}`);
     const select = element('input') as HTMLInputElement;
     select.type = 'checkbox';
@@ -141,8 +142,15 @@ function renderTasks(model: ReturnType<typeof buildAuditViewModel>): void {
     const actions = element('div', 'task-actions');
     actions.append(
       button('打开网站', 'text-button', () => { void focusTask(row.id); }),
+      button('改名', 'text-button', () => { void renameApplicationTask(row.id, row.name); }),
       button('归档', 'text-button muted', () => { void archiveTask(row.id, row.name); }),
     );
+    if (sourceTask?.customDisplayName) {
+      actions.insertBefore(
+        button('恢复自动名称', 'text-button muted', () => { void restoreAutomaticTaskName(row.id); }),
+        actions.lastChild,
+      );
+    }
     wrapper.append(select, body, actions);
     taskList.append(wrapper);
   }
@@ -357,6 +365,30 @@ async function runAudit(): Promise<void> {
 async function focusTask(taskId: string): Promise<void> {
   try { await sendRuntime('focusApplicationTask', { taskId }); }
   catch (error) { setNotice(error instanceof Error ? error.message : '无法打开网站', 'error'); }
+}
+
+async function renameApplicationTask(taskId: string, currentName: string): Promise<void> {
+  const name = prompt('自定义报名任务名称（最多 60 个字符）', currentName);
+  if (name == null) return;
+  try {
+    await sendRuntime('renameApplicationTask', { taskId, customDisplayName: name });
+    clearPreflight();
+    await loadTasks();
+    setNotice('任务名称已同步更新。', 'success');
+  } catch (error) {
+    setNotice(error instanceof Error ? error.message : '任务名称保存失败', 'error');
+  }
+}
+
+async function restoreAutomaticTaskName(taskId: string): Promise<void> {
+  try {
+    await sendRuntime('restoreAutomaticTaskName', { taskId });
+    clearPreflight();
+    await loadTasks();
+    setNotice('已恢复自动任务名称。', 'success');
+  } catch (error) {
+    setNotice(error instanceof Error ? error.message : '恢复自动名称失败', 'error');
+  }
 }
 
 async function archiveTask(taskId: string, name: string): Promise<void> {

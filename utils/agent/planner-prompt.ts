@@ -116,6 +116,10 @@ export function buildAgentPlannerPrompt(
     title: input.snapshot.title,
     stepText: input.snapshot.stepText,
     instructions: input.snapshot.instructions,
+    identity: input.snapshot.identity ?? null,
+    questionContext: input.snapshot.questionContext ?? null,
+    visiblePageText: input.snapshot.visiblePageText ?? [],
+    materials: input.snapshot.materials ?? [],
     groups: input.snapshot.groups.map((group) => {
       const rowTargetIds = new Set(group.rows.flatMap((row) => row.fields.map((field) => field.targetId)));
       return {

@@ -2,7 +2,6 @@ import type {
   ApplicationPageAnalysis,
   ApplicationRunnerCheckpoint,
 } from './page-analysis';
-import { formatAgentApplicationDisplayName } from './agent/page-identity';
 import type { AgentApplicationIdentity } from './agent/types';
 
 export const APPLICATION_TASKS_KEY = 'applicationTasks:v1';
@@ -87,6 +86,10 @@ export interface ApplicationTask {
   siteOrigin: string;
   siteTitle: string;
   displayName: string;
+  automaticIdentity?: AgentApplicationIdentity;
+  projectOrdinal?: number;
+  projectOrdinalScope?: string;
+  customDisplayName?: string;
   initialUrl: string;
   status: ApplicationTaskStatus;
   pauseReason?: ApplicationTaskPauseReason;
@@ -103,6 +106,124 @@ export interface ApplicationTask {
   createdAt: number;
   updatedAt: number;
   lastOpenedAt: number;
+}
+
+function normalizedTaskName(value: string | undefined): string {
+  return (value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+const APPLICATION_PROJECT_PARAMETER = /^(?:a|b|project(?:id)?|project_id|application(?:id)?|application_id|apply(?:id)?|apply_id|program(?:id)?|program_id|activity(?:id)?|activity_id|camp(?:id)?|camp_id|plan(?:id)?|plan_id|batch(?:id)?|batch_id|xm(?:id)?|xm_id)$/iu;
+
+function applicationProjectUrlIdentity(value: string): { origin: string; parameters: string[] } {
+  try {
+    const url = new URL(value);
+    const pairs: Array<[string, string]> = [];
+    const collect = (params: URLSearchParams): void => {
+      for (const [key, parameterValue] of params.entries()) {
+        if (APPLICATION_PROJECT_PARAMETER.test(key) && parameterValue.trim()) {
+          pairs.push([key.toLowerCase(), parameterValue.trim()]);
+        }
+      }
+    };
+    collect(url.searchParams);
+    const hashQueryIndex = url.hash.indexOf('?');
+    if (hashQueryIndex >= 0) collect(new URLSearchParams(url.hash.slice(hashQueryIndex + 1)));
+    return {
+      origin: url.origin,
+      parameters: [...new Set(pairs.map(([key, parameterValue]) => `${key}=${parameterValue}`))].sort(),
+    };
+  } catch {
+    return { origin: value, parameters: [] };
+  }
+}
+
+export function shouldReuseApplicationTaskForUrl(task: ApplicationTask, currentUrl: string): boolean {
+  const initial = applicationProjectUrlIdentity(task.initialUrl || task.siteOrigin);
+  const current = applicationProjectUrlIdentity(currentUrl);
+  if (initial.origin !== current.origin) return false;
+  if (initial.parameters.length === 0 || current.parameters.length === 0) return true;
+  return initial.parameters.length === current.parameters.length
+    && initial.parameters.every((parameter, index) => parameter === current.parameters[index]);
+}
+
+function applicationTaskOrdinalScope(task: ApplicationTask): string {
+  return normalizedTaskName(task.automaticIdentity?.institutionName)
+    || normalizedTaskName(task.siteTitle)
+    || normalizedTaskName(task.siteOrigin);
+}
+
+export function resolveApplicationTaskDisplayName(task: ApplicationTask): string {
+  const custom = normalizedTaskName(task.customDisplayName);
+  if (custom) return custom;
+  const institution = normalizedTaskName(task.automaticIdentity?.institutionName);
+  const department = normalizedTaskName(task.automaticIdentity?.departmentName);
+  if (institution && department) return `${institution} · ${department}`;
+  const base = institution || normalizedTaskName(task.siteTitle) || normalizedTaskName(task.siteOrigin);
+  if (base && Number.isInteger(task.projectOrdinal) && Number(task.projectOrdinal) > 0) {
+    return `${base} · 项目 ${task.projectOrdinal}`;
+  }
+  return base;
+}
+
+export function ensureStableApplicationTaskOrdinal(
+  task: ApplicationTask,
+  tasks: ApplicationTask[],
+  now = Date.now(),
+): ApplicationTask {
+  const scope = applicationTaskOrdinalScope(task);
+  const used = new Set(tasks
+    .filter((candidate) => candidate.id !== task.id && candidate.projectOrdinalScope === scope)
+    .map((candidate) => candidate.projectOrdinal)
+    .filter((ordinal): ordinal is number => Number.isInteger(ordinal) && Number(ordinal) > 0));
+  const currentOrdinal = task.projectOrdinal;
+  const existing = task.projectOrdinalScope === scope
+    && Number.isInteger(currentOrdinal)
+    && Number(currentOrdinal) > 0
+    && !used.has(currentOrdinal as number)
+    ? currentOrdinal
+    : undefined;
+  let projectOrdinal = existing;
+  if (projectOrdinal == null) {
+    projectOrdinal = 1;
+    while (used.has(projectOrdinal)) projectOrdinal += 1;
+  }
+  const next = {
+    ...task,
+    projectOrdinal,
+    projectOrdinalScope: scope,
+    updatedAt: Math.max(task.updatedAt, now),
+  };
+  return { ...next, displayName: resolveApplicationTaskDisplayName(next) };
+}
+
+export function renameApplicationTask(
+  task: ApplicationTask,
+  customDisplayName: string,
+  now = Date.now(),
+): ApplicationTask {
+  const custom = normalizedTaskName(customDisplayName);
+  if (!custom) throw new Error('请输入名称');
+  if (Array.from(custom).length > 60) throw new Error('名称不能超过 60 个字符');
+  return {
+    ...task,
+    customDisplayName: custom,
+    displayName: custom,
+    updatedAt: Math.max(task.updatedAt, now),
+    lastOpenedAt: Math.max(task.lastOpenedAt, now),
+  };
+}
+
+export function restoreAutomaticApplicationTaskName(
+  task: ApplicationTask,
+  now = Date.now(),
+): ApplicationTask {
+  const { customDisplayName: _removed, ...rest } = task;
+  const next: ApplicationTask = {
+    ...rest,
+    updatedAt: Math.max(task.updatedAt, now),
+    lastOpenedAt: Math.max(task.lastOpenedAt, now),
+  };
+  return { ...next, displayName: resolveApplicationTaskDisplayName(next) };
 }
 
 function clonePageAnalysis(analysis: ApplicationPageAnalysis): ApplicationPageAnalysis {
@@ -140,6 +261,7 @@ function cloneRunnerCheckpoint(checkpoint: ApplicationRunnerCheckpoint): Applica
     ...(checkpoint.agent ? { agent: structuredClone(checkpoint.agent) } : {}),
     ...(checkpoint.batchBlueprint ? { batchBlueprint: structuredClone(checkpoint.batchBlueprint) } : {}),
     ...(checkpoint.batchPlan ? { batchPlan: structuredClone(checkpoint.batchPlan) } : {}),
+    ...(checkpoint.pageDiscovery ? { pageDiscovery: structuredClone(checkpoint.pageDiscovery) } : {}),
   };
 }
 
@@ -244,15 +366,15 @@ export function updateTaskApplicationIdentity(
   identity: AgentApplicationIdentity,
   now = Date.now(),
 ): ApplicationTask {
-  const displayName = formatAgentApplicationDisplayName(identity);
-  if (!displayName) return task;
-  return {
+  if (!identity.institutionName && !identity.departmentName && !identity.projectName) return task;
+  const next: ApplicationTask = {
     ...task,
     siteTitle: identity.institutionName || task.siteTitle,
-    displayName,
+    automaticIdentity: { ...identity },
     updatedAt: Math.max(task.updatedAt, now),
     lastOpenedAt: Math.max(task.lastOpenedAt, now),
   };
+  return { ...next, displayName: resolveApplicationTaskDisplayName(next) };
 }
 
 export function upsertTaskPage(task: ApplicationTask, page: ApplicationPageSnapshot): ApplicationTask {
@@ -349,7 +471,7 @@ export async function getApplicationTask(taskId: string): Promise<ApplicationTas
 export function saveApplicationTask(task: ApplicationTask): Promise<void> {
   const operation = taskWriteChain.then(async () => {
     const tasks = await readTaskMap();
-    tasks[task.id] = task;
+    tasks[task.id] = ensureStableApplicationTaskOrdinal(task, Object.values(tasks));
     await chrome.storage.local.set({ [APPLICATION_TASKS_KEY]: tasks });
   });
   taskWriteChain = operation.catch(() => undefined);
@@ -365,7 +487,7 @@ export function updateApplicationTask(
     const tasks = await readTaskMap();
     const current = tasks[taskId];
     if (!current) return;
-    updated = updater(current);
+    updated = ensureStableApplicationTaskOrdinal(updater(current), Object.values(tasks));
     tasks[taskId] = updated;
     await chrome.storage.local.set({ [APPLICATION_TASKS_KEY]: tasks });
   });

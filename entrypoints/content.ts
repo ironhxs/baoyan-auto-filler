@@ -1,7 +1,7 @@
 import { fieldFingerprint } from '@/utils/field-fingerprint';
 import { isSensitiveAuditField } from '@/utils/final-audit';
 import type { WebsiteMaterialCandidate } from '@/utils/final-audit';
-import { waitForPageTransition } from '@/utils/navigation-wait';
+import { isSafePreviousStepLabel, waitForPageTransition } from '@/utils/navigation-wait';
 import { inferImageMimeType } from '@/utils/image-mime';
 import { chooseNearestAncestorQuestionContext } from '@/utils/field-context';
 import { stableTargetId } from '@/utils/agent/page-snapshot';
@@ -172,6 +172,7 @@ interface PrepareRepeatRecordsResult {
   }>;
 }
 interface AdvanceToNextStepMessage { type: 'advanceToNextStep' }
+interface ReturnToPreviousStepMessage { type: 'returnToPreviousStep' }
 interface MarkPreviewMessage {
   type: 'markPreview';
   items: Array<{ index: number; fingerprint?: string; status: 'verified' | 'review' | 'mismatch'; message?: string }>;
@@ -186,7 +187,7 @@ interface ExecuteAgentActionsMessage {
   pageKey: string;
   items: AgentExecutionItem[];
 }
-type Message = ScanMessage | ObserveRepeatGroupsMessage | CommitRepeatRecordMessage | GetAgentPageContextMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetExistingMaterialPreviewMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
+type Message = ScanMessage | ObserveRepeatGroupsMessage | CommitRepeatRecordMessage | GetAgentPageContextMessage | FillMessage | FillStreamInitMessage | FillFieldMessage | FillTypeChunkMessage | FillTypeCommitMessage | FillStreamCompleteMessage | ManualFillMessage | PrepareRepeatRowsMessage | PrepareRepeatRecordsMessage | AdvanceToNextStepMessage | ReturnToPreviousStepMessage | MarkPreviewMessage | FocusFieldMessage | FocusAgentTargetMessage | GetExistingMaterialPreviewMessage | GetPageMetaMessage | GetAuditPageSnapshotMessage | ExecuteAgentActionsMessage;
 
 let elementMap = new Map<number, HTMLElement>();
 let protectedIndices = new Set<number>();
@@ -1218,6 +1219,32 @@ async function advanceToNextStep(): Promise<{ clicked: boolean; advanced: boolea
   });
   if (transition.changed) return { clicked: true, advanced: true, reason: '已进入下一页' };
   return { clicked: true, advanced: false, reason: '页面没有切换，可能仍有校验项需要本人处理' };
+}
+
+function findSafePreviousControl(): HTMLElement | null {
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+    'button,input[type="button"],a,[role="button"]',
+  ));
+  return candidates.find((candidate) => {
+    if (!isVisible(candidate) || (candidate as HTMLButtonElement).disabled) return false;
+    const text = (candidate as HTMLInputElement).value || candidate.textContent || '';
+    return isSafePreviousStepLabel(text);
+  }) ?? null;
+}
+
+async function returnToPreviousStep(): Promise<{ clicked: boolean; advanced: boolean; reason: string }> {
+  const control = findSafePreviousControl();
+  if (!control) return { clicked: false, advanced: false, reason: '未找到安全的上一步按钮' };
+  const before = { url: location.href, signature: nextPageSignature() };
+  control.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  control.click();
+  const transition = await waitForPageTransition({
+    initial: before,
+    readCurrent: () => ({ url: location.href, signature: nextPageSignature() }),
+  });
+  return transition.changed
+    ? { clicked: true, advanced: true, reason: '已返回上一页' }
+    : { clicked: true, advanced: false, reason: '点击上一步后页面没有切换' };
 }
 
 function getProtection(el: HTMLElement, fieldText: string, isFile: boolean): { protected: boolean; reason: string } {
@@ -2859,6 +2886,10 @@ export default defineContentScript({
           advanceToNextStep()
             .then(sendResponse)
             .catch(() => sendResponse({ clicked: false, advanced: false, reason: '无法安全进入下一页' }));
+        } else if (message.type === 'returnToPreviousStep') {
+          returnToPreviousStep()
+            .then(sendResponse)
+            .catch(() => sendResponse({ clicked: false, advanced: false, reason: '无法安全返回上一页' }));
         } else if (message.type === 'markPreview') {
           sendResponse({ ok: true, marked: markPreviewFields(message.items) });
         } else if (message.type === 'focusField') {

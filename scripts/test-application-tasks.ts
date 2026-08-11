@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import {
   bindTaskToTab,
   createApplicationTask,
+  ensureStableApplicationTaskOrdinal,
   getTaskPageAnalysis,
+  renameApplicationTask,
+  resolveApplicationTaskDisplayName,
+  restoreAutomaticApplicationTaskName,
+  shouldReuseApplicationTaskForUrl,
   selectDefaultAuditTaskIds,
   sortTasksForCurrentSite,
   unbindTaskFromTab,
@@ -179,17 +184,87 @@ assert.notEqual(first.runner?.lastPageKey, second.runner?.lastPageKey);
 assert.equal(task.status, 'stopped');
 assert.equal(task.displayName, 'A 大学');
 
+const firstUnknownDepartment = ensureStableApplicationTaskOrdinal(task, [task], 160);
+assert.equal(firstUnknownDepartment.projectOrdinal, 1);
+assert.equal(firstUnknownDepartment.projectOrdinalScope, 'A 大学');
+assert.equal(resolveApplicationTaskDisplayName(firstUnknownDepartment), 'A 大学 · 项目 1');
+
+const siblingUnknownDepartment = ensureStableApplicationTaskOrdinal({
+  ...task,
+  id: 'task-a-2',
+  createdAt: 165,
+  updatedAt: 165,
+  lastOpenedAt: 165,
+}, [firstUnknownDepartment], 165);
+assert.equal(siblingUnknownDepartment.projectOrdinal, 2);
+assert.equal(resolveApplicationTaskDisplayName(siblingUnknownDepartment), 'A 大学 · 项目 2');
+
+const otherSchoolFirst = ensureStableApplicationTaskOrdinal({
+  ...task,
+  id: 'task-b-1',
+  siteTitle: 'B 大学',
+  displayName: 'B 大学',
+  siteOrigin: 'https://b.example',
+  createdAt: 166,
+  updatedAt: 166,
+  lastOpenedAt: 166,
+}, [firstUnknownDepartment, siblingUnknownDepartment], 166);
+assert.equal(otherSchoolFirst.projectOrdinal, 1);
+assert.equal(resolveApplicationTaskDisplayName(otherSchoolFirst), 'B 大学 · 项目 1');
+
+const renamedTask = renameApplicationTask(firstUnknownDepartment, '  中大 · 计院人工智能夏令营  ', 170);
+assert.equal(renamedTask.customDisplayName, '中大 · 计院人工智能夏令营');
+assert.equal(renamedTask.displayName, '中大 · 计院人工智能夏令营');
+const renamedAfterIdentity = updateTaskApplicationIdentity(renamedTask, {
+  institutionName: '中山大学',
+  departmentName: '计算机学院',
+  projectName: '预推免',
+}, 171);
+assert.equal(renamedAfterIdentity.displayName, '中大 · 计院人工智能夏令营');
+assert.equal(renamedAfterIdentity.automaticIdentity?.departmentName, '计算机学院');
+const restoredTask = restoreAutomaticApplicationTaskName(renamedAfterIdentity, 172);
+assert.equal(restoredTask.customDisplayName, undefined);
+assert.equal(restoredTask.displayName, '中山大学 · 计算机学院');
+assert.throws(() => renameApplicationTask(task, '   ', 173), /请输入名称/);
+assert.throws(() => renameApplicationTask(task, 'x'.repeat(61), 173), /60/);
+
 const identifiedTask = updateTaskApplicationIdentity(task, {
   institutionName: '中山大学',
   departmentName: '计算机学院',
   projectName: '预推免',
 }, 175);
-assert.equal(identifiedTask.displayName, '中山大学 · 计算机学院 · 预推免');
+assert.equal(identifiedTask.displayName, '中山大学 · 计算机学院');
+assert.deepEqual(identifiedTask.automaticIdentity, {
+  institutionName: '中山大学',
+  departmentName: '计算机学院',
+  projectName: '预推免',
+});
 assert.equal(identifiedTask.siteTitle, '中山大学');
 assert.equal(identifiedTask.updatedAt, 175);
 assert.equal(task.displayName, 'A 大学', 'identity update must not mutate the input task');
 assert.deepEqual(task.pageOrder, ['page-basic']);
 assert.equal(task.pages['page-basic'].capturedAt, 100);
+
+const sysuProjectTask = createApplicationTask({
+  id: 'sysu-project-a',
+  batchId: 'batch-projects',
+  siteOrigin: 'https://enroll.sysu.edu.cn',
+  siteTitle: '中山大学',
+  initialUrl: 'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance#/tmfwksdExemptionOnlineSignUp?a=project-a&b=season-1',
+  now: 1,
+});
+assert.equal(shouldReuseApplicationTaskForUrl(
+  sysuProjectTask,
+  'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance#/tmfwksdExemptionOnlineSignUp?a=project-a&b=season-1&step=family',
+), true, 'the same explicit project identity must reuse its task');
+assert.equal(shouldReuseApplicationTaskForUrl(
+  sysuProjectTask,
+  'https://enroll.sysu.edu.cn/yjszs/plugins/zs/zsxsd/entrance#/tmfwksdExemptionOnlineSignUp?a=project-b&b=season-1',
+), false, 'a different explicit project identity in the same tab must create a separate task');
+assert.equal(shouldReuseApplicationTaskForUrl(
+  sysuProjectTask,
+  'https://other.example.test/application?a=project-a',
+), false, 'tasks must never cross site origins');
 
 const refreshedPage = { ...firstPage, capturedAt: 200, label: '基本资料' };
 const updatedPageTask = upsertTaskPage(task, refreshedPage);
